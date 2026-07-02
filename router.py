@@ -61,7 +61,7 @@ router = APIRouter()
 
 
 @router.post("/intent")
-def submit_intent(
+async def submit_intent(
     payload: IntentPayload,
     threshold: float = Depends(get_threshold),
 ) -> JSONResponse:
@@ -71,10 +71,11 @@ def submit_intent(
     reshaped into a ValidationRejected envelope by the app's exception handler.
     A valid payload is accepted (200) or threshold-rejected (422) here. On
     acceptance the orchestration engine is triggered and its outcome + usage are
-    returned (feature 003).
+    returned (feature 003). Async because orchestration performs an asynchronous
+    local inference call (feature 005).
     """
     if decide(payload.confidence, threshold):
-        outcome = run_orchestration(payload)
+        outcome = await run_orchestration(payload)
         body = IntentAccepted(
             intent=payload.intent,
             orchestration=outcome,

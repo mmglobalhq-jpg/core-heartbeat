@@ -102,6 +102,19 @@ class RoutingFailure(BaseModel):
     detail: str
 
 
+class WorkerFailure(BaseModel):
+    """A categorized local-worker inference failure, recorded for observability (feature 005).
+
+    Parallel to RoutingFailure but for the local Ollama worker node. Ollama is a
+    local, keyless service, so there is no credential/auth category; the detail is
+    a short, secret-free diagnostic (exception type/message or ``"HTTP <code>"``).
+    See specs/005-local-ollama-worker/data-model.md (FR-008).
+    """
+
+    category: Literal["unreachable", "timeout", "invalid_output"]
+    detail: str
+
+
 # ---------------------------------------------------------------------------
 # Gateway response envelope (feature 002).
 # Every gateway response shares GatewayResponse so callers get a consistent

@@ -4,6 +4,7 @@ Covers POST /intent (accept / threshold-reject / validation-reject) and
 GET /health, plus the shared-envelope invariants (Scenarios 1-6, 8; SC-001..SC-008).
 """
 
+import httpx
 import pytest
 from starlette.testclient import TestClient
 
@@ -47,10 +48,29 @@ class _FakeClient:
 GREET_PLAN = ["local_llm", "tool_execution", "finish"]
 
 
+# Mocked Ollama counts preserve the historical stub totals (local 10/20/30 +
+# tool 5/0/5 = 35) so accepted-run usage assertions stay stable (feature 005).
+def _ollama_handler(request):
+    return httpx.Response(
+        200,
+        json={"response": "[local] mocked inference", "prompt_eval_count": 10, "eval_count": 20},
+    )
+
+
+def install_ollama(monkeypatch, handler=_ollama_handler):
+    """Inject a MockTransport-backed Ollama client so local_llm makes no real call."""
+    monkeypatch.setattr(
+        orchestrator,
+        "build_ollama_client",
+        lambda: httpx.AsyncClient(transport=httpx.MockTransport(handler)),
+    )
+
+
 def install_supervisor(monkeypatch, choices=GREET_PLAN):
-    """Inject a scripted fake model client so accepted runs are deterministic."""
+    """Inject scripted supervisor + MockTransport Ollama clients for accepted runs."""
     client = _FakeClient(choices)
     monkeypatch.setattr(orchestrator, "get_client", lambda: client)
+    install_ollama(monkeypatch)
 
 
 def valid_payload(**overrides):
@@ -195,6 +215,27 @@ def test_accepted_no_key_degrades_gracefully(monkeypatch):
     assert body["outcome"] == "accepted"
     assert body["orchestration"]["status"] == "degraded"
     assert body["orchestration"]["nodes_executed"] == []
+
+
+def test_accepted_local_worker_failure_degrades_gracefully(monkeypatch):
+    # Feature 005: supervisor routes to local_llm but the Ollama daemon is
+    # unreachable. The run still returns HTTP 200, terminates, and records a
+    # categorized local-worker failure in the orchestration messages (SC-003).
+    client_ = _FakeClient(["local_llm", "finish"])
+    monkeypatch.setattr(orchestrator, "get_client", lambda: client_)
+
+    def _refuse(request):
+        raise httpx.ConnectError("refused")
+
+    install_ollama(monkeypatch, _refuse)
+    client = make_client(monkeypatch)
+    r = client.post("/intent", json=valid_payload(confidence=0.9))
+    assert r.status_code == 200
+    body = r.json()
+    assert body["outcome"] == "accepted"
+    assert "local_llm" in body["orchestration"]["nodes_executed"]
+    messages = body["orchestration"]["messages"]
+    assert any("local inference failure: unreachable" in m["content"] for m in messages)
 
 
 def test_rejections_do_not_trigger_orchestration(monkeypatch):

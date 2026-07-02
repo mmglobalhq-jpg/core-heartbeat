@@ -32,6 +32,7 @@ from models import (
     RoutingDecision,
     RoutingFailure,
     TokenUsage,
+    WorkerFailure,
 )
 
 # --- constants --------------------------------------------------------------
@@ -42,8 +43,16 @@ MODEL_NAME = "gemini-2.5-flash"
 GEMINI_API_KEY_ENV = "GEMINI_API_KEY"
 REQUEST_TIMEOUT_MS = 10_000  # bound each model call (FR-006); milliseconds
 
-# Fixed, deterministic per-node usage increments for the stub worker nodes.
-LLM_USAGE = TokenUsage(input_tokens=10, output_tokens=20, total_tokens=30)
+# Local Ollama worker (feature 005). All three are read from the environment at
+# node-invoke time so tests/deployments can override without rebuilding the graph.
+OLLAMA_URL_ENV = "OLLAMA_URL"
+OLLAMA_MODEL_ENV = "OLLAMA_MODEL"
+OLLAMA_TIMEOUT_MS_ENV = "OLLAMA_TIMEOUT_MS"
+DEFAULT_OLLAMA_URL = "http://localhost:11434/api/generate"
+DEFAULT_OLLAMA_MODEL = "qwen2.5:7b"
+DEFAULT_OLLAMA_TIMEOUT_MS = 120_000  # local 7B generation can be slow; bound it (FR-007)
+
+# Fixed, deterministic per-node usage increment for the stub tool worker node.
 TOOL_USAGE = TokenUsage(input_tokens=5, output_tokens=0, total_tokens=5)
 
 WORKER_NODES = ["local_llm", "tool_execution"]
@@ -185,6 +194,92 @@ def request_routing_decision(
     return decision, None, usage
 
 
+# --- local Ollama worker (feature 005) --------------------------------------
+
+def _ollama_url() -> str:
+    """Local generate endpoint, env-overridable (read at invoke time; FR-010)."""
+    return os.environ.get(OLLAMA_URL_ENV) or DEFAULT_OLLAMA_URL
+
+
+def _ollama_model() -> str:
+    """Target local model, env-overridable (FR-010)."""
+    return os.environ.get(OLLAMA_MODEL_ENV) or DEFAULT_OLLAMA_MODEL
+
+
+def _ollama_timeout_s() -> float:
+    """Per-call time bound in seconds, env-overridable (FR-007). Falls back on junk."""
+    raw = os.environ.get(OLLAMA_TIMEOUT_MS_ENV)
+    try:
+        ms = int(raw) if raw else DEFAULT_OLLAMA_TIMEOUT_MS
+    except (TypeError, ValueError):
+        ms = DEFAULT_OLLAMA_TIMEOUT_MS
+    return ms / 1000.0
+
+
+def build_ollama_client() -> httpx.AsyncClient:
+    """Construct an AsyncClient bound to the configured timeout (feature 005).
+
+    This is the test seam: the local_llm node calls it at invoke time, so tests
+    monkeypatch ``orchestrator.build_ollama_client`` to return a client wired with
+    ``httpx.MockTransport`` — no network, no daemon (FR-011).
+    """
+    return httpx.AsyncClient(timeout=_ollama_timeout_s())
+
+
+def _build_local_prompt(state: GraphState) -> str:
+    """Deterministic inference prompt from the intent + message history."""
+    intent = state["intent"]
+    history = "\n".join(f"{m.source}: {m.content}" for m in state.get("messages", []))
+    return (
+        f"Intent: {intent.intent}\n"
+        f"Raw input: {intent.raw_input}\n"
+        f"History so far:\n{history or '(none)'}\n"
+        "Respond helpfully to the intent above."
+    )
+
+
+def _extract_ollama_usage(body: dict) -> TokenUsage:
+    """Map Ollama's prompt_eval_count/eval_count into TokenUsage (zeros if absent)."""
+    inp = body.get("prompt_eval_count") or 0
+    out = body.get("eval_count") or 0
+    return TokenUsage(input_tokens=inp, output_tokens=out, total_tokens=inp + out)
+
+
+async def generate_local(
+    state: GraphState, client: httpx.AsyncClient
+) -> tuple[str | None, WorkerFailure | None, TokenUsage]:
+    """Ask the local Ollama service to generate for this run. Never raises.
+
+    Returns exactly one of (text, failure) non-None, plus a TokenUsage (zeros on
+    failure or when the response reports no counts). Makes one non-streaming POST,
+    bounded by the client's timeout (FR-007). See contracts/local_worker.md.
+    """
+    payload = {
+        "model": _ollama_model(),
+        "prompt": _build_local_prompt(state),
+        "stream": False,
+    }
+    try:
+        response = await client.post(_ollama_url(), json=payload)
+    except httpx.TimeoutException as exc:
+        return None, WorkerFailure(category="timeout", detail=_detail(exc)), TokenUsage()
+    except httpx.TransportError as exc:  # ConnectError, read/connect transport failures
+        return None, WorkerFailure(category="unreachable", detail=_detail(exc)), TokenUsage()
+    except Exception as exc:  # last-resort safety net: never crash the graph
+        return None, WorkerFailure(category="unreachable", detail=_detail(exc)), TokenUsage()
+
+    if response.status_code // 100 != 2:
+        return None, WorkerFailure(
+            category="invalid_output", detail=f"HTTP {response.status_code}"
+        ), TokenUsage()
+    try:
+        body = response.json()
+        text = body["response"]  # KeyError if the field is missing
+    except Exception as exc:  # JSON decode error / missing field
+        return None, WorkerFailure(category="invalid_output", detail=_detail(exc)), TokenUsage()
+    return text, None, _extract_ollama_usage(body)
+
+
 # --- nodes ------------------------------------------------------------------
 
 def _degraded(step: int, failure: RoutingFailure, usage: TokenUsage | None = None) -> dict:
@@ -233,11 +328,34 @@ def supervisor(state: GraphState) -> dict:
     return update
 
 
-def local_llm(state: GraphState) -> dict:
-    """Stubbed local model inference: deterministic output + fixed usage."""
+async def local_llm(state: GraphState) -> dict:
+    """Live local inference via Ollama (feature 005). Degrades safely on any failure.
+
+    On success records the model's generated text + its reported token usage. On
+    any failure records a categorized WorkerFailure message with zero usage. Either
+    way, control returns to the Supervisor (this node never sets next/status), and
+    the node counts as executed. See specs/005-local-ollama-worker/.
+    """
+    step = state["step"]
+    client = build_ollama_client()
+    async with client:
+        text, failure, usage = await generate_local(state, client)
+    if failure is not None:
+        return {
+            "messages": [
+                Message(
+                    source="local_llm",
+                    content=f"local inference failure: {failure.category}",
+                    step=step,
+                )
+            ],
+            "usage": TokenUsage(),
+            "visited": ["local_llm"],
+            "step": 1,
+        }
     return {
-        "messages": [Message(source="local_llm", content="[stub] local inference result", step=state["step"])],
-        "usage": LLM_USAGE,
+        "messages": [Message(source="local_llm", content=text, step=step)],
+        "usage": usage,
         "visited": ["local_llm"],
         "step": 1,
     }
@@ -283,11 +401,14 @@ graph = build_graph()
 
 # --- public API -------------------------------------------------------------
 
-def run(payload: IntentPayload) -> OrchestrationOutcome:
+async def run(payload: IntentPayload) -> OrchestrationOutcome:
     """Orchestrate an accepted intent to a terminating OrchestrationOutcome.
 
-    Always returns: node errors or a recursion-limit breach are captured into
-    ``status="error"`` rather than propagating.
+    Async because the local_llm worker performs an asynchronous Ollama call
+    (feature 005); the graph is driven with ``ainvoke`` (the sync supervisor and
+    tool nodes run unchanged under it). Always returns: node errors or a
+    recursion-limit breach are captured into ``status="error"`` rather than
+    propagating.
     """
     initial: GraphState = {
         "intent": payload,
@@ -299,7 +420,7 @@ def run(payload: IntentPayload) -> OrchestrationOutcome:
         "status": "",
     }
     try:
-        final = graph.invoke(initial, config={"recursion_limit": RECURSION_LIMIT})
+        final = await graph.ainvoke(initial, config={"recursion_limit": RECURSION_LIMIT})
     except (GraphRecursionError, Exception) as exc:  # noqa: B014 - defensive catch-all
         return OrchestrationOutcome(
             status="error",

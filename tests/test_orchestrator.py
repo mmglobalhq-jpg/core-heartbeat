@@ -1,18 +1,24 @@
-"""Tests for the orchestration engine (features 003 + 004).
+"""Tests for the orchestration engine (features 003 + 004 + 005).
 
-Routing is now model-driven, so these inject a scripted fake client (no network)
-via monkeypatching orchestrator.get_client. A scripted
+Routing is model-driven, so these inject a scripted fake supervisor client (no
+network) via monkeypatching orchestrator.get_client. A scripted
 ["local_llm","tool_execution","finish"] reproduces the feature-003 greet-plan
-trace deterministically. Covers termination, cyclic accumulation, and determinism
-(SC-001..SC-004, SC-007).
+trace deterministically. Feature 005 made local_llm a live async Ollama call, so
+these also inject an httpx.MockTransport Ollama client (no daemon) and drive the
+now-async run() via asyncio.run. Covers termination, cyclic accumulation, and
+determinism (SC-001..SC-004, SC-007).
 """
+
+import asyncio
+
+import httpx
 
 from models import IntentPayload, RoutingDecision
 import orchestrator
-from orchestrator import MAX_STEPS, run
+from orchestrator import MAX_STEPS
 
 
-# --- scripted fake client (no network) --------------------------------------
+# --- scripted fake supervisor client (no network) ---------------------------
 
 class _Resp:
     def __init__(self, choice):
@@ -37,11 +43,30 @@ class _Client:
         self.models = _Models(choices)
 
 
+# Mocked Ollama counts chosen to preserve the historical stub totals
+# (local 10/20/30 + tool 5/0/5 = 15/20/35), so usage assertions stay stable.
+def _ollama_handler(request):
+    return httpx.Response(
+        200,
+        json={"response": "[local] mocked inference", "prompt_eval_count": 10, "eval_count": 20},
+    )
+
+
 def install(monkeypatch, choices):
-    """Install a single scripted client instance for one run (iterator persists)."""
+    """Install scripted supervisor + MockTransport Ollama clients for one run."""
     client = _Client(choices)
     monkeypatch.setattr(orchestrator, "get_client", lambda: client)
+    monkeypatch.setattr(
+        orchestrator,
+        "build_ollama_client",
+        lambda: httpx.AsyncClient(transport=httpx.MockTransport(_ollama_handler)),
+    )
     return client
+
+
+def run(payload):
+    """Drive the now-async orchestrator.run from sync tests (no pytest-asyncio)."""
+    return asyncio.run(orchestrator.run(payload))
 
 
 def intent(identity="greet", confidence=0.9):
