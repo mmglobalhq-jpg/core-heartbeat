@@ -1,0 +1,115 @@
+openapi: 3.1.0
+info:
+  title: core-heartbeat gateway
+  version: 0.1.0
+  description: >
+    Gateway routing MVP. Accepts an IntentPayload, validates it, checks its
+    confidence against an environment-driven threshold, and returns one of three
+    outcomes through a shared response envelope. No handler dispatch.
+paths:
+  /intent:
+    post:
+      summary: Submit an intent for validation and threshold evaluation
+      operationId: submitIntent
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/IntentPayload'
+      responses:
+        '200':
+          description: Intent accepted (confidence >= threshold)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/IntentAccepted'
+        '422':
+          description: >
+            Rejected. Either validation_rejected (body violated the IntentPayload
+            contract) or threshold_rejected (valid intent below the threshold).
+            Distinguish via the `outcome` field.
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - $ref: '#/components/schemas/ThresholdRejected'
+                  - $ref: '#/components/schemas/ValidationRejected'
+                discriminator:
+                  propertyName: outcome
+  /health:
+    get:
+      summary: Liveness check
+      operationId: health
+      responses:
+        '200':
+          description: Gateway is online
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HealthStatus'
+components:
+  schemas:
+    IntentPayload:
+      description: See specs/001-intent-payload/contracts/intent_payload.schema.json (strict, extra=forbid).
+      type: object
+      additionalProperties: false
+      required: [intent, confidence, raw_input, source]
+      properties:
+        intent: { type: string, minLength: 1 }
+        confidence: { type: number, minimum: 0.0, maximum: 1.0 }
+        entities: { type: object, additionalProperties: true, default: {} }
+        raw_input: { type: string }
+        source: { type: string, minLength: 1 }
+        timestamp: { type: string, format: date-time }
+    GatewayResponse:
+      type: object
+      description: Shared envelope carried by every response.
+      required: [outcome]
+      properties:
+        outcome:
+          type: string
+          enum: [accepted, threshold_rejected, validation_rejected]
+        usage:
+          type: [object, "null"]
+          additionalProperties: true
+          description: Optional usage/metadata; empty/null in this MVP.
+          default: null
+    IntentAccepted:
+      allOf:
+        - $ref: '#/components/schemas/GatewayResponse'
+        - type: object
+          required: [outcome, intent, accepted, detail]
+          properties:
+            outcome: { const: accepted }
+            intent: { type: string }
+            accepted: { type: boolean, const: true }
+            detail: { type: string }
+    ThresholdRejected:
+      allOf:
+        - $ref: '#/components/schemas/GatewayResponse'
+        - type: object
+          required: [outcome, intent, confidence, threshold, detail]
+          properties:
+            outcome: { const: threshold_rejected }
+            intent: { type: string }
+            confidence: { type: number }
+            threshold: { type: number }
+            detail: { type: string }
+    ValidationRejected:
+      allOf:
+        - $ref: '#/components/schemas/GatewayResponse'
+        - type: object
+          required: [outcome, errors, detail]
+          properties:
+            outcome: { const: validation_rejected }
+            errors:
+              type: array
+              items: { type: object, additionalProperties: true }
+            detail: { type: string }
+    HealthStatus:
+      type: object
+      required: [status, service]
+      properties:
+        status: { type: string, example: online }
+        service: { type: string, example: core-heartbeat }

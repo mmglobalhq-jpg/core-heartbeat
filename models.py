@@ -1,10 +1,12 @@
 """Data models for core-heartbeat.
 
-See specs/001-intent-payload/data-model.md for the field contract and
-validation rules (VR-1..VR-7).
+See specs/001-intent-payload/data-model.md for the IntentPayload field contract
+and validation rules (VR-1..VR-7), and specs/002-gateway-routing/data-model.md
+for the gateway response envelope.
 """
 
 from datetime import datetime, timezone
+from enum import Enum
 from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -44,3 +46,64 @@ class IntentPayload(BaseModel):
     raw_input: str
     source: str = Field(min_length=1)
     timestamp: datetime = Field(default_factory=_utc_now)
+
+
+# ---------------------------------------------------------------------------
+# Gateway response envelope (feature 002).
+# Every gateway response shares GatewayResponse so callers get a consistent
+# shape with an optional usage/metadata map (FR-013). The `outcome` enum is the
+# authoritative discriminator between the three outcomes (SC-004).
+# ---------------------------------------------------------------------------
+
+
+class Outcome(str, Enum):
+    """The three distinguishable outcomes of an intent submission."""
+
+    ACCEPTED = "accepted"
+    THRESHOLD_REJECTED = "threshold_rejected"
+    VALIDATION_REJECTED = "validation_rejected"
+
+
+class GatewayResponse(BaseModel):
+    """Shared envelope carried by every gateway response.
+
+    ``usage`` is present in the schema but unpopulated in this MVP; it is
+    reserved for future token-count and cost pass-through (FR-013, SC-007).
+    """
+
+    outcome: Outcome
+    usage: dict[str, Any] | None = None
+
+
+class IntentAccepted(GatewayResponse):
+    """Success: a validated intent whose confidence met the threshold (HTTP 200)."""
+
+    outcome: Outcome = Outcome.ACCEPTED
+    intent: str
+    accepted: bool = True
+    detail: str = "Intent received and validated."
+
+
+class ThresholdRejected(GatewayResponse):
+    """Policy rejection: valid intent below the acceptance threshold (HTTP 422)."""
+
+    outcome: Outcome = Outcome.THRESHOLD_REJECTED
+    intent: str
+    confidence: float
+    threshold: float
+    detail: str = "Confidence below acceptance threshold."
+
+
+class ValidationRejected(GatewayResponse):
+    """Contract rejection: submission failed IntentPayload validation (HTTP 422)."""
+
+    outcome: Outcome = Outcome.VALIDATION_REJECTED
+    errors: list[dict[str, Any]]
+    detail: str = "Submission failed intent contract validation."
+
+
+class HealthStatus(BaseModel):
+    """Liveness response for GET /health (HTTP 200)."""
+
+    status: str = "online"
+    service: str = "core-heartbeat"

@@ -1,0 +1,87 @@
+"""Gateway routing endpoints for core-heartbeat.
+
+Exposes POST /intent (validate + threshold-check an IntentPayload) and
+GET /health (liveness). See specs/002-gateway-routing/ for the contract.
+
+The confidence-threshold policy lives here (per the IntentPayload spec's
+assumptions). No handler dispatch happens in this MVP.
+"""
+
+from collections.abc import Mapping
+from os import environ
+
+from fastapi import APIRouter, Depends, Request
+from fastapi.responses import JSONResponse
+
+from models import HealthStatus, IntentAccepted, IntentPayload, ThresholdRejected
+
+THRESHOLD_ENV_VAR = "HEARTBEAT_CONFIDENCE_THRESHOLD"
+DEFAULT_THRESHOLD = 0.5
+
+
+def load_confidence_threshold(env: Mapping[str, str] | None = None) -> float:
+    """Resolve the acceptance threshold from the environment at startup.
+
+    Rules (FR-009, FR-012):
+      - unset or blank             -> DEFAULT_THRESHOLD (0.5)
+      - parseable float in [0, 1]  -> that value
+      - out of range or unparseable -> ValueError (fail fast, named clearly)
+    """
+    source = environ if env is None else env
+    raw = source.get(THRESHOLD_ENV_VAR)
+    if raw is None or raw.strip() == "":
+        return DEFAULT_THRESHOLD
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        raise ValueError(
+            f"{THRESHOLD_ENV_VAR}={raw!r} is not a valid number; "
+            f"expected a float in [0.0, 1.0]."
+        ) from None
+    if not (0.0 <= value <= 1.0):
+        raise ValueError(
+            f"{THRESHOLD_ENV_VAR}={raw!r} is out of range; "
+            f"expected a float in [0.0, 1.0]."
+        )
+    return value
+
+
+def decide(confidence: float, threshold: float) -> bool:
+    """Accept iff confidence meets the threshold (inclusive `>=`)."""
+    return confidence >= threshold
+
+
+def get_threshold(request: Request) -> float:
+    """Dependency: the threshold resolved at startup and stored on app.state."""
+    return request.app.state.confidence_threshold
+
+
+router = APIRouter()
+
+
+@router.post("/intent")
+def submit_intent(
+    payload: IntentPayload,
+    threshold: float = Depends(get_threshold),
+) -> JSONResponse:
+    """Validate an intent and evaluate its confidence against the threshold.
+
+    Body validation is handled by FastAPI against IntentPayload; failures are
+    reshaped into a ValidationRejected envelope by the app's exception handler.
+    A valid payload is accepted (200) or threshold-rejected (422) here.
+    """
+    if decide(payload.confidence, threshold):
+        body = IntentAccepted(intent=payload.intent)
+        return JSONResponse(status_code=200, content=body.model_dump(mode="json"))
+    body = ThresholdRejected(
+        intent=payload.intent,
+        confidence=payload.confidence,
+        threshold=threshold,
+    )
+    return JSONResponse(status_code=422, content=body.model_dump(mode="json"))
+
+
+@router.get("/health")
+def health() -> HealthStatus:
+    """Liveness check: reports the gateway is online. No body, no side effects."""
+    return HealthStatus()
