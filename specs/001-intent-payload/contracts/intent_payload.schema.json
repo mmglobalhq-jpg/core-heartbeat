@@ -1,0 +1,42 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://core-heartbeat/contracts/intent_payload.schema.json",
+  "title": "IntentPayload",
+  "description": "Self-contained parsed intent carried from the API boundary to the router. Validated at construction; consumers may trust it without re-validating.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["intent", "confidence", "raw_input", "source"],
+  "properties": {
+    "intent": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Unique intent identity used by the router to select a handler (FR-001, FR-002)."
+    },
+    "confidence": {
+      "type": "number",
+      "minimum": 0.0,
+      "maximum": 1.0,
+      "description": "Normalized certainty in the identified intent, inclusive 0..1 (FR-003, FR-004)."
+    },
+    "entities": {
+      "type": "object",
+      "description": "Extracted parameters as a name->value map; may be empty (FR-005).",
+      "additionalProperties": true,
+      "default": {}
+    },
+    "raw_input": {
+      "type": "string",
+      "description": "Verbatim original input that produced the intent; not re-parsed or sanitized (FR-006)."
+    },
+    "timestamp": {
+      "type": "string",
+      "format": "date-time",
+      "description": "Timezone-aware UTC creation time, ISO-8601; auto-defaulted at construction, overridable (FR-007)."
+    },
+    "source": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Originating channel/component identifier, e.g. 'http', 'cli', 'webhook:slack' (FR-008)."
+    }
+  }
+}

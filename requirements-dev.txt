@@ -1,0 +1,11 @@
+# Dev-only dependencies (testing). Install with:
+#   ./venv/bin/pip install -r requirements-dev.txt
+# Includes the runtime stack plus the test toolchain.
+-r requirements.txt
+
+# Test framework and its pinned transitive deps
+pytest==9.1.1
+iniconfig==2.3.0
+packaging==26.2
+pluggy==1.6.0
+pygments==2.20.0
