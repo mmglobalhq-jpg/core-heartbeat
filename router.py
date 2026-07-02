@@ -14,6 +14,7 @@ from fastapi import APIRouter, Depends, Request
 from fastapi.responses import JSONResponse
 
 from models import HealthStatus, IntentAccepted, IntentPayload, ThresholdRejected
+from orchestrator import run as run_orchestration
 
 THRESHOLD_ENV_VAR = "HEARTBEAT_CONFIDENCE_THRESHOLD"
 DEFAULT_THRESHOLD = 0.5
@@ -68,10 +69,17 @@ def submit_intent(
 
     Body validation is handled by FastAPI against IntentPayload; failures are
     reshaped into a ValidationRejected envelope by the app's exception handler.
-    A valid payload is accepted (200) or threshold-rejected (422) here.
+    A valid payload is accepted (200) or threshold-rejected (422) here. On
+    acceptance the orchestration engine is triggered and its outcome + usage are
+    returned (feature 003).
     """
     if decide(payload.confidence, threshold):
-        body = IntentAccepted(intent=payload.intent)
+        outcome = run_orchestration(payload)
+        body = IntentAccepted(
+            intent=payload.intent,
+            orchestration=outcome,
+            usage=outcome.usage.model_dump(),
+        )
         return JSONResponse(status_code=200, content=body.model_dump(mode="json"))
     body = ThresholdRejected(
         intent=payload.intent,

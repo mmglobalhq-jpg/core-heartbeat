@@ -41,7 +41,11 @@ def test_accept_confident_intent(monkeypatch):
     assert body["outcome"] == "accepted"
     assert body["accepted"] is True
     assert body["intent"] == "greet"
-    assert "usage" in body and body["usage"] is None
+    # Feature 003: accepted intents trigger orchestration; usage is now populated
+    # (was null in feature 002) and an orchestration outcome is present.
+    assert isinstance(body["usage"], dict)
+    assert body["orchestration"] is not None
+    assert body["orchestration"]["nodes_executed"] == ["local_llm", "tool_execution"]
 
 
 def test_accept_exactly_at_threshold(monkeypatch):
@@ -121,5 +125,37 @@ def test_all_outcomes_share_envelope(monkeypatch):
 
     outcomes = {accepted["outcome"], threshold["outcome"], validation["outcome"]}
     assert outcomes == {"accepted", "threshold_rejected", "validation_rejected"}
+    # Every response shares the envelope: the `usage` key is always present.
     for body in (accepted, threshold, validation):
-        assert "usage" in body and body["usage"] is None
+        assert "usage" in body
+    # Feature 003: accepted usage is populated (engine ran); rejections stay null
+    # because the engine is not triggered for them (FR-013, SC-006).
+    assert isinstance(accepted["usage"], dict)
+    assert threshold["usage"] is None
+    assert validation["usage"] is None
+
+
+# --- Feature 003: orchestration integration (SC-005, SC-006) ----------------
+
+def test_accepted_intent_triggers_orchestration_with_usage(monkeypatch):
+    client = make_client(monkeypatch)  # default threshold 0.5
+    r = client.post("/intent", json=valid_payload(intent="greet", confidence=0.9))
+    assert r.status_code == 200
+    body = r.json()
+    assert body["orchestration"]["nodes_executed"] == ["local_llm", "tool_execution"]
+    assert body["orchestration"]["status"] == "completed"
+    assert body["usage"]["total_tokens"] == 35  # fixed increments (10+20+30) + (5+0+5)
+
+
+def test_rejections_do_not_trigger_orchestration(monkeypatch):
+    client = make_client(monkeypatch, threshold=0.7)
+    # below threshold -> engine not triggered, usage null, no orchestration data
+    low = client.post("/intent", json=valid_payload(confidence=0.6)).json()
+    assert low["outcome"] == "threshold_rejected"
+    assert low["usage"] is None
+    assert "orchestration" not in low
+    # invalid -> engine not triggered
+    bad = client.post("/intent", json=valid_payload(confidence=1.5)).json()
+    assert bad["outcome"] == "validation_rejected"
+    assert bad["usage"] is None
+    assert "orchestration" not in bad

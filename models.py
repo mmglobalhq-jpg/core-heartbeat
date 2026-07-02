@@ -49,6 +49,39 @@ class IntentPayload(BaseModel):
 
 
 # ---------------------------------------------------------------------------
+# Orchestration models (feature 003).
+# Carried through a LangGraph run and returned to the gateway. See
+# specs/003-langgraph-orchestration/data-model.md.
+# ---------------------------------------------------------------------------
+
+
+class Message(BaseModel):
+    """An ordered entry appended to the run's message history as a node executes."""
+
+    source: str  # which node produced it: "supervisor" / "local_llm" / "tool_execution"
+    content: str
+    step: int
+
+
+class TokenUsage(BaseModel):
+    """Additive token accumulator; model_dump()s into the response envelope usage field."""
+
+    input_tokens: int = 0
+    output_tokens: int = 0
+    total_tokens: int = 0
+
+
+class OrchestrationOutcome(BaseModel):
+    """The structured result of an orchestration run (FR-010)."""
+
+    status: str  # "completed" / "halted_step_bound" / "error"
+    nodes_executed: list[str]
+    messages: list[Message]
+    usage: TokenUsage
+    steps: int
+
+
+# ---------------------------------------------------------------------------
 # Gateway response envelope (feature 002).
 # Every gateway response shares GatewayResponse so callers get a consistent
 # shape with an optional usage/metadata map (FR-013). The `outcome` enum is the
@@ -76,12 +109,18 @@ class GatewayResponse(BaseModel):
 
 
 class IntentAccepted(GatewayResponse):
-    """Success: a validated intent whose confidence met the threshold (HTTP 200)."""
+    """Success: a validated intent whose confidence met the threshold (HTTP 200).
+
+    For accepted intents the orchestration engine is triggered (feature 003):
+    ``orchestration`` carries the run outcome and ``usage`` (inherited) is
+    populated from it (FR-011, FR-012).
+    """
 
     outcome: Outcome = Outcome.ACCEPTED
     intent: str
     accepted: bool = True
     detail: str = "Intent received and validated."
+    orchestration: OrchestrationOutcome | None = None
 
 
 class ThresholdRejected(GatewayResponse):
