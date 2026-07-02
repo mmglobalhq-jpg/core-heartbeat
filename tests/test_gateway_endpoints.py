@@ -7,7 +7,9 @@ GET /health, plus the shared-envelope invariants (Scenarios 1-6, 8; SC-001..SC-0
 import pytest
 from starlette.testclient import TestClient
 
+import orchestrator
 from main import create_app
+from models import RoutingDecision
 
 
 def make_client(monkeypatch, threshold=None):
@@ -17,6 +19,38 @@ def make_client(monkeypatch, threshold=None):
     else:
         monkeypatch.setenv("HEARTBEAT_CONFIDENCE_THRESHOLD", str(threshold))
     return TestClient(create_app())
+
+
+# --- scripted fake supervisor client (feature 004; no network) --------------
+
+class _Resp:
+    def __init__(self, choice):
+        self.parsed = RoutingDecision(next_node=choice)
+        self.text = None
+        self.usage_metadata = None
+
+
+class _FakeClient:
+    def __init__(self, choices):
+        it = iter(choices)
+
+        class _Models:
+            def generate_content(self, model, contents, config):
+                try:
+                    return _Resp(next(it))
+                except StopIteration:
+                    return _Resp("finish")
+
+        self.models = _Models()
+
+
+GREET_PLAN = ["local_llm", "tool_execution", "finish"]
+
+
+def install_supervisor(monkeypatch, choices=GREET_PLAN):
+    """Inject a scripted fake model client so accepted runs are deterministic."""
+    client = _FakeClient(choices)
+    monkeypatch.setattr(orchestrator, "get_client", lambda: client)
 
 
 def valid_payload(**overrides):
@@ -34,6 +68,7 @@ def valid_payload(**overrides):
 # --- US1: accept ------------------------------------------------------------
 
 def test_accept_confident_intent(monkeypatch):
+    install_supervisor(monkeypatch)  # feature 004: inject scripted fake model client
     client = make_client(monkeypatch)  # default threshold 0.5
     r = client.post("/intent", json=valid_payload(confidence=0.9))
     assert r.status_code == 200
@@ -118,6 +153,7 @@ def test_health(monkeypatch):
 # --- Polish: shared-envelope consistency (SC-004, SC-007) -------------------
 
 def test_all_outcomes_share_envelope(monkeypatch):
+    install_supervisor(monkeypatch)
     client = make_client(monkeypatch, threshold=0.7)
     accepted = client.post("/intent", json=valid_payload(confidence=0.9)).json()
     threshold = client.post("/intent", json=valid_payload(confidence=0.6)).json()
@@ -138,6 +174,7 @@ def test_all_outcomes_share_envelope(monkeypatch):
 # --- Feature 003: orchestration integration (SC-005, SC-006) ----------------
 
 def test_accepted_intent_triggers_orchestration_with_usage(monkeypatch):
+    install_supervisor(monkeypatch)  # scripted greet plan
     client = make_client(monkeypatch)  # default threshold 0.5
     r = client.post("/intent", json=valid_payload(intent="greet", confidence=0.9))
     assert r.status_code == 200
@@ -145,6 +182,19 @@ def test_accepted_intent_triggers_orchestration_with_usage(monkeypatch):
     assert body["orchestration"]["nodes_executed"] == ["local_llm", "tool_execution"]
     assert body["orchestration"]["status"] == "completed"
     assert body["usage"]["total_tokens"] == 35  # fixed increments (10+20+30) + (5+0+5)
+
+
+def test_accepted_no_key_degrades_gracefully(monkeypatch):
+    # Feature 004: with no GEMINI_API_KEY and no injected client, the Supervisor
+    # cannot route -> the run degrades safely but still returns HTTP 200 (SC-003).
+    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+    client = make_client(monkeypatch)
+    r = client.post("/intent", json=valid_payload(confidence=0.9))
+    assert r.status_code == 200
+    body = r.json()
+    assert body["outcome"] == "accepted"
+    assert body["orchestration"]["status"] == "degraded"
+    assert body["orchestration"]["nodes_executed"] == []
 
 
 def test_rejections_do_not_trigger_orchestration(monkeypatch):

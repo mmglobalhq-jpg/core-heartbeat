@@ -1,6 +1,8 @@
 # Dev-only dependencies (testing). Install with:
 #   ./venv/bin/pip install -r requirements-dev.txt
 # Includes the runtime stack plus the test toolchain.
+# Note: httpx/httpcore are now RUNTIME deps (required by google-genai) and live
+# in requirements.txt; the FastAPI TestClient reuses them.
 -r requirements.txt
 
 # Test framework and its pinned transitive deps
@@ -8,8 +10,3 @@ pytest==9.1.1
 iniconfig==2.3.0
 pluggy==1.6.0
 pygments==2.20.0
-
-# HTTP client powering FastAPI/Starlette's in-process TestClient (endpoint tests).
-# Note: certifi is a runtime dep (via requests) and lives in requirements.txt.
-httpx==0.28.1
-httpcore==1.0.9

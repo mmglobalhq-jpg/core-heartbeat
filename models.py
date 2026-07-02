@@ -7,7 +7,7 @@ for the gateway response envelope.
 
 from datetime import datetime, timezone
 from enum import Enum
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -74,11 +74,32 @@ class TokenUsage(BaseModel):
 class OrchestrationOutcome(BaseModel):
     """The structured result of an orchestration run (FR-010)."""
 
-    status: str  # "completed" / "halted_step_bound" / "error"
+    # "completed" / "halted_step_bound" / "error" / "degraded"
+    # ("degraded" = terminated safely after a Supervisor model-routing failure, feature 004)
+    status: str
     nodes_executed: list[str]
     messages: list[Message]
     usage: TokenUsage
     steps: int
+
+
+class RoutingDecision(BaseModel):
+    """Strict schema for the Supervisor's model routing decision (feature 004).
+
+    Used both as the model's response_schema and to re-validate the response.
+    ``next_node`` is constrained to the graph's routing vocabulary (FR-002).
+    """
+
+    next_node: Literal["local_llm", "tool_execution", "finish"]
+
+
+class RoutingFailure(BaseModel):
+    """A categorized Supervisor routing failure, recorded for observability (FR-008)."""
+
+    category: Literal[
+        "missing_credential", "auth", "timeout", "network", "invalid_output"
+    ]
+    detail: str
 
 
 # ---------------------------------------------------------------------------
