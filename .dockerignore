@@ -1,0 +1,14 @@
+# Keep the build context small; the venv especially must never be copied in.
+venv
+__pycache__
+**/__pycache__
+*.pyc
+.pytest_cache
+.git
+.gitignore
+Dockerfile
+.dockerignore
+# Secrets are provided at runtime via compose env_file, not baked into the image.
+.env
+.claude
+.specify
