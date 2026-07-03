@@ -221,6 +221,13 @@ def test_health(monkeypatch):
     assert body["service"] == "core-heartbeat"
 
 
+def test_health_accepts_head(monkeypatch):
+    # Uptime probes issue HEAD (curl -I); the route must answer 200, not 405.
+    client = make_client(monkeypatch)
+    r = client.head("/health")
+    assert r.status_code == 200
+
+
 # --- Polish: shared-envelope consistency (SC-004, SC-007) -------------------
 
 def test_all_outcomes_share_envelope(monkeypatch):

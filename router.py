@@ -120,7 +120,12 @@ async def submit_intent_stream(
     return StreamingResponse(event_stream(), media_type="text/event-stream")
 
 
-@router.get("/health")
+@router.api_route("/health", methods=["GET", "HEAD"])
 def health() -> HealthStatus:
-    """Liveness check: reports the gateway is online. No body, no side effects."""
+    """Liveness check: reports the gateway is online. No body, no side effects.
+
+    Accepts HEAD as well as GET so uptime probes that issue ``curl -I`` /
+    HEAD-only monitors get a 200 instead of a 405 (Starlette does not auto-add
+    HEAD for GET routes).
+    """
     return HealthStatus()
