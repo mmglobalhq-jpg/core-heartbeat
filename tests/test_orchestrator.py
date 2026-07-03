@@ -55,7 +55,7 @@ def _ollama_handler(request):
 def install(monkeypatch, choices):
     """Install scripted supervisor + MockTransport Ollama clients for one run."""
     client = _Client(choices)
-    monkeypatch.setattr(orchestrator, "get_client", lambda: client)
+    monkeypatch.setattr(orchestrator, "get_client", lambda *a, **k: client)
     monkeypatch.setattr(
         orchestrator,
         "build_ollama_client",

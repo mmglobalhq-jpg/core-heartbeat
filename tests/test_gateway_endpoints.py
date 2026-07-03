@@ -69,7 +69,7 @@ def install_ollama(monkeypatch, handler=_ollama_handler):
 def install_supervisor(monkeypatch, choices=GREET_PLAN):
     """Inject scripted supervisor + MockTransport Ollama clients for accepted runs."""
     client = _FakeClient(choices)
-    monkeypatch.setattr(orchestrator, "get_client", lambda: client)
+    monkeypatch.setattr(orchestrator, "get_client", lambda *a, **k: client)
     install_ollama(monkeypatch)
 
 
@@ -108,6 +108,57 @@ def test_accept_exactly_at_threshold(monkeypatch):
     r = client.post("/intent", json=valid_payload(confidence=0.7))
     assert r.status_code == 200
     assert r.json()["outcome"] == "accepted"
+
+
+# --- Feature 006: model_preference flows through the request body -----------
+
+class _FakeOpenAIClient:
+    """Minimal OpenAI-shaped fake returning a fixed decision (no network, no SDK)."""
+
+    def __init__(self, next_node="finish"):
+        content = f'{{"next_node": "{next_node}"}}'
+
+        class _Completions:
+            def create(self, model, messages, response_format):
+                msg = type("Msg", (), {"content": content})()
+                choice = type("Choice", (), {"message": msg})()
+                return type("Resp", (), {"choices": [choice], "usage": None})()
+
+        self.chat = type("Chat", (), {"completions": _Completions()})()
+
+
+def test_model_preference_selects_provider_via_gateway(monkeypatch):
+    # A gpt-4o-mini preference in the body drives the OpenAI provider path; inject
+    # an OpenAI-shaped client so the accepted run routes with no real network.
+    seen = {}
+
+    def fake_get_client(model_preference=orchestrator.DEFAULT_MODEL_PREFERENCE):
+        seen["model"] = model_preference
+        return _FakeOpenAIClient(next_node="finish")
+
+    monkeypatch.setattr(orchestrator, "get_client", fake_get_client)
+    client = make_client(monkeypatch)  # default threshold 0.5
+    r = client.post("/intent", json=valid_payload(confidence=0.9, model_preference="gpt-4o-mini"))
+    assert r.status_code == 200
+    body = r.json()
+    assert body["outcome"] == "accepted"
+    assert seen["model"] == "gpt-4o-mini"  # the dropdown value reached the Supervisor
+    assert body["orchestration"]["status"] == "completed"
+
+
+def test_model_preference_defaults_when_omitted(monkeypatch):
+    # Omitting model_preference defaults to gemini (the field's default).
+    seen = {}
+
+    def fake_get_client(model_preference=orchestrator.DEFAULT_MODEL_PREFERENCE):
+        seen["model"] = model_preference
+        return _FakeClient(["finish"])  # gemini-shaped
+
+    monkeypatch.setattr(orchestrator, "get_client", fake_get_client)
+    client = make_client(monkeypatch)
+    r = client.post("/intent", json=valid_payload(confidence=0.9))
+    assert r.status_code == 200
+    assert seen["model"] == "gemini-2.5-flash"
 
 
 # --- US2: threshold rejection ----------------------------------------------
@@ -222,7 +273,7 @@ def test_accepted_local_worker_failure_degrades_gracefully(monkeypatch):
     # unreachable. The run still returns HTTP 200, terminates, and records a
     # categorized local-worker failure in the orchestration messages (SC-003).
     client_ = _FakeClient(["local_llm", "finish"])
-    monkeypatch.setattr(orchestrator, "get_client", lambda: client_)
+    monkeypatch.setattr(orchestrator, "get_client", lambda *a, **k: client_)
 
     def _refuse(request):
         raise httpx.ConnectError("refused")

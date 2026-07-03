@@ -36,6 +36,10 @@ class IntentPayload(BaseModel):
         raw_input: Verbatim original input that produced the intent (FR-006).
         timestamp: Timezone-aware UTC creation time, auto-defaulted (FR-007).
         source: Originating channel/component identifier (FR-008).
+        model_preference: Optional caller-selected Supervisor model (feature 006).
+            Drives which provider the orchestrator's Supervisor uses; defaults to
+            the Gemini flash model. Surfaced so a UI model dropdown can steer
+            routing. Unknown values fall back to the default provider.
     """
 
     model_config = ConfigDict(extra="forbid", frozen=True)
@@ -46,6 +50,7 @@ class IntentPayload(BaseModel):
     raw_input: str
     source: str = Field(min_length=1)
     timestamp: datetime = Field(default_factory=_utc_now)
+    model_preference: str | None = "gemini-2.5-flash"
 
 
 # ---------------------------------------------------------------------------

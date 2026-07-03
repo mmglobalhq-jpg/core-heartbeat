@@ -183,7 +183,7 @@ class _SupClient:
 
 def test_full_run_terminates_despite_local_failure(monkeypatch):
     monkeypatch.setattr(
-        orchestrator, "get_client", lambda: _SupClient(["local_llm", "finish"])
+        orchestrator, "get_client", lambda *a, **k: _SupClient(["local_llm", "finish"])
     )
     install_ollama(monkeypatch, raising_handler(httpx.ReadTimeout("slow")))
     outcome = asyncio.run(orchestrator.run(
