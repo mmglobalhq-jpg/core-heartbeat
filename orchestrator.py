@@ -43,6 +43,34 @@ MODEL_NAME = "gemini-2.5-flash"
 GEMINI_API_KEY_ENV = "GEMINI_API_KEY"
 REQUEST_TIMEOUT_MS = 10_000  # bound each model call (FR-006); milliseconds
 
+# Multi-model Supervisor support (feature 006). A caller-selected
+# `model_preference` on the intent picks the provider; each maps to a provider id
+# and the provider's real API model id. Unknown preferences fall back to the
+# default. OpenAI/Anthropic SDKs are imported lazily in their client constructors,
+# so the service boots without them and a missing SDK degrades like a missing key.
+OPENAI_API_KEY_ENV = "OPENAI_API_KEY"
+ANTHROPIC_API_KEY_ENV = "ANTHROPIC_API_KEY"
+DEFAULT_MODEL_PREFERENCE = "gemini-2.5-flash"
+MODEL_REGISTRY: dict[str, tuple[str, str]] = {
+    # dropdown value       -> (provider, provider API model id)
+    "gemini-2.5-flash": ("gemini", "gemini-2.5-flash"),
+    "gpt-4o-mini": ("openai", "gpt-4o-mini"),
+    # Claude 3.5 Haiku reached end-of-life 2026-02-19 (claude-3-5-haiku-latest /
+    # -20241022 now 404). claude-haiku-4-5 is the current Haiku (its documented
+    # drop-in replacement); alias used to match the other registry entries.
+    "claude-3.5-haiku": ("anthropic", "claude-haiku-4-5"),
+}
+# Shared JSON Schema for the routing decision, reused as OpenAI's json_schema and
+# Anthropic's tool input_schema so every provider is forced to the same shape.
+ROUTING_JSON_SCHEMA: dict = {
+    "type": "object",
+    "properties": {
+        "next_node": {"type": "string", "enum": ["local_llm", "tool_execution", "finish"]}
+    },
+    "required": ["next_node"],
+    "additionalProperties": False,
+}
+
 # Local Ollama worker (feature 005). All three are read from the environment at
 # node-invoke time so tests/deployments can override without rebuilding the graph.
 OLLAMA_URL_ENV = "OLLAMA_URL"
@@ -87,39 +115,96 @@ class GraphState(TypedDict):
     status: str
 
 
-# --- model client (feature 004) ---------------------------------------------
+# --- model client (feature 004; multi-provider in feature 006) --------------
 
-_client_cache: tuple[str, genai.Client] | None = None
+# provider -> (key, client). One memoized client per provider, rebuilt if its key
+# changes. Keyed by provider so gemini/openai/anthropic clients coexist.
+_client_cache: dict[str, tuple[str, object]] = {}
 
 
-def get_client() -> genai.Client | None:
-    """Construct (and memoize) a GenAI client from GEMINI_API_KEY.
+def _resolve_model(model_preference: str | None) -> tuple[str, str]:
+    """Map a caller preference to (provider, api_model_id); unknown -> default."""
+    pref = model_preference or DEFAULT_MODEL_PREFERENCE
+    return MODEL_REGISTRY.get(pref, MODEL_REGISTRY[DEFAULT_MODEL_PREFERENCE])
 
-    Returns None if the key is unset/blank so a missing credential becomes a
-    categorized failure and the service stays bootable without a key (FR-003).
-    The client is cached and reused across Supervisor visits; the cache is keyed
-    on the key value, so a changed key rebuilds. The key is passed to the SDK
-    and never logged.
+
+def _construct_gemini(key: str) -> object:
+    return genai.Client(api_key=key)
+
+
+def _construct_openai(key: str) -> object:
+    from openai import OpenAI  # lazy: keep the service bootable without the SDK
+
+    return OpenAI(api_key=key, timeout=REQUEST_TIMEOUT_MS / 1000)
+
+
+def _construct_anthropic(key: str) -> object:
+    from anthropic import Anthropic  # lazy import (see above)
+
+    return Anthropic(api_key=key, timeout=REQUEST_TIMEOUT_MS / 1000)
+
+
+_PROVIDERS: dict[str, tuple[str, object]] = {
+    "gemini": (GEMINI_API_KEY_ENV, _construct_gemini),
+    "openai": (OPENAI_API_KEY_ENV, _construct_openai),
+    "anthropic": (ANTHROPIC_API_KEY_ENV, _construct_anthropic),
+}
+
+
+def get_client(model_preference: str | None = DEFAULT_MODEL_PREFERENCE) -> object | None:
+    """Construct (and memoize) the provider client for the selected model.
+
+    The provider is derived from `model_preference` (feature 006). Returns None if
+    the provider's API key is unset/blank OR its SDK is not installed, so both a
+    missing credential and a missing SDK become a categorized `missing_credential`
+    degrade and the service stays bootable without any key/SDK (FR-003). One
+    client is cached per provider, keyed on the key value (a changed key rebuilds).
+    The key is passed to the SDK and never logged.
     """
-    global _client_cache
-    key = os.environ.get(GEMINI_API_KEY_ENV)
+    provider, _ = _resolve_model(model_preference)
+    key_env, construct = _PROVIDERS[provider]
+    key = os.environ.get(key_env)
     if not key or not key.strip():
         return None
-    if _client_cache is None or _client_cache[0] != key:
-        _client_cache = (key, genai.Client(api_key=key))
-    return _client_cache[1]
+    cached = _client_cache.get(provider)
+    if cached is None or cached[0] != key:
+        try:
+            client = construct(key)
+        except Exception:
+            # SDK missing or client could not be built -> degrade like a missing key.
+            return None
+        _client_cache[provider] = (key, client)
+    return _client_cache[provider][1]
 
 
 def _build_prompt(state: GraphState) -> str:
-    """Deterministic routing prompt derived from the intent + message history."""
+    """Deterministic routing prompt derived from the intent + message history.
+
+    The prompt carries an explicit completion policy: the Supervisor must choose
+    `finish` once the intent has already been answered by a worker, and must not
+    re-dispatch a worker that has already replied. Without this, a model tends to
+    keep routing a general chat back to local_llm until the MAX_STEPS guard fires
+    (observed with gemini-2.5-flash). A running worker-reply count is surfaced so
+    the decision does not depend on the model re-reading the whole history.
+    """
     intent = state["intent"]
-    history = "\n".join(f"{m.source}: {m.content}" for m in state.get("messages", []))
+    messages = state.get("messages", [])
+    history = "\n".join(f"{m.source}: {m.content}" for m in messages)
+    worker_replies = sum(1 for m in messages if m.source in WORKER_NODES)
     return (
         "You are the Supervisor in an orchestration graph. Decide the single "
         "next step for this run.\n"
+        "Routing policy:\n"
+        "- Route to local_llm to generate a conversational or reasoned reply, or "
+        "to tool_execution to run an external action/tool.\n"
+        "- Choose finish as soon as the intent has been satisfied. If a worker "
+        "has already produced a reply that answers the intent (e.g. a general "
+        "chat message), you MUST choose finish. Never re-dispatch a worker that "
+        "has already answered.\n"
         f"Intent: {intent.intent}\n"
         f"Confidence: {intent.confidence}\n"
         f"Raw input: {intent.raw_input}\n"
+        f"Worker replies so far: {worker_replies}\n"
         f"History so far:\n{history or '(none)'}\n"
         "Respond with next_node = one of: local_llm, tool_execution, finish."
     )
@@ -155,18 +240,52 @@ def _detail(exc: Exception) -> str:
     return f"{type(exc).__name__}: {exc}"[:200]
 
 
-def request_routing_decision(
-    state: GraphState, client: genai.Client
-) -> tuple[RoutingDecision | None, RoutingFailure | None, TokenUsage]:
-    """Ask the model for a routing decision. Never raises.
+def _categorize_api_error(exc: Exception) -> str:
+    """Map a provider API-call exception to a RoutingFailure category (never invalid_output).
 
-    Returns exactly one of (decision, failure) non-None, plus a TokenUsage
-    (zeros when the model reports none or on a pre-response failure).
+    Duck-typed so OpenAI/Anthropic SDK error classes need not be imported: both
+    wrap httpx and expose a `status_code`. Used only for call-time failures;
+    parsing failures are categorized separately as `invalid_output`.
     """
+    if isinstance(exc, httpx.TimeoutException):
+        return "timeout"
+    name = type(exc).__name__.lower()
+    if "timeout" in name:
+        return "timeout"
+    status = getattr(exc, "status_code", None) or getattr(exc, "status", None) or getattr(exc, "code", None)
+    if status in (401, 403) or "authentication" in name or "permission" in name:
+        return "auth"
+    return "network"
+
+
+def request_routing_decision(
+    state: GraphState,
+    client: object,
+    model_preference: str | None = DEFAULT_MODEL_PREFERENCE,
+) -> tuple[RoutingDecision | None, RoutingFailure | None, TokenUsage]:
+    """Ask the selected provider's model for a routing decision. Never raises.
+
+    Dispatches on the provider derived from `model_preference` (feature 006) and
+    normalizes every provider's response into the strict `RoutingDecision`. Returns
+    exactly one of (decision, failure) non-None, plus a TokenUsage (zeros when the
+    model reports none or on a pre-response failure).
+    """
+    provider, api_model = _resolve_model(model_preference)
+    if provider == "openai":
+        return _decide_openai(state, client, api_model)
+    if provider == "anthropic":
+        return _decide_anthropic(state, client, api_model)
+    return _decide_gemini(state, client, api_model)
+
+
+def _decide_gemini(
+    state: GraphState, client: object, api_model: str
+) -> tuple[RoutingDecision | None, RoutingFailure | None, TokenUsage]:
+    """Gemini path via the Google GenAI SDK's native structured output (feature 004)."""
     prompt = _build_prompt(state)
     try:
         response = client.models.generate_content(
-            model=MODEL_NAME,
+            model=api_model,
             contents=prompt,
             config=types.GenerateContentConfig(
                 response_mime_type="application/json",
@@ -192,6 +311,88 @@ def request_routing_decision(
     except Exception as exc:  # JSON error / ValidationError / out-of-vocab
         return None, RoutingFailure(category="invalid_output", detail=_detail(exc)), usage
     return decision, None, usage
+
+
+def _decide_openai(
+    state: GraphState, client: object, api_model: str
+) -> tuple[RoutingDecision | None, RoutingFailure | None, TokenUsage]:
+    """OpenAI path via chat.completions with a strict json_schema response_format."""
+    prompt = _build_prompt(state)
+    try:
+        response = client.chat.completions.create(
+            model=api_model,
+            messages=[{"role": "user", "content": prompt}],
+            response_format={
+                "type": "json_schema",
+                "json_schema": {
+                    "name": "routing_decision",
+                    "strict": True,
+                    "schema": ROUTING_JSON_SCHEMA,
+                },
+            },
+        )
+    except Exception as exc:  # never crash the graph
+        return None, RoutingFailure(category=_categorize_api_error(exc), detail=_detail(exc)), TokenUsage()
+
+    usage = _openai_usage(response)
+    try:
+        content = response.choices[0].message.content
+        decision = RoutingDecision.model_validate(json.loads(content))
+    except Exception as exc:  # JSON error / ValidationError / out-of-vocab / bad shape
+        return None, RoutingFailure(category="invalid_output", detail=_detail(exc)), usage
+    return decision, None, usage
+
+
+def _decide_anthropic(
+    state: GraphState, client: object, api_model: str
+) -> tuple[RoutingDecision | None, RoutingFailure | None, TokenUsage]:
+    """Anthropic path via the Messages API with a forced tool call for structure."""
+    prompt = _build_prompt(state)
+    tool = {
+        "name": "route",
+        "description": "Return the single next node for the orchestration graph.",
+        "input_schema": ROUTING_JSON_SCHEMA,
+    }
+    try:
+        response = client.messages.create(
+            model=api_model,
+            max_tokens=64,
+            messages=[{"role": "user", "content": prompt}],
+            tools=[tool],
+            tool_choice={"type": "tool", "name": "route"},
+        )
+    except Exception as exc:  # never crash the graph
+        return None, RoutingFailure(category=_categorize_api_error(exc), detail=_detail(exc)), TokenUsage()
+
+    usage = _anthropic_usage(response)
+    try:
+        block = next(b for b in response.content if getattr(b, "type", None) == "tool_use")
+        decision = RoutingDecision.model_validate(block.input)
+    except Exception as exc:  # no tool_use block / ValidationError / out-of-vocab
+        return None, RoutingFailure(category="invalid_output", detail=_detail(exc)), usage
+    return decision, None, usage
+
+
+def _openai_usage(response) -> TokenUsage:
+    """Map OpenAI's response.usage into TokenUsage (zeros if absent)."""
+    u = getattr(response, "usage", None)
+    if u is None:
+        return TokenUsage()
+    return TokenUsage(
+        input_tokens=getattr(u, "prompt_tokens", 0) or 0,
+        output_tokens=getattr(u, "completion_tokens", 0) or 0,
+        total_tokens=getattr(u, "total_tokens", 0) or 0,
+    )
+
+
+def _anthropic_usage(response) -> TokenUsage:
+    """Map Anthropic's response.usage into TokenUsage (total = input + output)."""
+    u = getattr(response, "usage", None)
+    if u is None:
+        return TokenUsage()
+    inp = getattr(u, "input_tokens", 0) or 0
+    out = getattr(u, "output_tokens", 0) or 0
+    return TokenUsage(input_tokens=inp, output_tokens=out, total_tokens=inp + out)
 
 
 # --- local Ollama worker (feature 005) --------------------------------------
@@ -308,11 +509,20 @@ def supervisor(state: GraphState) -> dict:
             "messages": [Message(source="supervisor", content="route -> finish (step bound)", step=step)],
         }
 
-    client = get_client()
+    # Feature 006: the caller's model_preference selects the provider/model.
+    model_pref = getattr(state["intent"], "model_preference", None) or DEFAULT_MODEL_PREFERENCE
+    provider, _ = _resolve_model(model_pref)
+    client = get_client(model_pref)
     if client is None:
-        return _degraded(step, RoutingFailure(category="missing_credential", detail="GEMINI_API_KEY not set"))
+        return _degraded(
+            step,
+            RoutingFailure(
+                category="missing_credential",
+                detail=f"no client for model_preference={model_pref!r} (provider={provider})",
+            ),
+        )
 
-    decision, failure, usage = request_routing_decision(state, client)
+    decision, failure, usage = request_routing_decision(state, client, model_pref)
     if failure is not None:
         return _degraded(step, failure, usage)
 
