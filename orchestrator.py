@@ -727,14 +727,18 @@ async def run(payload: IntentPayload) -> OrchestrationOutcome:
 async def astream_run(payload: IntentPayload) -> AsyncIterator[dict]:
     """Drive the graph via ``astream_events`` and yield progressive event dicts.
 
-    Emits one ``{"token": <text>}`` chunk per worker-node result (local_llm /
-    tool_execution), then a terminal ``{"status": <final status>}``. This is
-    **node-granular**, not per-token: local_llm calls Ollama with ``stream=False``
-    (a single blocking request), and no graph node is a LangChain LLM runnable, so
-    ``astream_events`` never emits ``on_llm_stream`` — a worker's full reply
-    arrives as one chunk on its ``on_chain_end``. To get true per-token streaming,
-    generate_local must switch to Ollama's streaming NDJSON and dispatch custom
-    events. Never raises: a run error is surfaced as a terminal error status.
+    Emits ``{"token": <text>}`` chunks progressively, then a terminal
+    ``{"status": <final status>}``. local_llm streams true per-token: it calls
+    Ollama with ``stream=True`` and dispatches a LOCAL_TOKEN_EVENT custom event
+    per chunk, surfaced here as ``on_custom_event``. tool_execution is a
+    non-streaming stub whose reply is emitted whole on ``on_chain_end``.
+
+    Fallback (important): if a local_llm run streams NO tokens — a degraded
+    Ollama call that only recorded a failure notice, or any non-streamed reply —
+    its final ``on_chain_end`` message is emitted instead, so a run that a guard
+    or finish stamps ``completed`` never reaches the client with an empty body
+    ("No reply produced"). Never raises: a run error is surfaced as an error
+    status.
 
     The caller (router) is responsible for SSE framing; this yields plain dicts.
     """
@@ -748,13 +752,19 @@ async def astream_run(payload: IntentPayload) -> AsyncIterator[dict]:
         "status": "",
     }
     final_status = "completed"
+    streamed_local_tokens = False
     try:
         async for event in graph.astream_events(
             initial, version="v2", config={"recursion_limit": RECURSION_LIMIT}
         ):
             etype = event["event"]
+            name = event.get("name")
+            # A fresh local_llm invocation resets the per-run "did it stream?" flag.
+            if etype == "on_chain_start" and name == "local_llm":
+                streamed_local_tokens = False
             # Per-token stream from local_llm (see LOCAL_TOKEN_EVENT / _emit).
-            if etype == "on_custom_event" and event.get("name") == LOCAL_TOKEN_EVENT:
+            if etype == "on_custom_event" and name == LOCAL_TOKEN_EVENT:
+                streamed_local_tokens = True
                 yield {"token": event["data"]["token"]}
                 continue
             if etype != "on_chain_end":
@@ -763,9 +773,17 @@ async def astream_run(payload: IntentPayload) -> AsyncIterator[dict]:
             if not isinstance(output, dict):
                 continue
             # tool_execution is a non-streaming stub — emit its reply as one chunk.
-            if event.get("name") == "tool_execution":
+            if name == "tool_execution":
                 for message in output.get("messages", []):
                     yield {"token": message.content}
+            # local_llm normally streams live tokens; if this run streamed NONE
+            # (a degraded call that only recorded a failure notice, or any
+            # non-streamed reply), surface its final message so the content is not
+            # silently dropped behind a "completed" status.
+            if name == "local_llm" and not streamed_local_tokens:
+                for message in output.get("messages", []):
+                    if message.content:
+                        yield {"token": message.content}
             # The supervisor stamps the terminal status on finish/degrade/halt.
             if output.get("status"):
                 final_status = output["status"]

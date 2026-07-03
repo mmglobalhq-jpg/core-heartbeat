@@ -242,3 +242,22 @@ def test_astream_run_streams_tokens_then_status(monkeypatch):
     tokens = [e["token"] for e in events if "token" in e]
     assert tokens == ["Hi", " there"]             # streamed via on_custom_event
     assert events[-1] == {"status": "completed"}  # terminal marker last
+
+
+def test_astream_run_surfaces_local_message_when_no_tokens(monkeypatch):
+    # A degraded local_llm streams NO tokens (it only records a failure notice).
+    # astream_run must still surface that final message so a run stamped
+    # "completed" (by finish or the anti-reloop guard) does not reach the client
+    # with an empty body — which the UI renders as "No reply produced".
+    sup = _SupClient(["local_llm", "finish"])
+    monkeypatch.setattr(orchestrator, "get_client", lambda *a, **k: sup)
+    install_ollama(monkeypatch, raising_handler(httpx.ConnectError("refused")))
+
+    async def _run():
+        payload = IntentPayload(intent="chat", confidence=0.95, raw_input="x", source="cli")
+        return [ev async for ev in orchestrator.astream_run(payload)]
+
+    events = asyncio.run(_run())
+    tokens = [e["token"] for e in events if "token" in e]
+    assert tokens == ["local inference failure: unreachable"]  # failure surfaced, not dropped
+    assert events[-1] == {"status": "completed"}
