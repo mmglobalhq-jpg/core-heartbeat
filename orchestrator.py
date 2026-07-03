@@ -14,6 +14,7 @@ recursion_limit. See specs/003-* and specs/004-api-supervisor/.
 import json
 import operator
 import os
+from collections.abc import AsyncIterator, Awaitable, Callable
 from typing import Annotated
 
 from typing_extensions import TypedDict
@@ -22,6 +23,7 @@ from google import genai
 from google.genai import errors, types
 import httpx
 
+from langchain_core.callbacks import adispatch_custom_event
 from langgraph.errors import GraphRecursionError
 from langgraph.graph import END, StateGraph
 
@@ -84,6 +86,10 @@ DEFAULT_OLLAMA_TIMEOUT_MS = 120_000  # local 7B generation can be slow; bound it
 TOOL_USAGE = TokenUsage(input_tokens=5, output_tokens=0, total_tokens=5)
 
 WORKER_NODES = ["local_llm", "tool_execution"]
+
+# Name of the LangGraph custom event the local_llm node dispatches per generated
+# token; astream_run surfaces it (as on_custom_event) into the SSE stream.
+LOCAL_TOKEN_EVENT = "local_llm_token"
 
 
 # --- reducers ---------------------------------------------------------------
@@ -447,38 +453,69 @@ def _extract_ollama_usage(body: dict) -> TokenUsage:
 
 
 async def generate_local(
-    state: GraphState, client: httpx.AsyncClient
+    state: GraphState,
+    client: httpx.AsyncClient,
+    on_token: Callable[[str], Awaitable[None]] | None = None,
 ) -> tuple[str | None, WorkerFailure | None, TokenUsage]:
-    """Ask the local Ollama service to generate for this run. Never raises.
+    """Stream a generation from the local Ollama service. Never raises.
 
-    Returns exactly one of (text, failure) non-None, plus a TokenUsage (zeros on
-    failure or when the response reports no counts). Makes one non-streaming POST,
-    bounded by the client's timeout (FR-007). See contracts/local_worker.md.
+    Issues one streaming POST. Ollama replies with NDJSON — one JSON object per
+    line, each carrying an incremental ``response`` chunk, the final one
+    ``done: true`` with the token counts. Each chunk is passed to ``on_token``
+    (if given) as it arrives — the seam the SSE endpoint uses for per-token
+    streaming — and also accumulated into the full reply so the graph state and
+    the non-streaming ``/intent`` path are unchanged. Returns exactly one of
+    (text, failure) non-None plus a TokenUsage. Bounded by the client's timeout
+    (FR-007). See contracts/local_worker.md.
     """
     payload = {
         "model": _ollama_model(),
         "prompt": _build_local_prompt(state),
-        "stream": False,
+        "stream": True,
     }
+    parts: list[str] = []
+    saw_response = False
+    usage_body: dict = {}
     try:
-        response = await client.post(_ollama_url(), json=payload)
+        async with client.stream("POST", _ollama_url(), json=payload) as response:
+            if response.status_code // 100 != 2:
+                return None, WorkerFailure(
+                    category="invalid_output", detail=f"HTTP {response.status_code}"
+                ), TokenUsage()
+            async for line in response.aiter_lines():
+                line = line.strip()
+                if not line:
+                    continue
+                obj = json.loads(line)  # JSONDecodeError -> invalid_output below
+                if obj.get("error"):
+                    return None, WorkerFailure(
+                        category="invalid_output", detail=str(obj["error"])[:200]
+                    ), TokenUsage()
+                if "response" in obj:
+                    saw_response = True
+                    chunk = obj["response"] or ""
+                    if chunk:
+                        parts.append(chunk)
+                        if on_token is not None:
+                            await on_token(chunk)
+                # Token counts ride the final done chunk (or the whole body when a
+                # server/mocks return a single non-streamed object).
+                if obj.get("prompt_eval_count") is not None or obj.get("eval_count") is not None:
+                    usage_body = obj
     except httpx.TimeoutException as exc:
         return None, WorkerFailure(category="timeout", detail=_detail(exc)), TokenUsage()
     except httpx.TransportError as exc:  # ConnectError, read/connect transport failures
         return None, WorkerFailure(category="unreachable", detail=_detail(exc)), TokenUsage()
+    except json.JSONDecodeError as exc:  # malformed NDJSON line
+        return None, WorkerFailure(category="invalid_output", detail=_detail(exc)), TokenUsage()
     except Exception as exc:  # last-resort safety net: never crash the graph
         return None, WorkerFailure(category="unreachable", detail=_detail(exc)), TokenUsage()
 
-    if response.status_code // 100 != 2:
+    if not saw_response:  # no chunk ever carried a "response" field
         return None, WorkerFailure(
-            category="invalid_output", detail=f"HTTP {response.status_code}"
+            category="invalid_output", detail="no 'response' field in stream"
         ), TokenUsage()
-    try:
-        body = response.json()
-        text = body["response"]  # KeyError if the field is missing
-    except Exception as exc:  # JSON decode error / missing field
-        return None, WorkerFailure(category="invalid_output", detail=_detail(exc)), TokenUsage()
-    return text, None, _extract_ollama_usage(body)
+    return "".join(parts), None, _extract_ollama_usage(usage_body)
 
 
 # --- nodes ------------------------------------------------------------------
@@ -527,6 +564,31 @@ def supervisor(state: GraphState) -> dict:
         return _degraded(step, failure, usage)
 
     nxt = decision.next_node
+
+    # Deterministic anti-reloop guard (do not rely on the model to terminate).
+    # If the model tries to re-dispatch a worker that has ALREADY produced a
+    # reply this run, override the decision to `finish`. This kills the observed
+    # gemini-2.5-flash trap where a general chat is routed back to local_llm over
+    # and over until the MAX_STEPS guard fires (see _build_prompt's completion
+    # policy — this enforces it in code). Each worker still runs at most once per
+    # run; a genuine second worker (e.g. tool_execution after local_llm) is
+    # unaffected because it is not yet in `visited`.
+    visited = state.get("visited", [])
+    if nxt in WORKER_NODES and nxt in visited:
+        return {
+            "next": "finish",
+            "status": "completed",
+            "step": 1,
+            "usage": usage,
+            "messages": [
+                Message(
+                    source="supervisor",
+                    content=f"route -> finish (guard: {nxt} already replied)",
+                    step=step,
+                )
+            ],
+        }
+
     update: dict = {
         "next": nxt,
         "step": 1,
@@ -548,8 +610,20 @@ async def local_llm(state: GraphState) -> dict:
     """
     step = state["step"]
     client = build_ollama_client()
+
+    async def _emit(token: str) -> None:
+        # Best-effort per-token streaming: dispatch a LangGraph custom event that
+        # astream_run surfaces into the SSE stream. Outside an astream run context
+        # (plain ainvoke via POST /intent, or a direct unit-test call) there is no
+        # run tree and adispatch raises RuntimeError — swallow it; the full reply
+        # is still accumulated and returned.
+        try:
+            await adispatch_custom_event(LOCAL_TOKEN_EVENT, {"token": token})
+        except Exception:
+            pass
+
     async with client:
-        text, failure, usage = await generate_local(state, client)
+        text, failure, usage = await generate_local(state, client, on_token=_emit)
     if failure is not None:
         return {
             "messages": [
@@ -648,3 +722,54 @@ async def run(payload: IntentPayload) -> OrchestrationOutcome:
         usage=final.get("usage", TokenUsage()),
         steps=final.get("step", 0),
     )
+
+
+async def astream_run(payload: IntentPayload) -> AsyncIterator[dict]:
+    """Drive the graph via ``astream_events`` and yield progressive event dicts.
+
+    Emits one ``{"token": <text>}`` chunk per worker-node result (local_llm /
+    tool_execution), then a terminal ``{"status": <final status>}``. This is
+    **node-granular**, not per-token: local_llm calls Ollama with ``stream=False``
+    (a single blocking request), and no graph node is a LangChain LLM runnable, so
+    ``astream_events`` never emits ``on_llm_stream`` — a worker's full reply
+    arrives as one chunk on its ``on_chain_end``. To get true per-token streaming,
+    generate_local must switch to Ollama's streaming NDJSON and dispatch custom
+    events. Never raises: a run error is surfaced as a terminal error status.
+
+    The caller (router) is responsible for SSE framing; this yields plain dicts.
+    """
+    initial: GraphState = {
+        "intent": payload,
+        "messages": [],
+        "usage": TokenUsage(),
+        "visited": [],
+        "step": 0,
+        "next": "",
+        "status": "",
+    }
+    final_status = "completed"
+    try:
+        async for event in graph.astream_events(
+            initial, version="v2", config={"recursion_limit": RECURSION_LIMIT}
+        ):
+            etype = event["event"]
+            # Per-token stream from local_llm (see LOCAL_TOKEN_EVENT / _emit).
+            if etype == "on_custom_event" and event.get("name") == LOCAL_TOKEN_EVENT:
+                yield {"token": event["data"]["token"]}
+                continue
+            if etype != "on_chain_end":
+                continue
+            output = event["data"].get("output")
+            if not isinstance(output, dict):
+                continue
+            # tool_execution is a non-streaming stub — emit its reply as one chunk.
+            if event.get("name") == "tool_execution":
+                for message in output.get("messages", []):
+                    yield {"token": message.content}
+            # The supervisor stamps the terminal status on finish/degrade/halt.
+            if output.get("status"):
+                final_status = output["status"]
+    except (GraphRecursionError, Exception) as exc:  # noqa: B014 - never break the stream
+        yield {"status": "error", "detail": f"{type(exc).__name__}: {exc}"[:200]}
+        return
+    yield {"status": final_status}

@@ -173,6 +173,39 @@ def test_supervisor_step_bound_no_model_call(monkeypatch):
     assert update["next"] == "finish" and update["status"] == "halted_step_bound"
 
 
+def test_supervisor_no_reloop_guard_forces_finish(monkeypatch):
+    # Deterministic guard: if the model re-dispatches a worker that already ran
+    # (its name is in `visited`), override to a clean finish rather than looping
+    # to the MAX_STEPS halt. Usage from the model call is still recorded.
+    monkeypatch.setattr(
+        orchestrator,
+        "get_client",
+        lambda *a, **k: returns(
+            parsed=RoutingDecision(next_node="local_llm"),
+            usage=FakeUsage(prompt=3, candidates=1, total=4),
+        ),
+    )
+    s = state()
+    s["visited"] = ["local_llm"]  # local_llm has already replied this run
+    update = supervisor(s)
+    assert update["next"] == "finish"
+    assert update["status"] == "completed"
+    assert update["usage"].total_tokens == 4
+    assert "guard" in update["messages"][0].content
+
+
+def test_supervisor_first_dispatch_not_guarded(monkeypatch):
+    # A worker not yet in `visited` routes normally (guard must not over-fire).
+    monkeypatch.setattr(
+        orchestrator,
+        "get_client",
+        lambda *a, **k: returns(parsed=RoutingDecision(next_node="local_llm")),
+    )
+    update = supervisor(state())  # visited == []
+    assert update["next"] == "local_llm"
+    assert update.get("status") != "completed"
+
+
 # --- US3: usage capture -----------------------------------------------------
 
 def test_usage_captured_when_reported():

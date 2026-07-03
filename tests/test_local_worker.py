@@ -6,6 +6,7 @@ full failure-degradation matrix (US3/SC-003/SC-005).
 """
 
 import asyncio
+import json
 
 import httpx
 import pytest
@@ -33,6 +34,19 @@ def raising_handler(exc):
     """Handler that raises a transport-level exception."""
     def _h(request):
         raise exc
+    return _h
+
+
+def ndjson_handler(chunks, prompt_eval_count=3, eval_count=4):
+    """Handler emitting Ollama-style streaming NDJSON: one object per chunk, plus a
+    final done object carrying the token counts."""
+    def _h(request):
+        lines = [json.dumps({"response": c, "done": False}) for c in chunks]
+        lines.append(json.dumps(
+            {"response": "", "done": True,
+             "prompt_eval_count": prompt_eval_count, "eval_count": eval_count}
+        ))
+        return httpx.Response(200, text="\n".join(lines))
     return _h
 
 
@@ -192,3 +206,39 @@ def test_full_run_terminates_despite_local_failure(monkeypatch):
     assert "local_llm" in outcome.nodes_executed
     assert any("local inference failure: timeout" in m.content for m in outcome.messages)
     assert isinstance(outcome.steps, int)  # returned, no hang / no exception
+
+
+# --- Feature: per-token streaming (SSE) -------------------------------------
+
+def test_generate_local_streams_tokens_and_accumulates():
+    tokens: list[str] = []
+
+    async def on_tok(t):
+        tokens.append(t)
+
+    async def _run():
+        async with _mock_client(ndjson_handler(["Hel", "lo", "!"])) as client:
+            return await generate_local(state(), client, on_token=on_tok)
+
+    text, failure, usage = asyncio.run(_run())
+    assert failure is None
+    assert tokens == ["Hel", "lo", "!"]          # each NDJSON chunk streamed live
+    assert text == "Hello!"                        # ...and accumulated into the reply
+    assert usage == TokenUsage(input_tokens=3, output_tokens=4, total_tokens=7)
+
+
+def test_astream_run_streams_tokens_then_status(monkeypatch):
+    # One memoized supervisor client so the scripted [local_llm, finish] iterator
+    # advances across calls (a fresh client per call would loop to the step bound).
+    sup = _SupClient(["local_llm", "finish"])
+    monkeypatch.setattr(orchestrator, "get_client", lambda *a, **k: sup)
+    install_ollama(monkeypatch, ndjson_handler(["Hi", " there"]))
+
+    async def _run():
+        payload = IntentPayload(intent="chat", confidence=0.95, raw_input="x", source="cli")
+        return [ev async for ev in orchestrator.astream_run(payload)]
+
+    events = asyncio.run(_run())
+    tokens = [e["token"] for e in events if "token" in e]
+    assert tokens == ["Hi", " there"]             # streamed via on_custom_event
+    assert events[-1] == {"status": "completed"}  # terminal marker last
