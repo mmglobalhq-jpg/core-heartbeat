@@ -29,6 +29,7 @@ from langgraph.graph import END, StateGraph
 
 from auth import SANDBOX_USER_ID
 from services.storage_sync import sync_user_vault
+from tools.user_vault import USER_VAULT_TOOLS, run_vault_tool
 from models import (
     IntentPayload,
     Message,
@@ -88,6 +89,12 @@ DEFAULT_OLLAMA_TIMEOUT_MS = 120_000  # local 7B generation can be slow; bound it
 TOOL_USAGE = TokenUsage(input_tokens=5, output_tokens=0, total_tokens=5)
 
 WORKER_NODES = ["local_llm", "tool_execution"]
+
+# User-isolated vault filesystem tools exposed to the tool_execution node.
+# Keyed by tool name; the node dispatches by name with the run's state-resolved
+# user_id (never a caller-supplied one), so every filesystem op is confined to
+# the active user's /tmp/vaults/<user_id>/ boundary. See tools/user_vault.py.
+TOOL_REGISTRY = {t.name: t for t in USER_VAULT_TOOLS}
 
 # Name of the LangGraph custom event the local_llm node dispatches per generated
 # token; astream_run surfaces it (as on_custom_event) into the SSE stream.
@@ -652,9 +659,26 @@ async def local_llm(state: GraphState) -> dict:
 
 
 def tool_execution(state: GraphState) -> dict:
-    """Stubbed external tool/action: deterministic output + fixed usage."""
+    """External tool/action node, wired to the user-isolated vault tools.
+
+    If the run carries a ``tool_request`` (``{"name", "args"}``), the named tool
+    from :data:`TOOL_REGISTRY` is executed with the run's state-resolved
+    ``user_id`` — passed straight from graph state, so no request argument can
+    redirect the operation to another user's folder (isolation is enforced in
+    tools/user_vault.py). Absent a request the node keeps its deterministic stub
+    behavior. Either way it emits a message, fixed usage, and returns control to
+    the Supervisor.
+    """
+    request = state.get("tool_request")
+    if isinstance(request, dict) and request.get("name") in TOOL_REGISTRY:
+        name = request["name"]
+        user_id = state.get("user_id", SANDBOX_USER_ID)
+        result = run_vault_tool(name, user_id, request.get("args") or {})
+        content = f"[tool:{name}] {result}"
+    else:
+        content = "[stub] tool executed"
     return {
-        "messages": [Message(source="tool_execution", content="[stub] tool executed", step=state["step"])],
+        "messages": [Message(source="tool_execution", content=content, step=state["step"])],
         "usage": TOOL_USAGE,
         "visited": ["tool_execution"],
         "step": 1,
