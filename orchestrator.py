@@ -27,6 +27,7 @@ from langchain_core.callbacks import adispatch_custom_event
 from langgraph.errors import GraphRecursionError
 from langgraph.graph import END, StateGraph
 
+from auth import SANDBOX_USER_ID
 from models import (
     IntentPayload,
     Message,
@@ -113,6 +114,10 @@ class GraphState(TypedDict):
     """State threaded through a run (channel reducers in brackets)."""
 
     intent: IntentPayload
+    # Stable identity of the caller (Supabase-resolved user_id, or the sandbox
+    # user for unauthenticated/local calls). Seeded once at run start and read by
+    # downstream nodes; no reducer, so it is set-once and carried unchanged.
+    user_id: str
     messages: Annotated[list[Message], operator.add]
     usage: Annotated[TokenUsage, add_usage]
     visited: Annotated[list[str], operator.add]
@@ -685,8 +690,15 @@ graph = build_graph()
 
 # --- public API -------------------------------------------------------------
 
-async def run(payload: IntentPayload) -> OrchestrationOutcome:
+async def run(
+    payload: IntentPayload, user_id: str = SANDBOX_USER_ID
+) -> OrchestrationOutcome:
     """Orchestrate an accepted intent to a terminating OrchestrationOutcome.
+
+    ``user_id`` is the caller identity resolved at the gateway boundary
+    (auth.resolve_user_id); it is seeded into GraphState and defaults to the
+    sandbox user so direct/programmatic callers and existing tests need not pass
+    it.
 
     Async because the local_llm worker performs an asynchronous Ollama call
     (feature 005); the graph is driven with ``ainvoke`` (the sync supervisor and
@@ -696,6 +708,7 @@ async def run(payload: IntentPayload) -> OrchestrationOutcome:
     """
     initial: GraphState = {
         "intent": payload,
+        "user_id": user_id,
         "messages": [],
         "usage": TokenUsage(),
         "visited": [],
@@ -724,7 +737,9 @@ async def run(payload: IntentPayload) -> OrchestrationOutcome:
     )
 
 
-async def astream_run(payload: IntentPayload) -> AsyncIterator[dict]:
+async def astream_run(
+    payload: IntentPayload, user_id: str = SANDBOX_USER_ID
+) -> AsyncIterator[dict]:
     """Drive the graph via ``astream_events`` and yield progressive event dicts.
 
     Emits ``{"token": <text>}`` chunks progressively, then a terminal
@@ -744,6 +759,7 @@ async def astream_run(payload: IntentPayload) -> AsyncIterator[dict]:
     """
     initial: GraphState = {
         "intent": payload,
+        "user_id": user_id,
         "messages": [],
         "usage": TokenUsage(),
         "visited": [],

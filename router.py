@@ -14,6 +14,7 @@ from os import environ
 from fastapi import APIRouter, Depends, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
+from auth import resolve_user_id
 from models import HealthStatus, IntentAccepted, IntentPayload, ThresholdRejected
 from orchestrator import astream_run
 from orchestrator import run as run_orchestration
@@ -66,6 +67,7 @@ router = APIRouter()
 async def submit_intent(
     payload: IntentPayload,
     threshold: float = Depends(get_threshold),
+    user_id: str = Depends(resolve_user_id),
 ) -> JSONResponse:
     """Validate an intent and evaluate its confidence against the threshold.
 
@@ -77,7 +79,7 @@ async def submit_intent(
     local inference call (feature 005).
     """
     if decide(payload.confidence, threshold):
-        outcome = await run_orchestration(payload)
+        outcome = await run_orchestration(payload, user_id)
         body = IntentAccepted(
             intent=payload.intent,
             orchestration=outcome,
@@ -96,6 +98,7 @@ async def submit_intent(
 async def submit_intent_stream(
     payload: IntentPayload,
     threshold: float = Depends(get_threshold),
+    user_id: str = Depends(resolve_user_id),
 ) -> StreamingResponse | JSONResponse:
     """Accept an intent and stream the orchestration as Server-Sent Events.
 
@@ -114,7 +117,7 @@ async def submit_intent_stream(
         return JSONResponse(status_code=422, content=body.model_dump(mode="json"))
 
     async def event_stream():
-        async for event in astream_run(payload):
+        async for event in astream_run(payload, user_id):
             yield f"data: {json.dumps(event)}\n\n"
 
     return StreamingResponse(event_stream(), media_type="text/event-stream")
