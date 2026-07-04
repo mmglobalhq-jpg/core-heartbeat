@@ -28,6 +28,7 @@ from langgraph.errors import GraphRecursionError
 from langgraph.graph import END, StateGraph
 
 from auth import SANDBOX_USER_ID
+from services.storage_sync import sync_user_vault
 from models import (
     IntentPayload,
     Message,
@@ -769,6 +770,18 @@ async def astream_run(
     }
     final_status = "completed"
     streamed_local_tokens = False
+
+    # Pre-execution: localize the caller's Markdown vault before the supervisor
+    # fires, so downstream nodes read from /tmp/vaults/<user_id>/ rather than
+    # reaching across the network mid-run (Phase 2 of the multi-user bridge). The
+    # sandbox user resolves to a local mock folder, so this is credential-free
+    # offline. Best-effort: a vault-sync failure must not break the stream — the
+    # run proceeds with whatever context is already local.
+    try:
+        await sync_user_vault(user_id)
+    except Exception:
+        pass
+
     try:
         async for event in graph.astream_events(
             initial, version="v2", config={"recursion_limit": RECURSION_LIMIT}
