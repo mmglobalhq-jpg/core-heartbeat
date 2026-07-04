@@ -103,10 +103,13 @@ async def submit_intent_stream(
     """Accept an intent and stream the orchestration as Server-Sent Events.
 
     Same validation + threshold policy as POST /intent, but on acceptance the run
-    is streamed: each worker-node reply is emitted as ``data: {"token": ...}`` and
-    the run ends with ``data: {"status": ...}`` (see orchestrator.astream_run for
-    the node-vs-token granularity note). A threshold rejection returns the normal
-    422 JSON envelope (there is nothing to stream).
+    is streamed. Each SSE frame is ``data: <json>\\n\\n`` carrying one of:
+      - ``{"token": ...}``     — an assistant text chunk (local_llm).
+      - ``{"tool_call": {"name", "args", "result"}}`` — a vault tool turn, so the
+        UI can show a reading/searching-the-vault indicator (feature 007).
+      - ``{"status": ...}``    — the terminal run status (always last).
+    (See orchestrator.astream_run for the node-vs-token granularity note.) A
+    threshold rejection returns the normal 422 JSON envelope (nothing to stream).
     """
     if not decide(payload.confidence, threshold):
         body = ThresholdRejected(

@@ -24,6 +24,7 @@ from google.genai import errors, types
 import httpx
 
 from langchain_core.callbacks import adispatch_custom_event
+from langchain_core.callbacks.manager import dispatch_custom_event
 from langgraph.errors import GraphRecursionError
 from langgraph.graph import END, StateGraph
 
@@ -67,10 +68,26 @@ MODEL_REGISTRY: dict[str, tuple[str, str]] = {
 }
 # Shared JSON Schema for the routing decision, reused as OpenAI's json_schema and
 # Anthropic's tool input_schema so every provider is forced to the same shape.
+# Feature 007: when next_node == "tool_execution" the model also emits tool_name +
+# tool_args (the vault tool call). tool_args is a fixed, typed object so it maps
+# onto every provider's structured output; only the field the tool needs is set.
 ROUTING_JSON_SCHEMA: dict = {
     "type": "object",
     "properties": {
-        "next_node": {"type": "string", "enum": ["local_llm", "tool_execution", "finish"]}
+        "next_node": {"type": "string", "enum": ["local_llm", "tool_execution", "finish"]},
+        "tool_name": {
+            "type": ["string", "null"],
+            "enum": ["read_user_note", "search_user_vault", "write_user_note", None],
+        },
+        "tool_args": {
+            "type": "object",
+            "properties": {
+                "filename": {"type": ["string", "null"]},
+                "query": {"type": ["string", "null"]},
+                "content": {"type": ["string", "null"]},
+            },
+            "additionalProperties": False,
+        },
     },
     "required": ["next_node"],
     "additionalProperties": False,
@@ -99,6 +116,11 @@ TOOL_REGISTRY = {t.name: t for t in USER_VAULT_TOOLS}
 # Name of the LangGraph custom event the local_llm node dispatches per generated
 # token; astream_run surfaces it (as on_custom_event) into the SSE stream.
 LOCAL_TOKEN_EVENT = "local_llm_token"
+
+# Custom event the tool_execution node dispatches when it runs a vault tool (name +
+# args + result). astream_run surfaces it so the UI can show a "reading/searching
+# the vault" indicator distinct from assistant tokens (feature 007).
+TOOL_CALL_EVENT = "vault_tool_call"
 
 
 # --- reducers ---------------------------------------------------------------
@@ -132,6 +154,11 @@ class GraphState(TypedDict):
     step: Annotated[int, operator.add]
     next: str
     status: str
+    # Set-once-per-turn by the Supervisor when it routes to tool_execution: the
+    # named vault tool + its args ({"name", "args"}) for this turn, or None. A
+    # LastValue channel — the Supervisor writes it fresh (dict or None) on every
+    # routing turn so tool_execution never replays a stale request. Feature 007.
+    tool_request: dict | None
 
 
 # --- model client (feature 004; multi-provider in feature 006) --------------
@@ -214,18 +241,29 @@ def _build_prompt(state: GraphState) -> str:
         "You are the Supervisor in an orchestration graph. Decide the single "
         "next step for this run.\n"
         "Routing policy:\n"
-        "- Route to local_llm to generate a conversational or reasoned reply, or "
-        "to tool_execution to run an external action/tool.\n"
+        "- Route to local_llm to generate a conversational or reasoned reply.\n"
+        "- Route to tool_execution to act on the user's personal Markdown vault. "
+        "You then MUST set tool_name and tool_args. The available tools are:\n"
+        "    * read_user_note — read one note. tool_args: {\"filename\": <path>}.\n"
+        "    * search_user_vault — case-insensitive text/regex search across the "
+        "vault's notes. tool_args: {\"query\": <text>}.\n"
+        "    * write_user_note — create/update a note. tool_args: "
+        "{\"filename\": <path>, \"content\": <text>}.\n"
+        "  The tools are already scoped to THIS user's vault — never put a user id "
+        "or absolute/`..` path in a filename.\n"
+        "- After a tool result appears in the history, either issue another tool "
+        "call or route to local_llm to compose the final answer from it.\n"
         "- Choose finish as soon as the intent has been satisfied. If a worker "
         "has already produced a reply that answers the intent (e.g. a general "
-        "chat message), you MUST choose finish. Never re-dispatch a worker that "
-        "has already answered.\n"
+        "chat message), you MUST choose finish. Never re-dispatch local_llm once "
+        "it has answered.\n"
         f"Intent: {intent.intent}\n"
         f"Confidence: {intent.confidence}\n"
         f"Raw input: {intent.raw_input}\n"
         f"Worker replies so far: {worker_replies}\n"
         f"History so far:\n{history or '(none)'}\n"
-        "Respond with next_node = one of: local_llm, tool_execution, finish."
+        "Respond with next_node = one of: local_llm, tool_execution, finish "
+        "(plus tool_name + tool_args when tool_execution)."
     )
 
 
@@ -579,20 +617,22 @@ def supervisor(state: GraphState) -> dict:
     nxt = decision.next_node
 
     # Deterministic anti-reloop guard (do not rely on the model to terminate).
-    # If the model tries to re-dispatch a worker that has ALREADY produced a
-    # reply this run, override the decision to `finish`. This kills the observed
-    # gemini-2.5-flash trap where a general chat is routed back to local_llm over
-    # and over until the MAX_STEPS guard fires (see _build_prompt's completion
-    # policy — this enforces it in code). Each worker still runs at most once per
-    # run; a genuine second worker (e.g. tool_execution after local_llm) is
-    # unaffected because it is not yet in `visited`.
+    # Scoped to local_llm: if the model re-dispatches local_llm after it has
+    # ALREADY produced a reply this run, override to a clean finish. This kills the
+    # observed gemini-2.5-flash trap where a general chat is routed back to
+    # local_llm over and over until the MAX_STEPS halt (see _build_prompt's
+    # completion policy — this enforces it in code). tool_execution is deliberately
+    # NOT guarded here: a tool-calling loop legitimately makes several tool calls
+    # (read, then search, ...), each a distinct turn bounded by MAX_STEPS /
+    # RECURSION_LIMIT, so a repeat visit must be allowed.
     visited = state.get("visited", [])
-    if nxt in WORKER_NODES and nxt in visited:
+    if nxt == "local_llm" and nxt in visited:
         return {
             "next": "finish",
             "status": "completed",
             "step": 1,
             "usage": usage,
+            "tool_request": None,
             "messages": [
                 Message(
                     source="supervisor",
@@ -602,11 +642,26 @@ def supervisor(state: GraphState) -> dict:
             ],
         }
 
+    # When routing to a tool, thread the named call to tool_execution via the
+    # tool_request channel. Written fresh (dict or None) on EVERY routing turn so
+    # tool_execution never replays a stale request from an earlier turn.
+    tool_request: dict | None = None
+    if nxt == "tool_execution" and decision.tool_name:
+        tool_request = {
+            "name": decision.tool_name,
+            "args": decision.tool_args.model_dump(exclude_none=True),
+        }
+
+    label = f"route -> {nxt}"
+    if tool_request is not None:
+        label = f"route -> {nxt} ({tool_request['name']})"
+
     update: dict = {
         "next": nxt,
         "step": 1,
         "usage": usage,
-        "messages": [Message(source="supervisor", content=f"route -> {nxt}", step=step)],
+        "tool_request": tool_request,
+        "messages": [Message(source="supervisor", content=label, step=step)],
     }
     if nxt == "finish":
         update["status"] = "completed"
@@ -672,9 +727,20 @@ def tool_execution(state: GraphState) -> dict:
     request = state.get("tool_request")
     if isinstance(request, dict) and request.get("name") in TOOL_REGISTRY:
         name = request["name"]
+        args = request.get("args") or {}
         user_id = state.get("user_id", SANDBOX_USER_ID)
-        result = run_vault_tool(name, user_id, request.get("args") or {})
+        result = run_vault_tool(name, user_id, args)
         content = f"[tool:{name}] {result}"
+        # Surface the call for the SSE stream so the UI can show a
+        # reading/searching indicator. Best-effort: outside a run context (a
+        # direct unit-test call) there is no callback manager and this raises —
+        # swallow it; the result is still recorded on the message channel.
+        try:
+            dispatch_custom_event(
+                TOOL_CALL_EVENT, {"name": name, "args": args, "result": result}
+            )
+        except Exception:
+            pass
     else:
         content = "[stub] tool executed"
     return {
@@ -740,6 +806,7 @@ async def run(
         "step": 0,
         "next": "",
         "status": "",
+        "tool_request": None,
     }
     try:
         final = await graph.ainvoke(initial, config={"recursion_limit": RECURSION_LIMIT})
@@ -791,6 +858,7 @@ async def astream_run(
         "step": 0,
         "next": "",
         "status": "",
+        "tool_request": None,
     }
     final_status = "completed"
     streamed_local_tokens = False
@@ -820,15 +888,16 @@ async def astream_run(
                 streamed_local_tokens = True
                 yield {"token": event["data"]["token"]}
                 continue
+            # A vault tool ran: surface it as a structured event (not an assistant
+            # token) so the UI can show a reading/searching-the-vault indicator.
+            if etype == "on_custom_event" and name == TOOL_CALL_EVENT:
+                yield {"tool_call": event["data"]}
+                continue
             if etype != "on_chain_end":
                 continue
             output = event["data"].get("output")
             if not isinstance(output, dict):
                 continue
-            # tool_execution is a non-streaming stub — emit its reply as one chunk.
-            if name == "tool_execution":
-                for message in output.get("messages", []):
-                    yield {"token": message.content}
             # local_llm normally streams live tokens; if this run streamed NONE
             # (a degraded call that only recorded a failure notice, or any
             # non-streamed reply), surface its final message so the content is not

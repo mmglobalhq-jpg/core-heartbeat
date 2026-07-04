@@ -88,14 +88,36 @@ class OrchestrationOutcome(BaseModel):
     steps: int
 
 
+class ToolArgs(BaseModel):
+    """Arguments for a vault tool call — only the field the chosen tool needs is set.
+
+    Kept as a fixed, typed object (rather than a free-form dict) so it maps cleanly
+    onto every provider's structured-output schema. Mirrors the vault tools'
+    parameters: ``read_user_note(filename)``, ``search_user_vault(query)``,
+    ``write_user_note(filename, content)``.
+    """
+
+    filename: str | None = None
+    query: str | None = None
+    content: str | None = None
+
+
 class RoutingDecision(BaseModel):
-    """Strict schema for the Supervisor's model routing decision (feature 004).
+    """Strict schema for the Supervisor's model routing decision (features 004 + 007).
 
     Used both as the model's response_schema and to re-validate the response.
     ``next_node`` is constrained to the graph's routing vocabulary (FR-002).
+
+    When ``next_node == "tool_execution"`` the model also names the vault tool to
+    run (``tool_name``) and supplies its arguments (``tool_args``); both are absent
+    for the ``local_llm``/``finish`` routes. This is the tool-calling loop: the
+    supervisor threads the named call to the tool_execution node, whose isolated
+    result is appended to the history and fed back to the model.
     """
 
     next_node: Literal["local_llm", "tool_execution", "finish"]
+    tool_name: Literal["read_user_note", "search_user_vault", "write_user_note"] | None = None
+    tool_args: ToolArgs = Field(default_factory=ToolArgs)
 
 
 class RoutingFailure(BaseModel):
