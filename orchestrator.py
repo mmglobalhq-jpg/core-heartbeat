@@ -602,7 +602,16 @@ async def generate_local(
 # --- nodes ------------------------------------------------------------------
 
 def _degraded(step: int, failure: RoutingFailure, usage: TokenUsage | None = None) -> dict:
-    """Safe terminal update after a routing failure (FR-005, FR-008)."""
+    """Safe terminal update after a routing failure (FR-005, FR-008).
+
+    Logs the category AND the secret-free detail so a "degraded" outcome is
+    diagnosable from the backend logs — the in-band message only carries the
+    category. This is the single funnel for every degrade (missing credential and
+    all model-call/parse failures).
+    """
+    logger.warning(
+        "supervisor degraded at step %s: %s: %s", step, failure.category, failure.detail
+    )
     return {
         "next": "finish",
         "status": "degraded",
