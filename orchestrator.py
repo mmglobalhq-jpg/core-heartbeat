@@ -11,7 +11,9 @@ decision, the MAX_STEPS bound (checked before any model call), and LangGraph's
 recursion_limit. See specs/003-* and specs/004-api-supervisor/.
 """
 
+import asyncio
 import json
+import logging
 import operator
 import os
 from collections.abc import AsyncIterator, Awaitable, Callable
@@ -41,6 +43,8 @@ from models import (
     TokenUsage,
     WorkerFailure,
 )
+
+logger = logging.getLogger(__name__)
 
 # --- constants --------------------------------------------------------------
 
@@ -902,38 +906,72 @@ def _record_preference(user_id: str, pref: MemoryExtraction) -> str:
     return line
 
 
-async def memory_extractor(state: GraphState) -> dict:
-    """Silent trailing node: learn one durable preference from the latest exchange.
+# Detached background tasks are kept referenced here so the event loop does not
+# garbage-collect them mid-flight; each removes itself on completion.
+_background_tasks: set[asyncio.Task] = set()
 
-    Runs as the final graph step (Supervisor finish -> here -> END), AFTER
-    local_llm has already streamed its full reply to the client, so it never
-    blocks the real-time token stream. Best-effort and side-effect-only: it emits
-    no messages/tokens/usage (returns an empty update), and every failure path is
-    swallowed so it can never break or alter the run. When the latest exchange
-    carries a high-confidence durable preference, it is upserted into the user's
-    isolated vault profile (feature 008).
+
+async def extract_and_record_preference(
+    user_id: str,
+    model_preference: str | None,
+    user_message: str,
+    assistant_reply: str,
+) -> str | None:
+    """Extract one durable preference from the exchange and upsert it. Never raises.
+
+    Designed to run fully DETACHED from the request (see
+    :func:`schedule_memory_extraction`): the blocking provider call and the file
+    write are offloaded to worker threads (``asyncio.to_thread``) so this never
+    ties up the event loop that is serving other clients. Returns the recorded
+    bullet, or ``None`` when nothing durable/high-confidence was found.
     """
     try:
-        intent = state["intent"]
-        user_id = state.get("user_id", SANDBOX_USER_ID)
-        assistant_reply = _latest_local_reply(state.get("messages", []))
         if not assistant_reply:
-            return {}  # no assistant answer this turn -> nothing to learn
-        model_pref = getattr(intent, "model_preference", None) or DEFAULT_MODEL_PREFERENCE
-        client = get_client(model_pref)
+            return None
+        client = get_client(model_preference)
         if client is None:
-            return {}
-        pref = extract_user_preference(intent.raw_input, assistant_reply, client, model_pref)
+            return None
+        pref = await asyncio.to_thread(
+            extract_user_preference, user_message, assistant_reply, client, model_preference
+        )
         if (
             pref is None
             or pref.preference_type == "none"
             or pref.confidence_score < MEMORY_CONFIDENCE_THRESHOLD
         ):
-            return {}
-        _record_preference(user_id, pref)
-    except Exception:
-        pass  # never let profile-building break the run
-    return {}
+            return None
+        line = await asyncio.to_thread(_record_preference, user_id, pref)
+        logger.info("memory: recorded preference for user_id=%s (%s)", user_id, pref.preference_type)
+        return line
+    except Exception:  # best-effort; a profile-building failure is never fatal
+        logger.info("memory: extraction skipped (error)", exc_info=False)
+        return None
+
+
+def schedule_memory_extraction(
+    user_id: str, intent: IntentPayload, assistant_reply: str
+) -> asyncio.Task | None:
+    """Fire-and-forget the memory extraction so it never blocks the response.
+
+    Called right before the (streaming or non-streaming) response returns: it
+    schedules :func:`extract_and_record_preference` as a detached task on the
+    running loop and returns immediately, so the token stream closes instantly and
+    the profile write happens in parallel. Returns the task (callers ignore it;
+    tests may await it), or ``None`` when there is no assistant reply to learn from
+    or no running loop.
+    """
+    if not assistant_reply:
+        return None
+    model_pref = getattr(intent, "model_preference", None) or DEFAULT_MODEL_PREFERENCE
+    coro = extract_and_record_preference(user_id, model_pref, intent.raw_input, assistant_reply)
+    try:
+        task = asyncio.create_task(coro)
+    except RuntimeError:  # no running loop (not the normal request path)
+        coro.close()
+        return None
+    _background_tasks.add(task)
+    task.add_done_callback(_background_tasks.discard)
+    return task
 
 
 # --- routing + graph --------------------------------------------------------
@@ -949,23 +987,18 @@ def build_graph():
     builder.add_node("supervisor", supervisor)
     builder.add_node("local_llm", local_llm)
     builder.add_node("tool_execution", tool_execution)
-    builder.add_node("memory_extractor", memory_extractor)
     builder.set_entry_point("supervisor")
-    # On finish, pass through the silent memory_extractor before terminating. It
-    # runs after local_llm has streamed its reply, so it is a trailing step that
-    # never blocks the token stream (feature 008).
+    # finish terminates the graph directly, so the token stream closes instantly.
+    # Memory extraction is NOT a graph node — it is fired as a detached background
+    # task from run()/astream_run() (schedule_memory_extraction) so it can never
+    # block the response or affect the run's status (feature 008).
     builder.add_conditional_edges(
         "supervisor",
         route,
-        {
-            "local_llm": "local_llm",
-            "tool_execution": "tool_execution",
-            "finish": "memory_extractor",
-        },
+        {"local_llm": "local_llm", "tool_execution": "tool_execution", "finish": END},
     )
     builder.add_edge("local_llm", "supervisor")
     builder.add_edge("tool_execution", "supervisor")
-    builder.add_edge("memory_extractor", END)
     return builder.compile()
 
 
@@ -1013,6 +1046,11 @@ async def run(
             steps=0,
         )
 
+    # Detached, non-blocking profile update from the finished exchange.
+    schedule_memory_extraction(
+        user_id, payload, _latest_local_reply(final.get("messages", []))
+    )
+
     visited = final.get("visited", [])
     return OrchestrationOutcome(
         status=final.get("status") or "completed",
@@ -1056,6 +1094,7 @@ async def astream_run(
     }
     final_status = "completed"
     streamed_local_tokens = False
+    last_local_reply = ""  # captured for the detached memory extraction
 
     # Pre-execution: localize the caller's Markdown vault before the supervisor
     # fires, so downstream nodes read from /tmp/vaults/<user_id>/ rather than
@@ -1092,13 +1131,17 @@ async def astream_run(
             output = event["data"].get("output")
             if not isinstance(output, dict):
                 continue
-            # local_llm normally streams live tokens; if this run streamed NONE
-            # (a degraded call that only recorded a failure notice, or any
-            # non-streamed reply), surface its final message so the content is not
+            # Capture the assistant reply for the detached memory extraction, and
+            # (if this run streamed NO tokens — a degraded failure notice or any
+            # non-streamed reply) surface its final message so the content is not
             # silently dropped behind a "completed" status.
-            if name == "local_llm" and not streamed_local_tokens:
+            if name == "local_llm":
                 for message in output.get("messages", []):
-                    if message.content:
+                    if not message.content:
+                        continue
+                    if not message.content.startswith("local inference failure:"):
+                        last_local_reply = message.content
+                    if not streamed_local_tokens:
                         yield {"token": message.content}
             # The supervisor stamps the terminal status on finish/degrade/halt.
             if output.get("status"):
@@ -1106,4 +1149,7 @@ async def astream_run(
     except (GraphRecursionError, Exception) as exc:  # noqa: B014 - never break the stream
         yield {"status": "error", "detail": f"{type(exc).__name__}: {exc}"[:200]}
         return
+    # Detached, non-blocking profile update — the stream closes immediately after
+    # the status event while extraction runs in parallel.
+    schedule_memory_extraction(user_id, payload, last_local_reply)
     yield {"status": final_status}

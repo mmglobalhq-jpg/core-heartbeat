@@ -18,8 +18,9 @@ from orchestrator import (
     PREFERENCES_FILE,
     _latest_local_reply,
     _record_preference,
+    extract_and_record_preference,
     extract_user_preference,
-    memory_extractor,
+    schedule_memory_extraction,
 )
 from tools.user_vault import read_note
 
@@ -56,20 +57,6 @@ def _pref(ptype="favorite", key="favorite_language", value="Python", conf=0.9):
     return MemoryExtraction(
         preference_type=ptype, key_insight=key, value=value, confidence_score=conf
     )
-
-
-def _state(reply="I'll remember you love Python.", user_id="user-abc", raw="I love Python"):
-    return {
-        "intent": IntentPayload(intent="chat", confidence=0.95, raw_input=raw, source="cli"),
-        "user_id": user_id,
-        "messages": [Message(source="local_llm", content=reply, step=1)] if reply else [],
-        "usage": None,
-        "visited": [],
-        "step": 1,
-        "next": "",
-        "status": "",
-        "tool_request": None,
-    }
 
 
 # --- extraction parsing -----------------------------------------------------
@@ -129,61 +116,87 @@ def test_record_is_user_isolated(_vault_root):
     assert "Go" not in read_note("user-abc", PREFERENCES_FILE)
 
 
-# --- node behavior ----------------------------------------------------------
+# --- detached extract+record coroutine --------------------------------------
 
-def test_node_writes_high_confidence_preference(monkeypatch, _vault_root):
+def _run_extract(user_id="user-abc", user_message="I love Python", reply="noted"):
+    return asyncio.run(
+        extract_and_record_preference(user_id, "gemini-2.5-flash", user_message, reply)
+    )
+
+
+def test_extract_and_record_writes_high_confidence(monkeypatch, _vault_root):
     monkeypatch.setattr(orchestrator, "get_client", lambda *a, **k: _MemClient(parsed=_pref(conf=0.9)))
-    update = asyncio.run(memory_extractor(_state(user_id="user-abc")))
-    assert update == {}  # silent: no messages/usage/visited
+    line = _run_extract()
+    assert "Python" in line
     assert "Python" in read_note("user-abc", PREFERENCES_FILE)
 
 
-def test_node_skips_preference_type_none(monkeypatch, _vault_root):
+def test_extract_and_record_skips_none(monkeypatch, _vault_root):
     monkeypatch.setattr(
         orchestrator, "get_client",
         lambda *a, **k: _MemClient(parsed=_pref(ptype="none", key="n", value="n", conf=0.0)),
     )
-    asyncio.run(memory_extractor(_state(user_id="user-abc")))
+    assert _run_extract() is None
     assert not (_vault_root / "user-abc" / PREFERENCES_FILE).exists()
 
 
-def test_node_skips_low_confidence(monkeypatch, _vault_root):
+def test_extract_and_record_skips_low_confidence(monkeypatch, _vault_root):
     monkeypatch.setattr(orchestrator, "get_client", lambda *a, **k: _MemClient(parsed=_pref(conf=0.3)))
-    asyncio.run(memory_extractor(_state(user_id="user-abc")))
+    assert _run_extract() is None
     assert not (_vault_root / "user-abc" / PREFERENCES_FILE).exists()
 
 
-def test_node_skips_when_no_local_reply(monkeypatch, _vault_root):
+def test_extract_and_record_skips_empty_reply(monkeypatch, _vault_root):
     called = {"n": 0}
 
-    def _get_client(*a, **k):
+    def _gc(*a, **k):
         called["n"] += 1
         return _MemClient(parsed=_pref())
 
-    monkeypatch.setattr(orchestrator, "get_client", _get_client)
-    asyncio.run(memory_extractor(_state(reply="", user_id="user-abc")))  # no assistant reply
-    assert called["n"] == 0  # short-circuits before any model call
-    assert not (_vault_root / "user-abc" / PREFERENCES_FILE).exists()
+    monkeypatch.setattr(orchestrator, "get_client", _gc)
+    out = asyncio.run(
+        extract_and_record_preference("user-abc", "gemini-2.5-flash", "hi", "")
+    )
+    assert out is None
+    assert called["n"] == 0  # short-circuits before any client/model call
 
 
-def test_node_skips_local_failure_notice(monkeypatch, _vault_root):
-    monkeypatch.setattr(orchestrator, "get_client", lambda *a, **k: _MemClient(parsed=_pref()))
-    state = _state(reply="local inference failure: unreachable", user_id="user-abc")
-    asyncio.run(memory_extractor(state))
-    assert not (_vault_root / "user-abc" / PREFERENCES_FILE).exists()
-
-
-def test_node_no_client_is_silent_noop(monkeypatch, _vault_root):
+def test_extract_and_record_no_client(monkeypatch, _vault_root):
     monkeypatch.setattr(orchestrator, "get_client", lambda *a, **k: None)
-    update = asyncio.run(memory_extractor(_state(user_id="user-abc")))
-    assert update == {}
+    assert _run_extract() is None
     assert not (_vault_root / "user-abc" / PREFERENCES_FILE).exists()
 
 
-def test_node_never_raises_on_bad_extraction(monkeypatch, _vault_root):
-    # Wrong-shaped model output -> extraction None -> silent no-op, no exception.
-    monkeypatch.setattr(orchestrator, "get_client", lambda *a, **k: _MemClient(parsed=RoutingDecision(next_node="finish")))
-    assert asyncio.run(memory_extractor(_state(user_id="user-abc"))) == {}
+def test_extract_and_record_never_raises_on_bad_shape(monkeypatch, _vault_root):
+    monkeypatch.setattr(
+        orchestrator, "get_client", lambda *a, **k: _MemClient(parsed=RoutingDecision(next_node="finish"))
+    )
+    assert _run_extract() is None  # graceful None, no exception
+
+
+# --- schedule_memory_extraction (detached task) -----------------------------
+
+def _intent(raw="I love Python"):
+    return IntentPayload(intent="chat", confidence=0.95, raw_input=raw, source="cli")
+
+
+def test_schedule_returns_task_and_writes_when_awaited(monkeypatch, _vault_root):
+    monkeypatch.setattr(orchestrator, "get_client", lambda *a, **k: _MemClient(parsed=_pref(conf=0.9)))
+
+    async def _drive():
+        task = schedule_memory_extraction("user-abc", _intent(), "you love Python")
+        assert task is not None
+        return await task
+
+    line = asyncio.run(_drive())
+    assert "Python" in line
+    assert "Python" in read_note("user-abc", PREFERENCES_FILE)
+
+
+def test_schedule_returns_none_without_reply(_vault_root):
+    # No assistant reply -> nothing scheduled (no task, no write).
+    assert schedule_memory_extraction("user-abc", _intent(), "") is None
+    assert not (_vault_root / "user-abc" / PREFERENCES_FILE).exists()
 
 
 # --- helper + graph wiring --------------------------------------------------
@@ -197,9 +210,9 @@ def test_latest_local_reply_picks_last_local_llm():
     assert _latest_local_reply(msgs) == "second"
 
 
-def test_graph_routes_finish_through_memory_extractor():
+def test_graph_finish_routes_directly_to_end():
+    # memory_extractor is no longer a graph node — it's a detached task.
     g = orchestrator.graph.get_graph()
-    assert "memory_extractor" in g.nodes
-    # memory_extractor terminates the graph.
+    assert "memory_extractor" not in g.nodes
     edges = [(e.source, e.target) for e in g.edges]
-    assert ("memory_extractor", "__end__") in edges
+    assert ("supervisor", "__end__") in edges  # finish terminates immediately
