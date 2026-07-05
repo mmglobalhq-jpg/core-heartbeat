@@ -31,7 +31,7 @@ from langgraph.errors import GraphRecursionError
 from langgraph.graph import END, StateGraph
 
 from auth import SANDBOX_USER_ID
-from services.storage_sync import sync_user_vault
+from services.storage_sync import sync_user_vault, upload_user_file
 from tools.user_vault import USER_VAULT_TOOLS, read_note, run_vault_tool, write_note
 from models import (
     IntentPayload,
@@ -1016,6 +1016,16 @@ async def extract_and_record_preference(
             return None
         line = await asyncio.to_thread(_record_preference, user_id, pref)
         logger.info("memory: recorded preference for user_id=%s (%s)", user_id, pref.preference_type)
+        # Durability: mirror the updated profile back to S3 immediately, in a
+        # worker thread (blocking boto3). Best-effort and isolated — a write-back
+        # failure keeps the successful local write and never fails the task.
+        try:
+            await asyncio.to_thread(upload_user_file, user_id, PREFERENCES_FILE)
+            logger.info("memory: wrote profile back to S3 for user_id=%s", user_id)
+        except Exception:
+            logger.warning(
+                "memory: S3 write-back failed for user_id=%s (local copy kept)", user_id
+            )
         return line
     except Exception:  # best-effort; a profile-building failure is never fatal
         logger.info("memory: extraction skipped (error)", exc_info=False)

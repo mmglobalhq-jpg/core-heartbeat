@@ -170,6 +170,24 @@ def _sync_from_s3(user_id: str, dest: str) -> str:
     return dest
 
 
+def upload_user_file(user_id: str, filename: str) -> None:
+    """Upload one local vault file back to the ``user-vaults`` bucket (blocking).
+
+    Write-back for durability: mirrors ``/tmp/vaults/<user_id>/<filename>`` to the
+    S3 key ``<user_id>/<filename>`` so a preference profile survives a container
+    restart (a fresh container's :func:`sync_user_vault` then downloads it back).
+    Runs in a worker thread (boto3 is synchronous). No-op for the sandbox user
+    (offline mock, no S3) and when the local file is absent.
+    """
+    if user_id == SANDBOX_USER_ID:
+        return
+    local_path = os.path.join(_sync_root(), user_id, filename)
+    if not os.path.isfile(local_path):
+        return
+    client = build_s3_client()
+    client.upload_file(local_path, _vault_bucket(), f"{user_id}/{filename}")
+
+
 # --- sandbox path (local mock, no S3) ---------------------------------------
 
 def _sync_from_mock(user_id: str, dest: str) -> str:

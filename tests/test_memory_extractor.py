@@ -57,6 +57,15 @@ def _vault_root(monkeypatch, tmp_path):
     return tmp_path / "vaults"
 
 
+@pytest.fixture(autouse=True)
+def _stub_s3_writeback(monkeypatch):
+    """Neutralize the real S3 write-back in every memory test (no network) and
+    record the (user_id, filename) calls so tests can assert on them."""
+    calls: list[tuple[str, str]] = []
+    monkeypatch.setattr(orchestrator, "upload_user_file", lambda uid, fn: calls.append((uid, fn)))
+    return calls
+
+
 def _pref(ptype="favorite", key="favorite_language", value="Python", conf=0.9):
     return MemoryExtraction(
         preference_type=ptype, key_insight=key, value=value, confidence_score=conf
@@ -176,6 +185,37 @@ def test_extract_and_record_never_raises_on_bad_shape(monkeypatch, _vault_root):
         orchestrator, "get_client", lambda *a, **k: _MemClient(parsed=RoutingDecision(next_node="finish"))
     )
     assert _run_extract() is None  # graceful None, no exception
+
+
+def test_extract_and_record_writes_back_to_s3(monkeypatch, _vault_root, _stub_s3_writeback):
+    # After the local write, the profile is mirrored to S3 (durability).
+    monkeypatch.setattr(orchestrator, "get_client", lambda *a, **k: _MemClient(parsed=_pref(conf=0.9)))
+    line = _run_extract(user_id="user-abc")
+    assert "Python" in line
+    assert _stub_s3_writeback == [("user-abc", PREFERENCES_FILE)]  # exactly one write-back
+
+
+def test_write_back_failure_keeps_local_write(monkeypatch, _vault_root):
+    # An S3 write-back failure must NOT undo the successful local record.
+    monkeypatch.setattr(orchestrator, "get_client", lambda *a, **k: _MemClient(parsed=_pref(conf=0.9)))
+
+    def _boom(uid, fn):
+        raise RuntimeError("s3 unreachable")
+
+    monkeypatch.setattr(orchestrator, "upload_user_file", _boom)  # overrides the autouse stub
+    line = _run_extract(user_id="user-abc")
+    assert "Python" in line
+    assert "Python" in read_note("user-abc", PREFERENCES_FILE)  # local copy intact
+
+
+def test_no_write_back_when_nothing_recorded(monkeypatch, _vault_root, _stub_s3_writeback):
+    # A "none"/low-confidence extraction records nothing, so no write-back fires.
+    monkeypatch.setattr(
+        orchestrator, "get_client",
+        lambda *a, **k: _MemClient(parsed=_pref(ptype="none", key="n", value="n", conf=0.0)),
+    )
+    assert _run_extract(user_id="user-abc") is None
+    assert _stub_s3_writeback == []
 
 
 # --- schedule_memory_extraction (detached task) -----------------------------

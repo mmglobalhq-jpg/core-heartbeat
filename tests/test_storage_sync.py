@@ -33,6 +33,7 @@ class _FakeS3:
         self._pages = list(pages)
         self.list_calls: list[dict] = []
         self.downloaded: list[tuple[str, str, str]] = []
+        self.uploaded: list[tuple[str, str, str]] = []  # (bucket, key, content)
 
     def list_objects_v2(self, **kwargs):
         self.list_calls.append(kwargs)
@@ -47,6 +48,10 @@ class _FakeS3:
         self.downloaded.append((bucket, key, path))
         with open(path, "w", encoding="utf-8") as fh:
             fh.write(f"content of {key}")
+
+    def upload_file(self, filename, bucket, key):
+        with open(filename, encoding="utf-8") as fh:
+            self.uploaded.append((bucket, key, fh.read()))
 
 
 def _single_page(keys):
@@ -215,3 +220,50 @@ def test_sync_clears_stale_files(monkeypatch, tmp_path):
 
     dest = _run(SANDBOX_USER_ID)
     assert _listdir_md(dest) == ["fresh.md"]  # stale.md was cleared
+
+
+# --- S3 write-back (durability) ---------------------------------------------
+
+def test_upload_user_file_puts_to_bucket(monkeypatch, tmp_path):
+    sync_root, _ = _redirect_roots(monkeypatch, tmp_path)
+    (sync_root / "user-123").mkdir(parents=True)
+    (sync_root / "user-123" / "user_preferences.md").write_text(
+        "# User Preferences\n- red\n", encoding="utf-8"
+    )
+    fake = _single_page([])
+    _install_s3(monkeypatch, fake)
+
+    storage_sync.upload_user_file("user-123", "user_preferences.md")
+
+    assert fake.uploaded == [
+        ("user-vaults", "user-123/user_preferences.md", "# User Preferences\n- red\n")
+    ]
+
+
+def test_upload_user_file_sandbox_is_noop(monkeypatch, tmp_path):
+    _redirect_roots(monkeypatch, tmp_path)
+
+    def _boom():
+        raise AssertionError("sandbox write-back must not build an S3 client")
+
+    monkeypatch.setattr(storage_sync, "build_s3_client", _boom)
+    storage_sync.upload_user_file(SANDBOX_USER_ID, "user_preferences.md")  # no raise
+
+
+def test_upload_user_file_missing_local_is_noop(monkeypatch, tmp_path):
+    _redirect_roots(monkeypatch, tmp_path)
+    fake = _single_page([])
+    _install_s3(monkeypatch, fake)
+    storage_sync.upload_user_file("user-123", "user_preferences.md")  # file absent
+    assert fake.uploaded == []
+
+
+def test_fresh_sync_restores_profile_from_s3(monkeypatch, tmp_path):
+    # Step 3: a fresh container (empty local root) downloads the profile back.
+    sync_root, _ = _redirect_roots(monkeypatch, tmp_path)
+    fake = _single_page(["user-123/user_preferences.md", "user-123/note.md"])
+    _install_s3(monkeypatch, fake)
+
+    dest = _run("user-123")
+    assert "user_preferences.md" in _listdir_md(dest)  # restored on startup
+    assert (sync_root / "user-123" / "user_preferences.md").is_file()
