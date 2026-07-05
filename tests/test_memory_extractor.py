@@ -16,8 +16,12 @@ import services.storage_sync as storage_sync
 from models import IntentPayload, MemoryExtraction, Message, RoutingDecision
 from orchestrator import (
     PREFERENCES_FILE,
+    _build_local_prompt,
+    _build_prompt,
     _latest_local_reply,
+    _load_user_profile,
     _record_preference,
+    _user_profile_block,
     extract_and_record_preference,
     extract_user_preference,
     schedule_memory_extraction,
@@ -216,3 +220,49 @@ def test_graph_finish_routes_directly_to_end():
     assert "memory_extractor" not in g.nodes
     edges = [(e.source, e.target) for e in g.edges]
     assert ("supervisor", "__end__") in edges  # finish terminates immediately
+
+
+# --- profile injection into the prompts (read side) -------------------------
+
+def _sup_state(user_id, raw="hello"):
+    return {
+        "intent": IntentPayload(intent="chat", confidence=0.9, raw_input=raw, source="cli"),
+        "user_id": user_id, "messages": [], "usage": None, "visited": [],
+        "step": 1, "next": "", "status": "", "tool_request": None,
+    }
+
+
+def test_profile_block_empty_when_no_profile(_vault_root):
+    assert _user_profile_block("nobody-home") == ""
+
+
+def test_profile_block_present_when_profile_exists(_vault_root):
+    _record_preference("user-abc", _pref(value="Red"))
+    block = _user_profile_block("user-abc")
+    assert "### USER PROFILE & LONG-TERM PREFERENCES" in block
+    assert "Red" in block
+
+
+def test_supervisor_prompt_injects_profile(_vault_root):
+    _record_preference("user-abc", _pref(value="Red"))
+    prompt = _build_prompt(_sup_state("user-abc"))
+    assert "### USER PROFILE & LONG-TERM PREFERENCES" in prompt
+    assert "Red" in prompt
+    assert "do NOT call a tool to fetch it" in prompt
+
+
+def test_supervisor_prompt_omits_block_without_profile(_vault_root):
+    assert "USER PROFILE" not in _build_prompt(_sup_state("nobody-home"))
+
+
+def test_local_prompt_injects_profile(_vault_root):
+    _record_preference("user-abc", _pref(value="Red"))
+    prompt = _build_local_prompt(_sup_state("user-abc"))
+    assert "### USER PROFILE & LONG-TERM PREFERENCES" in prompt
+    assert "Red" in prompt
+
+
+def test_load_user_profile_is_user_isolated(_vault_root):
+    _record_preference("user-abc", _pref(value="Red"))
+    assert "Red" in _load_user_profile("user-abc")
+    assert _load_user_profile("user-xyz") == ""  # path-safe read is user-scoped

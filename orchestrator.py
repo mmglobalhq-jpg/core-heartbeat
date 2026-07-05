@@ -259,6 +259,39 @@ def get_client(model_preference: str | None = DEFAULT_MODEL_PREFERENCE) -> objec
     return _client_cache[provider][1]
 
 
+def _load_user_profile(user_id: str) -> str:
+    """Read the caller's cross-session profile (user_preferences.md), or "".
+
+    Uses the path-safe, user-isolated read_note so it can only ever read within
+    ``/tmp/vaults/<user_id>/``. Any miss (no profile written yet) or read error
+    yields an empty string — the prompt simply omits the profile block.
+    """
+    try:
+        return read_note(user_id, PREFERENCES_FILE).strip()
+    except Exception:
+        return ""
+
+
+def _user_profile_block(user_id: str) -> str:
+    """A '### USER PROFILE & LONG-TERM PREFERENCES' context block, or "" if none.
+
+    Injected into the Supervisor and local worker prompts so a brand-new session
+    is aware of the user's durable preferences from turn one, without any node
+    having to call a filesystem tool to fetch them.
+    """
+    profile = _load_user_profile(user_id)
+    if not profile:
+        return ""
+    return (
+        "\n### USER PROFILE & LONG-TERM PREFERENCES\n"
+        "The block below is this user's PERMANENT, cross-session identity and "
+        "preferences, already loaded from their profile. Treat it as durable "
+        "ground truth and use it to guide your decision and responses. It is "
+        "already provided here — do NOT call a tool to fetch it.\n"
+        f"{profile}\n\n"
+    )
+
+
 def _build_prompt(state: GraphState) -> str:
     """Deterministic routing prompt derived from the intent + message history.
 
@@ -273,9 +306,11 @@ def _build_prompt(state: GraphState) -> str:
     messages = state.get("messages", [])
     history = "\n".join(f"{m.source}: {m.content}" for m in messages)
     worker_replies = sum(1 for m in messages if m.source in WORKER_NODES)
+    profile_block = _user_profile_block(state.get("user_id", SANDBOX_USER_ID))
     return (
         "You are the Supervisor in an orchestration graph. Decide the single "
         "next step for this run.\n"
+        f"{profile_block}"
         "Routing policy:\n"
         "- Route to local_llm to generate a conversational or reasoned reply.\n"
         "- Route to tool_execution to act on the user's personal Markdown vault. "
@@ -521,10 +556,16 @@ def build_ollama_client() -> httpx.AsyncClient:
 
 
 def _build_local_prompt(state: GraphState) -> str:
-    """Deterministic inference prompt from the intent + message history."""
+    """Deterministic inference prompt from the intent + message history.
+
+    Prefixes the user's long-term profile (if any) so generated replies reflect
+    durable preferences from the first turn of a new session.
+    """
     intent = state["intent"]
     history = "\n".join(f"{m.source}: {m.content}" for m in state.get("messages", []))
+    profile_block = _user_profile_block(state.get("user_id", SANDBOX_USER_ID))
     return (
+        f"{profile_block}"
         f"Intent: {intent.intent}\n"
         f"Raw input: {intent.raw_input}\n"
         f"History so far:\n{history or '(none)'}\n"

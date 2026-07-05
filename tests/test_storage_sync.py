@@ -179,6 +179,30 @@ def test_real_user_follows_pagination(monkeypatch, tmp_path):
 
 # --- snapshot semantics: dest cleared each sync -----------------------------
 
+def test_sync_preserves_user_preferences_across_wipe(monkeypatch, tmp_path):
+    # The locally-generated profile must survive the clean-snapshot wipe, while
+    # ordinary stale notes are still cleared and mock/remote notes still sync in.
+    sync_root, mock_root = _redirect_roots(monkeypatch, tmp_path)
+    user = SANDBOX_USER_ID
+    (sync_root / user).mkdir(parents=True)
+    (sync_root / user / "user_preferences.md").write_text(
+        "# User Preferences\n- keep me\n", encoding="utf-8"
+    )
+    (sync_root / user / "stale.md").write_text("old", encoding="utf-8")
+    (mock_root / user).mkdir(parents=True)
+    (mock_root / user / "fresh.md").write_text("new", encoding="utf-8")
+
+    dest = _run(user)
+    names = sorted(os.listdir(dest))
+    assert "user_preferences.md" in names   # preserved across the wipe
+    assert "fresh.md" in names              # synced from the mock source
+    assert "stale.md" not in names          # ordinary stale note cleared
+    assert (
+        (sync_root / user / "user_preferences.md").read_text(encoding="utf-8")
+        == "# User Preferences\n- keep me\n"
+    )
+
+
 def test_sync_clears_stale_files(monkeypatch, tmp_path):
     sync_root, mock_root = _redirect_roots(monkeypatch, tmp_path)
     dest_dir = sync_root / SANDBOX_USER_ID

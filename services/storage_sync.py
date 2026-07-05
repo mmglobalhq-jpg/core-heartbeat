@@ -60,6 +60,11 @@ VAULT_MOCK_ROOT_ENV = "VAULT_MOCK_ROOT"
 DEFAULT_VAULT_MOCK_ROOT = str(Path(__file__).resolve().parent.parent / "mock_vaults")
 
 VAULT_SUFFIX = ".md"
+# Locally-generated files that are NOT remote notes and must survive a sync's
+# clean-snapshot wipe (e.g. the memory_extractor's cross-session user profile).
+# Without this, each streaming turn's pre-run sync would delete the profile before
+# the Supervisor could read it back.
+PRESERVED_LOCAL_FILES = ("user_preferences.md",)
 
 
 def _vault_bucket() -> str:
@@ -82,11 +87,22 @@ def _reset_dest(user_id: str) -> str:
     """Return (and freshly (re)create) the local destination for ``user_id``.
 
     The directory is cleared first so each sync is a clean snapshot — a note
-    deleted remotely does not survive locally.
+    deleted remotely does not survive locally — EXCEPT for locally-generated files
+    in :data:`PRESERVED_LOCAL_FILES` (the user profile), which are carried across
+    the wipe so cross-session memory is not destroyed on every pre-run sync.
     """
     dest = os.path.join(_sync_root(), user_id)
+    preserved: dict[str, bytes] = {}
+    for name in PRESERVED_LOCAL_FILES:
+        path = os.path.join(dest, name)
+        if os.path.isfile(path):
+            with open(path, "rb") as fh:
+                preserved[name] = fh.read()
     shutil.rmtree(dest, ignore_errors=True)
     os.makedirs(dest, exist_ok=True)
+    for name, data in preserved.items():
+        with open(os.path.join(dest, name), "wb") as fh:
+            fh.write(data)
     return dest
 
 
