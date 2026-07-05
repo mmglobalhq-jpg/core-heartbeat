@@ -30,9 +30,10 @@ from langgraph.graph import END, StateGraph
 
 from auth import SANDBOX_USER_ID
 from services.storage_sync import sync_user_vault
-from tools.user_vault import USER_VAULT_TOOLS, run_vault_tool
+from tools.user_vault import USER_VAULT_TOOLS, read_note, run_vault_tool, write_note
 from models import (
     IntentPayload,
+    MemoryExtraction,
     Message,
     OrchestrationOutcome,
     RoutingDecision,
@@ -92,6 +93,31 @@ ROUTING_JSON_SCHEMA: dict = {
     "required": ["next_node"],
     "additionalProperties": False,
 }
+
+# Memory extractor (feature 008). Shared JSON Schema for the silent profile
+# builder's structured output, reused as OpenAI's json_schema and Anthropic's tool
+# input_schema (Gemini uses the MemoryExtraction Pydantic model directly).
+MEMORY_EXTRACTION_JSON_SCHEMA: dict = {
+    "type": "object",
+    "properties": {
+        "preference_type": {
+            "type": "string",
+            "enum": [
+                "favorite", "project_stack", "tool_setting",
+                "personal_fact", "workflow", "none",
+            ],
+        },
+        "key_insight": {"type": "string"},
+        "value": {"type": "string"},
+        "confidence_score": {"type": "number"},
+    },
+    "required": ["preference_type", "key_insight", "value", "confidence_score"],
+    "additionalProperties": False,
+}
+# Only durable, non-"none" extractions at/above this confidence are persisted.
+MEMORY_CONFIDENCE_THRESHOLD = 0.6
+# Vault file the extractor upserts learned preferences into (per-user, path-safe).
+PREFERENCES_FILE = "user_preferences.md"
 
 # Local Ollama worker (feature 005). All three are read from the environment at
 # node-invoke time so tests/deployments can override without rebuilding the graph.
@@ -751,6 +777,165 @@ def tool_execution(state: GraphState) -> dict:
     }
 
 
+# --- memory extractor (feature 008) -----------------------------------------
+
+def _latest_local_reply(messages: list[Message]) -> str:
+    """The most recent local_llm reply text (the user-visible assistant answer)."""
+    for message in reversed(messages):
+        if message.source == "local_llm" and message.content:
+            # Skip a degraded failure notice — nothing durable to learn from it.
+            if message.content.startswith("local inference failure:"):
+                return ""
+            return message.content
+    return ""
+
+
+def _build_memory_prompt(user_message: str, assistant_reply: str) -> str:
+    """Prompt the silent profile builder to extract at most one durable preference."""
+    return (
+        "You are a silent, background profile builder for a personal assistant. "
+        "Read ONLY the latest exchange and extract AT MOST ONE durable, "
+        "cross-session fact about the user worth remembering long-term — e.g. a "
+        "favorite thing, a project/tech-stack choice, a tool or workflow setting, "
+        "or a stable personal fact. IGNORE transient chat, one-off questions, the "
+        "task's subject matter, and generic conversation. If nothing durable is "
+        "present, return preference_type=\"none\" with confidence_score 0.0.\n"
+        f"User said: {user_message}\n"
+        f"Assistant replied: {assistant_reply}\n"
+        "Return the fields: preference_type, key_insight (a short stable label), "
+        "value (the concrete preference), confidence_score (0.0-1.0)."
+    )
+
+
+def extract_user_preference(
+    user_message: str,
+    assistant_reply: str,
+    client: object,
+    model_preference: str | None = DEFAULT_MODEL_PREFERENCE,
+) -> MemoryExtraction | None:
+    """Ask the selected provider to extract one durable preference. Never raises.
+
+    Dispatches on the same provider registry as the Supervisor and normalizes each
+    provider's structured output into a MemoryExtraction. Returns None on any
+    failure (call error, unparseable/invalid output) so the node stays best-effort.
+    """
+    provider, api_model = _resolve_model(model_preference)
+    prompt = _build_memory_prompt(user_message, assistant_reply)
+    try:
+        if provider == "openai":
+            response = client.chat.completions.create(
+                model=api_model,
+                messages=[{"role": "user", "content": prompt}],
+                response_format={
+                    "type": "json_schema",
+                    "json_schema": {
+                        "name": "memory_extraction",
+                        "strict": True,
+                        "schema": MEMORY_EXTRACTION_JSON_SCHEMA,
+                    },
+                },
+            )
+            return MemoryExtraction.model_validate(
+                json.loads(response.choices[0].message.content)
+            )
+        if provider == "anthropic":
+            tool = {
+                "name": "remember",
+                "description": "Record at most one durable user preference.",
+                "input_schema": MEMORY_EXTRACTION_JSON_SCHEMA,
+            }
+            response = client.messages.create(
+                model=api_model,
+                max_tokens=256,
+                messages=[{"role": "user", "content": prompt}],
+                tools=[tool],
+                tool_choice={"type": "tool", "name": "remember"},
+            )
+            block = next(b for b in response.content if getattr(b, "type", None) == "tool_use")
+            return MemoryExtraction.model_validate(block.input)
+        # Gemini: native structured output via the MemoryExtraction schema.
+        response = client.models.generate_content(
+            model=api_model,
+            contents=prompt,
+            config=types.GenerateContentConfig(
+                response_mime_type="application/json",
+                response_schema=MemoryExtraction,
+                http_options=types.HttpOptions(timeout=REQUEST_TIMEOUT_MS),
+            ),
+        )
+        parsed = getattr(response, "parsed", None)
+        if isinstance(parsed, MemoryExtraction):
+            return parsed
+        if isinstance(parsed, dict):
+            return MemoryExtraction.model_validate(parsed)
+        text = getattr(response, "text", None)
+        if not text:
+            return None
+        return MemoryExtraction.model_validate(json.loads(text))
+    except Exception:  # call failure / bad shape / invalid output — never raise
+        return None
+
+
+def _record_preference(user_id: str, pref: MemoryExtraction) -> str:
+    """Upsert one preference into the user's vault profile via the path-safe utils.
+
+    Reads/writes strictly within ``/tmp/vaults/<user_id>/`` (tools.user_vault
+    enforces the isolation boundary). Upserts on ``preference_type + key_insight``:
+    an existing bullet for the same key is replaced, otherwise the line is
+    appended, so repeated turns refine rather than duplicate. Returns the written
+    bullet.
+    """
+    line = (
+        f"- **{pref.preference_type}** | {pref.key_insight}: {pref.value} "
+        f"(confidence {pref.confidence_score:.2f})"
+    )
+    key_prefix = f"- **{pref.preference_type}** | {pref.key_insight}:"
+    try:
+        existing = read_note(user_id, PREFERENCES_FILE)
+    except Exception:  # missing file / any read issue -> start fresh
+        existing = ""
+    bullets = [b for b in existing.splitlines() if b.startswith("- ")]
+    bullets = [b for b in bullets if not b.startswith(key_prefix)]  # upsert
+    bullets.append(line)
+    content = "# User Preferences\n\n" + "\n".join(bullets) + "\n"
+    write_note(user_id, PREFERENCES_FILE, content)
+    return line
+
+
+async def memory_extractor(state: GraphState) -> dict:
+    """Silent trailing node: learn one durable preference from the latest exchange.
+
+    Runs as the final graph step (Supervisor finish -> here -> END), AFTER
+    local_llm has already streamed its full reply to the client, so it never
+    blocks the real-time token stream. Best-effort and side-effect-only: it emits
+    no messages/tokens/usage (returns an empty update), and every failure path is
+    swallowed so it can never break or alter the run. When the latest exchange
+    carries a high-confidence durable preference, it is upserted into the user's
+    isolated vault profile (feature 008).
+    """
+    try:
+        intent = state["intent"]
+        user_id = state.get("user_id", SANDBOX_USER_ID)
+        assistant_reply = _latest_local_reply(state.get("messages", []))
+        if not assistant_reply:
+            return {}  # no assistant answer this turn -> nothing to learn
+        model_pref = getattr(intent, "model_preference", None) or DEFAULT_MODEL_PREFERENCE
+        client = get_client(model_pref)
+        if client is None:
+            return {}
+        pref = extract_user_preference(intent.raw_input, assistant_reply, client, model_pref)
+        if (
+            pref is None
+            or pref.preference_type == "none"
+            or pref.confidence_score < MEMORY_CONFIDENCE_THRESHOLD
+        ):
+            return {}
+        _record_preference(user_id, pref)
+    except Exception:
+        pass  # never let profile-building break the run
+    return {}
+
+
 # --- routing + graph --------------------------------------------------------
 
 def route(state: GraphState) -> str:
@@ -764,14 +949,23 @@ def build_graph():
     builder.add_node("supervisor", supervisor)
     builder.add_node("local_llm", local_llm)
     builder.add_node("tool_execution", tool_execution)
+    builder.add_node("memory_extractor", memory_extractor)
     builder.set_entry_point("supervisor")
+    # On finish, pass through the silent memory_extractor before terminating. It
+    # runs after local_llm has streamed its reply, so it is a trailing step that
+    # never blocks the token stream (feature 008).
     builder.add_conditional_edges(
         "supervisor",
         route,
-        {"local_llm": "local_llm", "tool_execution": "tool_execution", "finish": END},
+        {
+            "local_llm": "local_llm",
+            "tool_execution": "tool_execution",
+            "finish": "memory_extractor",
+        },
     )
     builder.add_edge("local_llm", "supervisor")
     builder.add_edge("tool_execution", "supervisor")
+    builder.add_edge("memory_extractor", END)
     return builder.compile()
 
 

@@ -120,6 +120,30 @@ class RoutingDecision(BaseModel):
     tool_args: ToolArgs = Field(default_factory=ToolArgs)
 
 
+class MemoryExtraction(BaseModel):
+    """Structured output of the silent memory_extractor node (feature 008).
+
+    The background profile-builder LLM emits exactly one of these per turn. A
+    durable, cross-session user preference sets a concrete ``preference_type`` with
+    a high ``confidence_score``; transient chat / task noise yields
+    ``preference_type="none"`` with ``confidence_score`` 0. Only high-confidence,
+    non-"none" extractions are written to the user's vault profile.
+
+    Fields:
+        preference_type: category of the durable fact (or "none").
+        key_insight: short stable label for the preference (the upsert key).
+        value: the concrete preference/fact to remember.
+        confidence_score: model certainty in [0, 1] that this is durable.
+    """
+
+    preference_type: Literal[
+        "favorite", "project_stack", "tool_setting", "personal_fact", "workflow", "none"
+    ]
+    key_insight: str
+    value: str
+    confidence_score: float = Field(ge=0.0, le=1.0)
+
+
 class RoutingFailure(BaseModel):
     """A categorized Supervisor routing failure, recorded for observability (FR-008)."""
 
