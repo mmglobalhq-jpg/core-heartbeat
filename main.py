@@ -6,12 +6,20 @@ failures into the shared ValidationRejected envelope. See
 specs/002-gateway-routing/ for the contract.
 """
 
+import logging
+
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
 from models import ValidationRejected
 from router import load_confidence_threshold, router
+
+# Surface app-level INFO logs (e.g. auth.resolve_user_id's resolved user_id).
+# uvicorn configures only its own loggers and leaves the root logger unhandled,
+# so without this our module loggers' INFO records are dropped. uvicorn's loggers
+# do not propagate to root, so this does not duplicate its access log lines.
+logging.basicConfig(level=logging.INFO)
 
 
 def _validation_exception_handler(

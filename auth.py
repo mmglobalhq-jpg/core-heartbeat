@@ -210,15 +210,18 @@ def resolve_user_id(request: Request) -> str:
     sandbox user. Never raises.
     """
     token = extract_bearer_token(request)
+    user_id = SANDBOX_USER_ID
     if token is not None:
         verified = verify_supabase_jwt(token)
         if verified:
-            return verified
+            user_id = verified
         # Token present but unverifiable → ignore it and fall through to sandbox.
 
     # No verified Supabase identity. Sandbox boundary (see module docstring):
     # unauthenticated local/dev + test calls, and CF Access service-token
     # automation that Access already gate-kept at the edge.
-    if _has_cf_access_service_token(request):
+    if user_id == SANDBOX_USER_ID and _has_cf_access_service_token(request):
         logger.debug("CF Access service-token request resolved to the sandbox user.")
-    return SANDBOX_USER_ID
+
+    logger.info("Resolved active user_id: %s", user_id)
+    return user_id
