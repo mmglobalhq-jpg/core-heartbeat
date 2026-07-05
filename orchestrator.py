@@ -54,6 +54,12 @@ MODEL_NAME = "gemini-2.5-flash"
 GEMINI_API_KEY_ENV = "GEMINI_API_KEY"
 REQUEST_TIMEOUT_MS = 10_000  # bound each model call (FR-006); milliseconds
 
+# Bounded retry for TRANSIENT Supervisor routing failures before degrading. Only
+# categories that can plausibly succeed on a re-attempt are retried; auth /
+# missing_credential are terminal (a retry cannot fix them).
+MAX_ROUTING_RETRIES = 2  # up to 1 + 2 = 3 attempts per Supervisor turn
+RETRYABLE_ROUTING_CATEGORIES = frozenset({"timeout", "network", "invalid_output"})
+
 # Multi-model Supervisor support (feature 006). A caller-selected
 # `model_preference` on the intent picks the provider; each maps to a provider id
 # and the provider's real API model id. Unknown preferences fall back to the
@@ -649,7 +655,25 @@ def supervisor(state: GraphState) -> dict:
             ),
         )
 
-    decision, failure, usage = request_routing_decision(state, client, model_pref)
+    # Bounded retry: a transient timeout/network/invalid_output can succeed on a
+    # re-attempt, so retry those before degrading (a non-transient failure such as
+    # auth breaks out immediately). Usage is accumulated across attempts so token
+    # accounting reflects every model call. FR-005/FR-006.
+    usage = TokenUsage()
+    decision = None
+    failure = None
+    max_attempts = 1 + MAX_ROUTING_RETRIES
+    for attempt in range(1, max_attempts + 1):
+        decision, failure, call_usage = request_routing_decision(state, client, model_pref)
+        usage = add_usage(usage, call_usage)
+        if failure is None:
+            break
+        if failure.category not in RETRYABLE_ROUTING_CATEGORIES or attempt == max_attempts:
+            break
+        logger.warning(
+            "supervisor routing attempt %d/%d failed (%s: %s); retrying",
+            attempt, max_attempts, failure.category, failure.detail,
+        )
     if failure is not None:
         return _degraded(step, failure, usage)
 

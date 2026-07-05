@@ -206,6 +206,80 @@ def test_supervisor_first_dispatch_not_guarded(monkeypatch):
     assert update.get("status") != "completed"
 
 
+# --- bounded retry on transient routing failures ----------------------------
+
+def _raiser(exc):
+    def _r():
+        raise exc
+    return _r
+
+
+def _returner(parsed=None, text=None, usage=None):
+    def _r():
+        return FakeResponse(parsed=parsed, text=text, usage_metadata=usage)
+    return _r
+
+
+def sequenced(*responders):
+    """FakeClient whose successive generate_content calls run `responders` in order
+    (the last repeats). `.seq["n"]` counts how many calls were made."""
+    state = {"n": 0}
+
+    def _r():
+        i = min(state["n"], len(responders) - 1)
+        state["n"] += 1
+        return responders[i]()
+
+    client = FakeClient(_r)
+    client.seq = state
+    return client
+
+
+def test_supervisor_retries_transient_then_succeeds(monkeypatch):
+    # attempt 1 times out, attempt 2 returns a valid decision -> routes, no degrade.
+    client = sequenced(
+        _raiser(httpx.TimeoutException("slow")),
+        _returner(parsed=RoutingDecision(next_node="local_llm"), usage=FakeUsage(prompt=1, candidates=1, total=2)),
+    )
+    monkeypatch.setattr(orchestrator, "get_client", lambda *a, **k: client)
+    update = supervisor(state())
+    assert update["next"] == "local_llm"
+    assert update.get("status") != "degraded"
+    assert client.seq["n"] == 2  # retried exactly once
+    assert update["usage"].total_tokens == 2  # usage accumulated across attempts
+
+
+def test_supervisor_retries_invalid_output_then_succeeds(monkeypatch):
+    client = sequenced(
+        _returner(text='{"next_node": "banana"}'),  # invalid_output
+        _returner(parsed=RoutingDecision(next_node="finish")),
+    )
+    monkeypatch.setattr(orchestrator, "get_client", lambda *a, **k: client)
+    update = supervisor(state())
+    assert update["next"] == "finish" and update["status"] == "completed"
+    assert client.seq["n"] == 2
+
+
+def test_supervisor_degrades_after_exhausting_retries(monkeypatch):
+    # persistent timeout -> degrade after the full attempt budget (1 + 2 = 3).
+    client = sequenced(_raiser(httpx.TimeoutException("slow")))  # always times out
+    monkeypatch.setattr(orchestrator, "get_client", lambda *a, **k: client)
+    update = supervisor(state())
+    assert update["next"] == "finish" and update["status"] == "degraded"
+    assert "timeout" in update["messages"][0].content
+    assert client.seq["n"] == 1 + orchestrator.MAX_ROUTING_RETRIES  # 3 attempts
+
+
+def test_supervisor_auth_failure_is_not_retried(monkeypatch):
+    # a non-transient auth error degrades immediately — no wasted retries.
+    client = sequenced(_raiser(errors.ClientError(401, {"error": {"message": "unauth"}})))
+    monkeypatch.setattr(orchestrator, "get_client", lambda *a, **k: client)
+    update = supervisor(state())
+    assert update["next"] == "finish" and update["status"] == "degraded"
+    assert "auth" in update["messages"][0].content
+    assert client.seq["n"] == 1  # tried once, did not retry
+
+
 # --- US3: usage capture -----------------------------------------------------
 
 def test_usage_captured_when_reported():
