@@ -17,6 +17,21 @@ def _utc_now() -> datetime:
     return datetime.now(timezone.utc)
 
 
+class HistoryTurn(BaseModel):
+    """One prior conversation turn supplied by the caller (feature: chat history).
+
+    The gateway is otherwise stateless per request — it seeds the graph with an
+    empty message list. When a UI reopens a saved conversation (or continues a
+    live multi-turn one) it passes the earlier turns here so the orchestrator can
+    seed them into the run's history, giving the agent context. Only the two
+    display roles are accepted; the current message stays in
+    ``IntentPayload.raw_input`` and is NOT repeated here.
+    """
+
+    role: Literal["user", "assistant"]
+    content: str
+
+
 class IntentPayload(BaseModel):
     """Self-contained parsed intent carried from the API boundary to the router.
 
@@ -40,6 +55,9 @@ class IntentPayload(BaseModel):
             Drives which provider the orchestrator's Supervisor uses; defaults to
             the Gemini flash model. Surfaced so a UI model dropdown can steer
             routing. Unknown values fall back to the default provider.
+        history: Optional prior conversation turns (chat-history feature). Empty by
+            default (stateless request); when present the orchestrator seeds them
+            into the run so the agent has conversational context.
     """
 
     model_config = ConfigDict(extra="forbid", frozen=True)
@@ -51,6 +69,7 @@ class IntentPayload(BaseModel):
     source: str = Field(min_length=1)
     timestamp: datetime = Field(default_factory=_utc_now)
     model_preference: str | None = "gemini-2.5-flash"
+    history: list[HistoryTurn] = Field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------
@@ -88,14 +107,60 @@ class OrchestrationOutcome(BaseModel):
     steps: int
 
 
+class ToolArgs(BaseModel):
+    """Arguments for a vault tool call — only the field the chosen tool needs is set.
+
+    Kept as a fixed, typed object (rather than a free-form dict) so it maps cleanly
+    onto every provider's structured-output schema. Mirrors the vault tools'
+    parameters: ``read_user_note(filename)``, ``search_user_vault(query)``,
+    ``write_user_note(filename, content)``.
+    """
+
+    filename: str | None = None
+    query: str | None = None
+    content: str | None = None
+
+
 class RoutingDecision(BaseModel):
-    """Strict schema for the Supervisor's model routing decision (feature 004).
+    """Strict schema for the Supervisor's model routing decision (features 004 + 007).
 
     Used both as the model's response_schema and to re-validate the response.
     ``next_node`` is constrained to the graph's routing vocabulary (FR-002).
+
+    When ``next_node == "tool_execution"`` the model also names the vault tool to
+    run (``tool_name``) and supplies its arguments (``tool_args``); both are absent
+    for the ``local_llm``/``finish`` routes. This is the tool-calling loop: the
+    supervisor threads the named call to the tool_execution node, whose isolated
+    result is appended to the history and fed back to the model.
     """
 
     next_node: Literal["local_llm", "tool_execution", "finish"]
+    tool_name: Literal["read_user_note", "search_user_vault", "write_user_note"] | None = None
+    tool_args: ToolArgs = Field(default_factory=ToolArgs)
+
+
+class MemoryExtraction(BaseModel):
+    """Structured output of the silent memory_extractor node (feature 008).
+
+    The background profile-builder LLM emits exactly one of these per turn. A
+    durable, cross-session user preference sets a concrete ``preference_type`` with
+    a high ``confidence_score``; transient chat / task noise yields
+    ``preference_type="none"`` with ``confidence_score`` 0. Only high-confidence,
+    non-"none" extractions are written to the user's vault profile.
+
+    Fields:
+        preference_type: category of the durable fact (or "none").
+        key_insight: short stable label for the preference (the upsert key).
+        value: the concrete preference/fact to remember.
+        confidence_score: model certainty in [0, 1] that this is durable.
+    """
+
+    preference_type: Literal[
+        "favorite", "project_stack", "tool_setting", "personal_fact", "workflow", "none"
+    ]
+    key_insight: str
+    value: str
+    confidence_score: float = Field(ge=0.0, le=1.0)
 
 
 class RoutingFailure(BaseModel):
@@ -185,3 +250,22 @@ class HealthStatus(BaseModel):
 
     status: str = "online"
     service: str = "core-heartbeat"
+
+
+class TitleRequest(BaseModel):
+    """Request body for POST /title — the conversation to summarize into a label.
+
+    Reuses HistoryTurn (the chat-history turn shape). At least one message is
+    required (enforced in the handler). Strict: unknown fields rejected.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    messages: list[HistoryTurn]
+
+
+class TitleResponse(BaseModel):
+    """Response for POST /title: a short topic label, or null to keep the current
+    title (empty conversation, model refusal, or local inference unavailable)."""
+
+    title: str | None = None

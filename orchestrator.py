@@ -11,7 +11,9 @@ decision, the MAX_STEPS bound (checked before any model call), and LangGraph's
 recursion_limit. See specs/003-* and specs/004-api-supervisor/.
 """
 
+import asyncio
 import json
+import logging
 import operator
 import os
 from collections.abc import AsyncIterator, Awaitable, Callable
@@ -24,11 +26,17 @@ from google.genai import errors, types
 import httpx
 
 from langchain_core.callbacks import adispatch_custom_event
+from langchain_core.callbacks.manager import dispatch_custom_event
 from langgraph.errors import GraphRecursionError
 from langgraph.graph import END, StateGraph
 
+from auth import SANDBOX_USER_ID
+from services.storage_sync import sync_user_vault, upload_user_file
+from tools.user_vault import USER_VAULT_TOOLS, read_note, run_vault_tool, write_note
 from models import (
+    HistoryTurn,
     IntentPayload,
+    MemoryExtraction,
     Message,
     OrchestrationOutcome,
     RoutingDecision,
@@ -37,13 +45,22 @@ from models import (
     WorkerFailure,
 )
 
+logger = logging.getLogger(__name__)
+
 # --- constants --------------------------------------------------------------
 
 MAX_STEPS = 8          # graceful step bound (Supervisor finishes at/after this)
 RECURSION_LIMIT = 25   # hard LangGraph catch
+HISTORY_LIMIT = 10     # max prior turns seeded from IntentPayload.history (token/latency bound)
 MODEL_NAME = "gemini-2.5-flash"
 GEMINI_API_KEY_ENV = "GEMINI_API_KEY"
 REQUEST_TIMEOUT_MS = 10_000  # bound each model call (FR-006); milliseconds
+
+# Bounded retry for TRANSIENT Supervisor routing failures before degrading. Only
+# categories that can plausibly succeed on a re-attempt are retried; auth /
+# missing_credential are terminal (a retry cannot fix them).
+MAX_ROUTING_RETRIES = 2  # up to 1 + 2 = 3 attempts per Supervisor turn
+RETRYABLE_ROUTING_CATEGORIES = frozenset({"timeout", "network", "invalid_output"})
 
 # Multi-model Supervisor support (feature 006). A caller-selected
 # `model_preference` on the intent picks the provider; each maps to a provider id
@@ -64,14 +81,55 @@ MODEL_REGISTRY: dict[str, tuple[str, str]] = {
 }
 # Shared JSON Schema for the routing decision, reused as OpenAI's json_schema and
 # Anthropic's tool input_schema so every provider is forced to the same shape.
+# Feature 007: when next_node == "tool_execution" the model also emits tool_name +
+# tool_args (the vault tool call). tool_args is a fixed, typed object so it maps
+# onto every provider's structured output; only the field the tool needs is set.
 ROUTING_JSON_SCHEMA: dict = {
     "type": "object",
     "properties": {
-        "next_node": {"type": "string", "enum": ["local_llm", "tool_execution", "finish"]}
+        "next_node": {"type": "string", "enum": ["local_llm", "tool_execution", "finish"]},
+        "tool_name": {
+            "type": ["string", "null"],
+            "enum": ["read_user_note", "search_user_vault", "write_user_note", None],
+        },
+        "tool_args": {
+            "type": "object",
+            "properties": {
+                "filename": {"type": ["string", "null"]},
+                "query": {"type": ["string", "null"]},
+                "content": {"type": ["string", "null"]},
+            },
+            "additionalProperties": False,
+        },
     },
     "required": ["next_node"],
     "additionalProperties": False,
 }
+
+# Memory extractor (feature 008). Shared JSON Schema for the silent profile
+# builder's structured output, reused as OpenAI's json_schema and Anthropic's tool
+# input_schema (Gemini uses the MemoryExtraction Pydantic model directly).
+MEMORY_EXTRACTION_JSON_SCHEMA: dict = {
+    "type": "object",
+    "properties": {
+        "preference_type": {
+            "type": "string",
+            "enum": [
+                "favorite", "project_stack", "tool_setting",
+                "personal_fact", "workflow", "none",
+            ],
+        },
+        "key_insight": {"type": "string"},
+        "value": {"type": "string"},
+        "confidence_score": {"type": "number"},
+    },
+    "required": ["preference_type", "key_insight", "value", "confidence_score"],
+    "additionalProperties": False,
+}
+# Only durable, non-"none" extractions at/above this confidence are persisted.
+MEMORY_CONFIDENCE_THRESHOLD = 0.6
+# Vault file the extractor upserts learned preferences into (per-user, path-safe).
+PREFERENCES_FILE = "user_preferences.md"
 
 # Local Ollama worker (feature 005). All three are read from the environment at
 # node-invoke time so tests/deployments can override without rebuilding the graph.
@@ -87,9 +145,20 @@ TOOL_USAGE = TokenUsage(input_tokens=5, output_tokens=0, total_tokens=5)
 
 WORKER_NODES = ["local_llm", "tool_execution"]
 
+# User-isolated vault filesystem tools exposed to the tool_execution node.
+# Keyed by tool name; the node dispatches by name with the run's state-resolved
+# user_id (never a caller-supplied one), so every filesystem op is confined to
+# the active user's /tmp/vaults/<user_id>/ boundary. See tools/user_vault.py.
+TOOL_REGISTRY = {t.name: t for t in USER_VAULT_TOOLS}
+
 # Name of the LangGraph custom event the local_llm node dispatches per generated
 # token; astream_run surfaces it (as on_custom_event) into the SSE stream.
 LOCAL_TOKEN_EVENT = "local_llm_token"
+
+# Custom event the tool_execution node dispatches when it runs a vault tool (name +
+# args + result). astream_run surfaces it so the UI can show a "reading/searching
+# the vault" indicator distinct from assistant tokens (feature 007).
+TOOL_CALL_EVENT = "vault_tool_call"
 
 
 # --- reducers ---------------------------------------------------------------
@@ -113,12 +182,28 @@ class GraphState(TypedDict):
     """State threaded through a run (channel reducers in brackets)."""
 
     intent: IntentPayload
+    # Stable identity of the caller (Supabase-resolved user_id, or the sandbox
+    # user for unauthenticated/local calls). Seeded once at run start and read by
+    # downstream nodes; no reducer, so it is set-once and carried unchanged.
+    user_id: str
     messages: Annotated[list[Message], operator.add]
+    # Prior conversation turns supplied by the caller (chat history), seeded once
+    # at run start. Kept SEPARATE from `messages` on purpose: `messages` is the
+    # this-run working set the Supervisor uses to detect completion (worker
+    # replies), so mixing prior turns in there makes it finish before answering
+    # the current question. Read only by the answering prompt (_build_local_prompt)
+    # to give the model context. Set-once, no reducer.
+    prior_context: list[Message]
     usage: Annotated[TokenUsage, add_usage]
     visited: Annotated[list[str], operator.add]
     step: Annotated[int, operator.add]
     next: str
     status: str
+    # Set-once-per-turn by the Supervisor when it routes to tool_execution: the
+    # named vault tool + its args ({"name", "args"}) for this turn, or None. A
+    # LastValue channel — the Supervisor writes it fresh (dict or None) on every
+    # routing turn so tool_execution never replays a stale request. Feature 007.
+    tool_request: dict | None
 
 
 # --- model client (feature 004; multi-provider in feature 006) --------------
@@ -183,6 +268,39 @@ def get_client(model_preference: str | None = DEFAULT_MODEL_PREFERENCE) -> objec
     return _client_cache[provider][1]
 
 
+def _load_user_profile(user_id: str) -> str:
+    """Read the caller's cross-session profile (user_preferences.md), or "".
+
+    Uses the path-safe, user-isolated read_note so it can only ever read within
+    ``/tmp/vaults/<user_id>/``. Any miss (no profile written yet) or read error
+    yields an empty string — the prompt simply omits the profile block.
+    """
+    try:
+        return read_note(user_id, PREFERENCES_FILE).strip()
+    except Exception:
+        return ""
+
+
+def _user_profile_block(user_id: str) -> str:
+    """A '### USER PROFILE & LONG-TERM PREFERENCES' context block, or "" if none.
+
+    Injected into the Supervisor and local worker prompts so a brand-new session
+    is aware of the user's durable preferences from turn one, without any node
+    having to call a filesystem tool to fetch them.
+    """
+    profile = _load_user_profile(user_id)
+    if not profile:
+        return ""
+    return (
+        "\n### USER PROFILE & LONG-TERM PREFERENCES\n"
+        "The block below is this user's PERMANENT, cross-session identity and "
+        "preferences, already loaded from their profile. Treat it as durable "
+        "ground truth and use it to guide your decision and responses. It is "
+        "already provided here — do NOT call a tool to fetch it.\n"
+        f"{profile}\n\n"
+    )
+
+
 def _build_prompt(state: GraphState) -> str:
     """Deterministic routing prompt derived from the intent + message history.
 
@@ -197,22 +315,35 @@ def _build_prompt(state: GraphState) -> str:
     messages = state.get("messages", [])
     history = "\n".join(f"{m.source}: {m.content}" for m in messages)
     worker_replies = sum(1 for m in messages if m.source in WORKER_NODES)
+    profile_block = _user_profile_block(state.get("user_id", SANDBOX_USER_ID))
     return (
         "You are the Supervisor in an orchestration graph. Decide the single "
         "next step for this run.\n"
+        f"{profile_block}"
         "Routing policy:\n"
-        "- Route to local_llm to generate a conversational or reasoned reply, or "
-        "to tool_execution to run an external action/tool.\n"
+        "- Route to local_llm to generate a conversational or reasoned reply.\n"
+        "- Route to tool_execution to act on the user's personal Markdown vault. "
+        "You then MUST set tool_name and tool_args. The available tools are:\n"
+        "    * read_user_note — read one note. tool_args: {\"filename\": <path>}.\n"
+        "    * search_user_vault — case-insensitive text/regex search across the "
+        "vault's notes. tool_args: {\"query\": <text>}.\n"
+        "    * write_user_note — create/update a note. tool_args: "
+        "{\"filename\": <path>, \"content\": <text>}.\n"
+        "  The tools are already scoped to THIS user's vault — never put a user id "
+        "or absolute/`..` path in a filename.\n"
+        "- After a tool result appears in the history, either issue another tool "
+        "call or route to local_llm to compose the final answer from it.\n"
         "- Choose finish as soon as the intent has been satisfied. If a worker "
         "has already produced a reply that answers the intent (e.g. a general "
-        "chat message), you MUST choose finish. Never re-dispatch a worker that "
-        "has already answered.\n"
+        "chat message), you MUST choose finish. Never re-dispatch local_llm once "
+        "it has answered.\n"
         f"Intent: {intent.intent}\n"
         f"Confidence: {intent.confidence}\n"
         f"Raw input: {intent.raw_input}\n"
         f"Worker replies so far: {worker_replies}\n"
         f"History so far:\n{history or '(none)'}\n"
-        "Respond with next_node = one of: local_llm, tool_execution, finish."
+        "Respond with next_node = one of: local_llm, tool_execution, finish "
+        "(plus tool_name + tool_args when tool_execution)."
     )
 
 
@@ -434,13 +565,22 @@ def build_ollama_client() -> httpx.AsyncClient:
 
 
 def _build_local_prompt(state: GraphState) -> str:
-    """Deterministic inference prompt from the intent + message history."""
+    """Deterministic inference prompt from the intent + message history.
+
+    Prefixes the user's long-term profile (if any) so generated replies reflect
+    durable preferences from the first turn of a new session.
+    """
     intent = state["intent"]
-    history = "\n".join(f"{m.source}: {m.content}" for m in state.get("messages", []))
+    # Prior conversation (chat history) first, then this-run messages (e.g. tool
+    # results), so the model answers the current input with full context.
+    convo = list(state.get("prior_context", [])) + list(state.get("messages", []))
+    history = "\n".join(f"{m.source}: {m.content}" for m in convo)
+    profile_block = _user_profile_block(state.get("user_id", SANDBOX_USER_ID))
     return (
+        f"{profile_block}"
         f"Intent: {intent.intent}\n"
         f"Raw input: {intent.raw_input}\n"
-        f"History so far:\n{history or '(none)'}\n"
+        f"Conversation so far:\n{history or '(none)'}\n"
         "Respond helpfully to the intent above."
     )
 
@@ -518,10 +658,90 @@ async def generate_local(
     return "".join(parts), None, _extract_ollama_usage(usage_body)
 
 
+# --- chat title generation (local-only) -------------------------------------
+
+_TITLE_MAX_LEN = 48
+
+
+def _clean_title(raw: str | None) -> str | None:
+    """Normalize a model-produced title, or None if it isn't usable.
+
+    Takes the first non-empty line, strips wrapping quotes/backticks and trailing
+    punctuation, collapses whitespace, and caps length. Rejects empty output and
+    obvious refusals / full sentences, so a chatty model never overwrites a decent
+    default with "Sure, here's a title:". None means "keep the current title".
+    """
+    if not raw:
+        return None
+    line = next((ln.strip() for ln in raw.splitlines() if ln.strip()), "")
+    if not line or len(line) > 60:  # a long single line is a sentence, not a label
+        return None
+    line = " ".join(line.split())  # collapse internal whitespace
+    # Strip wrapping quotes/backticks/punctuation from both ends in one pass, so
+    # order-dependent cases like '"DC Museums".' fully unwrap.
+    line = line.strip("\"'`.!?,:;() \t")
+    if not line:
+        return None
+    if line.lower().startswith(("i ", "i'm", "sorry", "here is", "here's", "sure")):
+        return None
+    return line[:_TITLE_MAX_LEN].strip()
+
+
+def _build_title_prompt(turns: list[HistoryTurn]) -> str:
+    """Prompt the local model for a short Title-Case topic label, nothing else."""
+    convo = "\n".join(f"{t.role}: {t.content}" for t in turns)
+    return (
+        "You name chat conversations. Read the conversation and reply with a "
+        "SHORT topic label of 2 to 5 words in Title Case that captures its "
+        "subject. Reply with ONLY the label — no quotes, no punctuation, no "
+        "explanation, no leading words like 'Title:'.\n\n"
+        f"Conversation:\n{convo}\n\nLabel:"
+    )
+
+
+async def generate_title(
+    turns: list[HistoryTurn], client: httpx.AsyncClient
+) -> str | None:
+    """Summarize a conversation into a short title via the local Ollama model.
+
+    One non-streaming call, reusing the local worker's Ollama config
+    (_ollama_url/_ollama_model). Never raises: any HTTP error, timeout,
+    unreachable service, or unparsable body yields None so the caller simply keeps
+    the existing title. Output is sanitized by _clean_title (None if unusable).
+    """
+    if not turns:
+        return None
+    payload = {
+        "model": _ollama_model(),
+        "prompt": _build_title_prompt(turns),
+        "stream": False,
+        "options": {"num_predict": 24, "temperature": 0.2},
+    }
+    try:
+        response = await client.post(_ollama_url(), json=payload)
+        if response.status_code // 100 != 2:
+            return None
+        body = response.json()
+    except Exception:  # timeout / transport / decode — never crash the endpoint
+        return None
+    if body.get("error"):
+        return None
+    return _clean_title(body.get("response"))
+
+
 # --- nodes ------------------------------------------------------------------
 
 def _degraded(step: int, failure: RoutingFailure, usage: TokenUsage | None = None) -> dict:
-    """Safe terminal update after a routing failure (FR-005, FR-008)."""
+    """Safe terminal update after a routing failure (FR-005, FR-008).
+
+    Logs the category AND the secret-free detail so a "degraded" outcome is
+    diagnosable from the backend logs — the in-band message only carries the
+    category. This is the single funnel for every degrade (missing credential and
+    all model-call/parse failures).
+    """
+    logger.warning(
+        "supervisor degraded at step %s: %s: %s", step, failure.category, failure.detail
+    )
     return {
         "next": "finish",
         "status": "degraded",
@@ -559,27 +779,47 @@ def supervisor(state: GraphState) -> dict:
             ),
         )
 
-    decision, failure, usage = request_routing_decision(state, client, model_pref)
+    # Bounded retry: a transient timeout/network/invalid_output can succeed on a
+    # re-attempt, so retry those before degrading (a non-transient failure such as
+    # auth breaks out immediately). Usage is accumulated across attempts so token
+    # accounting reflects every model call. FR-005/FR-006.
+    usage = TokenUsage()
+    decision = None
+    failure = None
+    max_attempts = 1 + MAX_ROUTING_RETRIES
+    for attempt in range(1, max_attempts + 1):
+        decision, failure, call_usage = request_routing_decision(state, client, model_pref)
+        usage = add_usage(usage, call_usage)
+        if failure is None:
+            break
+        if failure.category not in RETRYABLE_ROUTING_CATEGORIES or attempt == max_attempts:
+            break
+        logger.warning(
+            "supervisor routing attempt %d/%d failed (%s: %s); retrying",
+            attempt, max_attempts, failure.category, failure.detail,
+        )
     if failure is not None:
         return _degraded(step, failure, usage)
 
     nxt = decision.next_node
 
     # Deterministic anti-reloop guard (do not rely on the model to terminate).
-    # If the model tries to re-dispatch a worker that has ALREADY produced a
-    # reply this run, override the decision to `finish`. This kills the observed
-    # gemini-2.5-flash trap where a general chat is routed back to local_llm over
-    # and over until the MAX_STEPS guard fires (see _build_prompt's completion
-    # policy — this enforces it in code). Each worker still runs at most once per
-    # run; a genuine second worker (e.g. tool_execution after local_llm) is
-    # unaffected because it is not yet in `visited`.
+    # Scoped to local_llm: if the model re-dispatches local_llm after it has
+    # ALREADY produced a reply this run, override to a clean finish. This kills the
+    # observed gemini-2.5-flash trap where a general chat is routed back to
+    # local_llm over and over until the MAX_STEPS halt (see _build_prompt's
+    # completion policy — this enforces it in code). tool_execution is deliberately
+    # NOT guarded here: a tool-calling loop legitimately makes several tool calls
+    # (read, then search, ...), each a distinct turn bounded by MAX_STEPS /
+    # RECURSION_LIMIT, so a repeat visit must be allowed.
     visited = state.get("visited", [])
-    if nxt in WORKER_NODES and nxt in visited:
+    if nxt == "local_llm" and nxt in visited:
         return {
             "next": "finish",
             "status": "completed",
             "step": 1,
             "usage": usage,
+            "tool_request": None,
             "messages": [
                 Message(
                     source="supervisor",
@@ -589,11 +829,26 @@ def supervisor(state: GraphState) -> dict:
             ],
         }
 
+    # When routing to a tool, thread the named call to tool_execution via the
+    # tool_request channel. Written fresh (dict or None) on EVERY routing turn so
+    # tool_execution never replays a stale request from an earlier turn.
+    tool_request: dict | None = None
+    if nxt == "tool_execution" and decision.tool_name:
+        tool_request = {
+            "name": decision.tool_name,
+            "args": decision.tool_args.model_dump(exclude_none=True),
+        }
+
+    label = f"route -> {nxt}"
+    if tool_request is not None:
+        label = f"route -> {nxt} ({tool_request['name']})"
+
     update: dict = {
         "next": nxt,
         "step": 1,
         "usage": usage,
-        "messages": [Message(source="supervisor", content=f"route -> {nxt}", step=step)],
+        "tool_request": tool_request,
+        "messages": [Message(source="supervisor", content=label, step=step)],
     }
     if nxt == "finish":
         update["status"] = "completed"
@@ -646,13 +901,281 @@ async def local_llm(state: GraphState) -> dict:
 
 
 def tool_execution(state: GraphState) -> dict:
-    """Stubbed external tool/action: deterministic output + fixed usage."""
+    """External tool/action node, wired to the user-isolated vault tools.
+
+    If the run carries a ``tool_request`` (``{"name", "args"}``), the named tool
+    from :data:`TOOL_REGISTRY` is executed with the run's state-resolved
+    ``user_id`` — passed straight from graph state, so no request argument can
+    redirect the operation to another user's folder (isolation is enforced in
+    tools/user_vault.py). Absent a request the node keeps its deterministic stub
+    behavior. Either way it emits a message, fixed usage, and returns control to
+    the Supervisor.
+    """
+    request = state.get("tool_request")
+    if isinstance(request, dict) and request.get("name") in TOOL_REGISTRY:
+        name = request["name"]
+        args = request.get("args") or {}
+        user_id = state.get("user_id", SANDBOX_USER_ID)
+        result = run_vault_tool(name, user_id, args)
+        content = f"[tool:{name}] {result}"
+        # Surface the call for the SSE stream so the UI can show a
+        # reading/searching indicator. Best-effort: outside a run context (a
+        # direct unit-test call) there is no callback manager and this raises —
+        # swallow it; the result is still recorded on the message channel.
+        try:
+            dispatch_custom_event(
+                TOOL_CALL_EVENT, {"name": name, "args": args, "result": result}
+            )
+        except Exception:
+            pass
+    else:
+        content = "[stub] tool executed"
     return {
-        "messages": [Message(source="tool_execution", content="[stub] tool executed", step=state["step"])],
+        "messages": [Message(source="tool_execution", content=content, step=state["step"])],
         "usage": TOOL_USAGE,
         "visited": ["tool_execution"],
         "step": 1,
     }
+
+
+# --- memory extractor (feature 008) -----------------------------------------
+
+def _seed_messages(payload: IntentPayload) -> list[Message]:
+    """Build a run's initial message history from any prior turns the caller passed.
+
+    The gateway is stateless per request, so this is empty by default (today's
+    behavior). When a UI reopens a saved conversation (or continues a live one) it
+    supplies earlier turns via ``IntentPayload.history``; seeding them gives the
+    supervisor routing prompt and the inference prompt real conversational context
+    (both already render ``f"{m.source}: {m.content}"`` over ``state["messages"]``).
+
+    Only the most recent ``HISTORY_LIMIT`` turns are kept (oldest dropped, logged)
+    to bound tokens/latency. Roles map onto message ``source`` as user→"user",
+    assistant→"assistant".
+
+    IMPORTANT: assistant turns must NOT be sourced as "local_llm". The Supervisor's
+    completion policy counts WORKER_NODES messages ("local_llm"/"tool_execution")
+    as replies already produced *in this run* and finishes as soon as one exists
+    (see _build_prompt). Seeding a prior assistant turn as "local_llm" makes it
+    think the CURRENT question is already answered, so it routes straight to finish
+    and streams nothing. "assistant" keeps the turn as visible context without
+    tripping that heuristic. The current message is NOT included here — it stays in
+    ``payload.raw_input`` and enters the graph exactly as it does today.
+    """
+    history: list[HistoryTurn] = list(payload.history or [])
+    if len(history) > HISTORY_LIMIT:
+        logger.info(
+            "seed history truncated: %d turns supplied, keeping last %d",
+            len(history),
+            HISTORY_LIMIT,
+        )
+        history = history[-HISTORY_LIMIT:]
+    role_source = {"user": "user", "assistant": "assistant"}
+    return [
+        Message(source=role_source[turn.role], content=turn.content, step=i)
+        for i, turn in enumerate(history)
+    ]
+
+
+def _latest_local_reply(messages: list[Message]) -> str:
+    """The most recent local_llm reply text (the user-visible assistant answer)."""
+    for message in reversed(messages):
+        if message.source == "local_llm" and message.content:
+            # Skip a degraded failure notice — nothing durable to learn from it.
+            if message.content.startswith("local inference failure:"):
+                return ""
+            return message.content
+    return ""
+
+
+def _build_memory_prompt(user_message: str, assistant_reply: str) -> str:
+    """Prompt the silent profile builder to extract at most one durable preference."""
+    return (
+        "You are a silent, background profile builder for a personal assistant. "
+        "Read ONLY the latest exchange and extract AT MOST ONE durable, "
+        "cross-session fact about the user worth remembering long-term — e.g. a "
+        "favorite thing, a project/tech-stack choice, a tool or workflow setting, "
+        "or a stable personal fact. IGNORE transient chat, one-off questions, the "
+        "task's subject matter, and generic conversation. If nothing durable is "
+        "present, return preference_type=\"none\" with confidence_score 0.0.\n"
+        f"User said: {user_message}\n"
+        f"Assistant replied: {assistant_reply}\n"
+        "Return the fields: preference_type, key_insight (a short stable label), "
+        "value (the concrete preference), confidence_score (0.0-1.0)."
+    )
+
+
+def extract_user_preference(
+    user_message: str,
+    assistant_reply: str,
+    client: object,
+    model_preference: str | None = DEFAULT_MODEL_PREFERENCE,
+) -> MemoryExtraction | None:
+    """Ask the selected provider to extract one durable preference. Never raises.
+
+    Dispatches on the same provider registry as the Supervisor and normalizes each
+    provider's structured output into a MemoryExtraction. Returns None on any
+    failure (call error, unparseable/invalid output) so the node stays best-effort.
+    """
+    provider, api_model = _resolve_model(model_preference)
+    prompt = _build_memory_prompt(user_message, assistant_reply)
+    try:
+        if provider == "openai":
+            response = client.chat.completions.create(
+                model=api_model,
+                messages=[{"role": "user", "content": prompt}],
+                response_format={
+                    "type": "json_schema",
+                    "json_schema": {
+                        "name": "memory_extraction",
+                        "strict": True,
+                        "schema": MEMORY_EXTRACTION_JSON_SCHEMA,
+                    },
+                },
+            )
+            return MemoryExtraction.model_validate(
+                json.loads(response.choices[0].message.content)
+            )
+        if provider == "anthropic":
+            tool = {
+                "name": "remember",
+                "description": "Record at most one durable user preference.",
+                "input_schema": MEMORY_EXTRACTION_JSON_SCHEMA,
+            }
+            response = client.messages.create(
+                model=api_model,
+                max_tokens=256,
+                messages=[{"role": "user", "content": prompt}],
+                tools=[tool],
+                tool_choice={"type": "tool", "name": "remember"},
+            )
+            block = next(b for b in response.content if getattr(b, "type", None) == "tool_use")
+            return MemoryExtraction.model_validate(block.input)
+        # Gemini: native structured output via the MemoryExtraction schema.
+        response = client.models.generate_content(
+            model=api_model,
+            contents=prompt,
+            config=types.GenerateContentConfig(
+                response_mime_type="application/json",
+                response_schema=MemoryExtraction,
+                http_options=types.HttpOptions(timeout=REQUEST_TIMEOUT_MS),
+            ),
+        )
+        parsed = getattr(response, "parsed", None)
+        if isinstance(parsed, MemoryExtraction):
+            return parsed
+        if isinstance(parsed, dict):
+            return MemoryExtraction.model_validate(parsed)
+        text = getattr(response, "text", None)
+        if not text:
+            return None
+        return MemoryExtraction.model_validate(json.loads(text))
+    except Exception:  # call failure / bad shape / invalid output — never raise
+        return None
+
+
+def _record_preference(user_id: str, pref: MemoryExtraction) -> str:
+    """Upsert one preference into the user's vault profile via the path-safe utils.
+
+    Reads/writes strictly within ``/tmp/vaults/<user_id>/`` (tools.user_vault
+    enforces the isolation boundary). Upserts on ``preference_type + key_insight``:
+    an existing bullet for the same key is replaced, otherwise the line is
+    appended, so repeated turns refine rather than duplicate. Returns the written
+    bullet.
+    """
+    line = (
+        f"- **{pref.preference_type}** | {pref.key_insight}: {pref.value} "
+        f"(confidence {pref.confidence_score:.2f})"
+    )
+    key_prefix = f"- **{pref.preference_type}** | {pref.key_insight}:"
+    try:
+        existing = read_note(user_id, PREFERENCES_FILE)
+    except Exception:  # missing file / any read issue -> start fresh
+        existing = ""
+    bullets = [b for b in existing.splitlines() if b.startswith("- ")]
+    bullets = [b for b in bullets if not b.startswith(key_prefix)]  # upsert
+    bullets.append(line)
+    content = "# User Preferences\n\n" + "\n".join(bullets) + "\n"
+    write_note(user_id, PREFERENCES_FILE, content)
+    return line
+
+
+# Detached background tasks are kept referenced here so the event loop does not
+# garbage-collect them mid-flight; each removes itself on completion.
+_background_tasks: set[asyncio.Task] = set()
+
+
+async def extract_and_record_preference(
+    user_id: str,
+    model_preference: str | None,
+    user_message: str,
+    assistant_reply: str,
+) -> str | None:
+    """Extract one durable preference from the exchange and upsert it. Never raises.
+
+    Designed to run fully DETACHED from the request (see
+    :func:`schedule_memory_extraction`): the blocking provider call and the file
+    write are offloaded to worker threads (``asyncio.to_thread``) so this never
+    ties up the event loop that is serving other clients. Returns the recorded
+    bullet, or ``None`` when nothing durable/high-confidence was found.
+    """
+    try:
+        if not assistant_reply:
+            return None
+        client = get_client(model_preference)
+        if client is None:
+            return None
+        pref = await asyncio.to_thread(
+            extract_user_preference, user_message, assistant_reply, client, model_preference
+        )
+        if (
+            pref is None
+            or pref.preference_type == "none"
+            or pref.confidence_score < MEMORY_CONFIDENCE_THRESHOLD
+        ):
+            return None
+        line = await asyncio.to_thread(_record_preference, user_id, pref)
+        logger.info("memory: recorded preference for user_id=%s (%s)", user_id, pref.preference_type)
+        # Durability: mirror the updated profile back to S3 immediately, in a
+        # worker thread (blocking boto3). Best-effort and isolated — a write-back
+        # failure keeps the successful local write and never fails the task.
+        try:
+            await asyncio.to_thread(upload_user_file, user_id, PREFERENCES_FILE)
+            logger.info("memory: wrote profile back to S3 for user_id=%s", user_id)
+        except Exception:
+            logger.warning(
+                "memory: S3 write-back failed for user_id=%s (local copy kept)", user_id
+            )
+        return line
+    except Exception:  # best-effort; a profile-building failure is never fatal
+        logger.info("memory: extraction skipped (error)", exc_info=False)
+        return None
+
+
+def schedule_memory_extraction(
+    user_id: str, intent: IntentPayload, assistant_reply: str
+) -> asyncio.Task | None:
+    """Fire-and-forget the memory extraction so it never blocks the response.
+
+    Called right before the (streaming or non-streaming) response returns: it
+    schedules :func:`extract_and_record_preference` as a detached task on the
+    running loop and returns immediately, so the token stream closes instantly and
+    the profile write happens in parallel. Returns the task (callers ignore it;
+    tests may await it), or ``None`` when there is no assistant reply to learn from
+    or no running loop.
+    """
+    if not assistant_reply:
+        return None
+    model_pref = getattr(intent, "model_preference", None) or DEFAULT_MODEL_PREFERENCE
+    coro = extract_and_record_preference(user_id, model_pref, intent.raw_input, assistant_reply)
+    try:
+        task = asyncio.create_task(coro)
+    except RuntimeError:  # no running loop (not the normal request path)
+        coro.close()
+        return None
+    _background_tasks.add(task)
+    task.add_done_callback(_background_tasks.discard)
+    return task
 
 
 # --- routing + graph --------------------------------------------------------
@@ -669,6 +1192,10 @@ def build_graph():
     builder.add_node("local_llm", local_llm)
     builder.add_node("tool_execution", tool_execution)
     builder.set_entry_point("supervisor")
+    # finish terminates the graph directly, so the token stream closes instantly.
+    # Memory extraction is NOT a graph node — it is fired as a detached background
+    # task from run()/astream_run() (schedule_memory_extraction) so it can never
+    # block the response or affect the run's status (feature 008).
     builder.add_conditional_edges(
         "supervisor",
         route,
@@ -685,8 +1212,15 @@ graph = build_graph()
 
 # --- public API -------------------------------------------------------------
 
-async def run(payload: IntentPayload) -> OrchestrationOutcome:
+async def run(
+    payload: IntentPayload, user_id: str = SANDBOX_USER_ID
+) -> OrchestrationOutcome:
     """Orchestrate an accepted intent to a terminating OrchestrationOutcome.
+
+    ``user_id`` is the caller identity resolved at the gateway boundary
+    (auth.resolve_user_id); it is seeded into GraphState and defaults to the
+    sandbox user so direct/programmatic callers and existing tests need not pass
+    it.
 
     Async because the local_llm worker performs an asynchronous Ollama call
     (feature 005); the graph is driven with ``ainvoke`` (the sync supervisor and
@@ -696,12 +1230,15 @@ async def run(payload: IntentPayload) -> OrchestrationOutcome:
     """
     initial: GraphState = {
         "intent": payload,
+        "user_id": user_id,
         "messages": [],
+        "prior_context": _seed_messages(payload),
         "usage": TokenUsage(),
         "visited": [],
         "step": 0,
         "next": "",
         "status": "",
+        "tool_request": None,
     }
     try:
         final = await graph.ainvoke(initial, config={"recursion_limit": RECURSION_LIMIT})
@@ -714,6 +1251,11 @@ async def run(payload: IntentPayload) -> OrchestrationOutcome:
             steps=0,
         )
 
+    # Detached, non-blocking profile update from the finished exchange.
+    schedule_memory_extraction(
+        user_id, payload, _latest_local_reply(final.get("messages", []))
+    )
+
     visited = final.get("visited", [])
     return OrchestrationOutcome(
         status=final.get("status") or "completed",
@@ -724,7 +1266,9 @@ async def run(payload: IntentPayload) -> OrchestrationOutcome:
     )
 
 
-async def astream_run(payload: IntentPayload) -> AsyncIterator[dict]:
+async def astream_run(
+    payload: IntentPayload, user_id: str = SANDBOX_USER_ID
+) -> AsyncIterator[dict]:
     """Drive the graph via ``astream_events`` and yield progressive event dicts.
 
     Emits ``{"token": <text>}`` chunks progressively, then a terminal
@@ -744,15 +1288,31 @@ async def astream_run(payload: IntentPayload) -> AsyncIterator[dict]:
     """
     initial: GraphState = {
         "intent": payload,
+        "user_id": user_id,
         "messages": [],
+        "prior_context": _seed_messages(payload),
         "usage": TokenUsage(),
         "visited": [],
         "step": 0,
         "next": "",
         "status": "",
+        "tool_request": None,
     }
     final_status = "completed"
     streamed_local_tokens = False
+    last_local_reply = ""  # captured for the detached memory extraction
+
+    # Pre-execution: localize the caller's Markdown vault before the supervisor
+    # fires, so downstream nodes read from /tmp/vaults/<user_id>/ rather than
+    # reaching across the network mid-run (Phase 2 of the multi-user bridge). The
+    # sandbox user resolves to a local mock folder, so this is credential-free
+    # offline. Best-effort: a vault-sync failure must not break the stream — the
+    # run proceeds with whatever context is already local.
+    try:
+        await sync_user_vault(user_id)
+    except Exception:
+        pass
+
     try:
         async for event in graph.astream_events(
             initial, version="v2", config={"recursion_limit": RECURSION_LIMIT}
@@ -767,22 +1327,27 @@ async def astream_run(payload: IntentPayload) -> AsyncIterator[dict]:
                 streamed_local_tokens = True
                 yield {"token": event["data"]["token"]}
                 continue
+            # A vault tool ran: surface it as a structured event (not an assistant
+            # token) so the UI can show a reading/searching-the-vault indicator.
+            if etype == "on_custom_event" and name == TOOL_CALL_EVENT:
+                yield {"tool_call": event["data"]}
+                continue
             if etype != "on_chain_end":
                 continue
             output = event["data"].get("output")
             if not isinstance(output, dict):
                 continue
-            # tool_execution is a non-streaming stub — emit its reply as one chunk.
-            if name == "tool_execution":
-                for message in output.get("messages", []):
-                    yield {"token": message.content}
-            # local_llm normally streams live tokens; if this run streamed NONE
-            # (a degraded call that only recorded a failure notice, or any
-            # non-streamed reply), surface its final message so the content is not
+            # Capture the assistant reply for the detached memory extraction, and
+            # (if this run streamed NO tokens — a degraded failure notice or any
+            # non-streamed reply) surface its final message so the content is not
             # silently dropped behind a "completed" status.
-            if name == "local_llm" and not streamed_local_tokens:
+            if name == "local_llm":
                 for message in output.get("messages", []):
-                    if message.content:
+                    if not message.content:
+                        continue
+                    if not message.content.startswith("local inference failure:"):
+                        last_local_reply = message.content
+                    if not streamed_local_tokens:
                         yield {"token": message.content}
             # The supervisor stamps the terminal status on finish/degrade/halt.
             if output.get("status"):
@@ -790,4 +1355,7 @@ async def astream_run(payload: IntentPayload) -> AsyncIterator[dict]:
     except (GraphRecursionError, Exception) as exc:  # noqa: B014 - never break the stream
         yield {"status": "error", "detail": f"{type(exc).__name__}: {exc}"[:200]}
         return
+    # Detached, non-blocking profile update — the stream closes immediately after
+    # the status event while extraction runs in parallel.
+    schedule_memory_extraction(user_id, payload, last_local_reply)
     yield {"status": final_status}
