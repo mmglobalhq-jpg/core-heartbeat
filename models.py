@@ -250,3 +250,22 @@ class HealthStatus(BaseModel):
 
     status: str = "online"
     service: str = "core-heartbeat"
+
+
+class TitleRequest(BaseModel):
+    """Request body for POST /title — the conversation to summarize into a label.
+
+    Reuses HistoryTurn (the chat-history turn shape). At least one message is
+    required (enforced in the handler). Strict: unknown fields rejected.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    messages: list[HistoryTurn]
+
+
+class TitleResponse(BaseModel):
+    """Response for POST /title: a short topic label, or null to keep the current
+    title (empty conversation, model refusal, or local inference unavailable)."""
+
+    title: str | None = None

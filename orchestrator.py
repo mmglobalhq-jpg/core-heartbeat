@@ -658,6 +658,77 @@ async def generate_local(
     return "".join(parts), None, _extract_ollama_usage(usage_body)
 
 
+# --- chat title generation (local-only) -------------------------------------
+
+_TITLE_MAX_LEN = 48
+
+
+def _clean_title(raw: str | None) -> str | None:
+    """Normalize a model-produced title, or None if it isn't usable.
+
+    Takes the first non-empty line, strips wrapping quotes/backticks and trailing
+    punctuation, collapses whitespace, and caps length. Rejects empty output and
+    obvious refusals / full sentences, so a chatty model never overwrites a decent
+    default with "Sure, here's a title:". None means "keep the current title".
+    """
+    if not raw:
+        return None
+    line = next((ln.strip() for ln in raw.splitlines() if ln.strip()), "")
+    if not line or len(line) > 60:  # a long single line is a sentence, not a label
+        return None
+    line = " ".join(line.split())  # collapse internal whitespace
+    # Strip wrapping quotes/backticks/punctuation from both ends in one pass, so
+    # order-dependent cases like '"DC Museums".' fully unwrap.
+    line = line.strip("\"'`.!?,:;() \t")
+    if not line:
+        return None
+    if line.lower().startswith(("i ", "i'm", "sorry", "here is", "here's", "sure")):
+        return None
+    return line[:_TITLE_MAX_LEN].strip()
+
+
+def _build_title_prompt(turns: list[HistoryTurn]) -> str:
+    """Prompt the local model for a short Title-Case topic label, nothing else."""
+    convo = "\n".join(f"{t.role}: {t.content}" for t in turns)
+    return (
+        "You name chat conversations. Read the conversation and reply with a "
+        "SHORT topic label of 2 to 5 words in Title Case that captures its "
+        "subject. Reply with ONLY the label — no quotes, no punctuation, no "
+        "explanation, no leading words like 'Title:'.\n\n"
+        f"Conversation:\n{convo}\n\nLabel:"
+    )
+
+
+async def generate_title(
+    turns: list[HistoryTurn], client: httpx.AsyncClient
+) -> str | None:
+    """Summarize a conversation into a short title via the local Ollama model.
+
+    One non-streaming call, reusing the local worker's Ollama config
+    (_ollama_url/_ollama_model). Never raises: any HTTP error, timeout,
+    unreachable service, or unparsable body yields None so the caller simply keeps
+    the existing title. Output is sanitized by _clean_title (None if unusable).
+    """
+    if not turns:
+        return None
+    payload = {
+        "model": _ollama_model(),
+        "prompt": _build_title_prompt(turns),
+        "stream": False,
+        "options": {"num_predict": 24, "temperature": 0.2},
+    }
+    try:
+        response = await client.post(_ollama_url(), json=payload)
+        if response.status_code // 100 != 2:
+            return None
+        body = response.json()
+    except Exception:  # timeout / transport / decode — never crash the endpoint
+        return None
+    if body.get("error"):
+        return None
+    return _clean_title(body.get("response"))
+
+
 # --- nodes ------------------------------------------------------------------
 
 def _degraded(step: int, failure: RoutingFailure, usage: TokenUsage | None = None) -> dict:

@@ -15,8 +15,15 @@ from fastapi import APIRouter, Depends, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from auth import resolve_user_id
-from models import HealthStatus, IntentAccepted, IntentPayload, ThresholdRejected
-from orchestrator import astream_run
+from models import (
+    HealthStatus,
+    IntentAccepted,
+    IntentPayload,
+    ThresholdRejected,
+    TitleRequest,
+    TitleResponse,
+)
+from orchestrator import astream_run, build_ollama_client, generate_title
 from orchestrator import run as run_orchestration
 
 THRESHOLD_ENV_VAR = "HEARTBEAT_CONFIDENCE_THRESHOLD"
@@ -124,6 +131,25 @@ async def submit_intent_stream(
             yield f"data: {json.dumps(event)}\n\n"
 
     return StreamingResponse(event_stream(), media_type="text/event-stream")
+
+
+@router.post("/title")
+async def make_title(payload: TitleRequest) -> TitleResponse:
+    """Summarize a conversation into a short sidebar title via the local model.
+
+    Best-effort and side-effect-free: runs one non-streaming Ollama call and
+    returns ``{"title": <label>}`` — or ``{"title": null}`` when the model is
+    unavailable, refuses, or emits junk, so the caller keeps its existing title.
+    Empty ``messages`` fail IntentPayload-style validation (422) via the request
+    model + the guard below. No confidence/threshold or vault involvement.
+    """
+    if not payload.messages:
+        return JSONResponse(
+            status_code=422, content={"detail": "messages must not be empty"}
+        )
+    async with build_ollama_client() as client:
+        title = await generate_title(payload.messages, client)
+    return TitleResponse(title=title)
 
 
 @router.api_route("/health", methods=["GET", "HEAD"])
