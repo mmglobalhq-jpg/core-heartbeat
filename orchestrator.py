@@ -16,6 +16,7 @@ import json
 import logging
 import operator
 import os
+from collections import defaultdict
 from collections.abc import AsyncIterator, Awaitable, Callable
 from typing import Annotated
 
@@ -1134,18 +1135,21 @@ async def extract_and_record_preference(
             or pref.confidence_score < MEMORY_CONFIDENCE_THRESHOLD
         ):
             return None
-        line = await asyncio.to_thread(_record_preference, user_id, pref)
-        logger.info("memory: recorded preference for user_id=%s (%s)", user_id, pref.preference_type)
-        # Durability: mirror the updated profile back to S3 immediately, in a
-        # worker thread (blocking boto3). Best-effort and isolated — a write-back
-        # failure keeps the successful local write and never fails the task.
-        try:
-            await asyncio.to_thread(upload_user_file, user_id, PREFERENCES_FILE)
-            logger.info("memory: wrote profile back to S3 for user_id=%s", user_id)
-        except Exception:
-            logger.warning(
-                "memory: S3 write-back failed for user_id=%s (local copy kept)", user_id
-            )
+        # C-4: hold the per-user vault lock across the local write + S3 mirror so a
+        # concurrent request's vault reset can't clobber this profile update.
+        async with _vault_locks[user_id]:
+            line = await asyncio.to_thread(_record_preference, user_id, pref)
+            logger.info("memory: recorded preference for user_id=%s (%s)", user_id, pref.preference_type)
+            # Durability: mirror the updated profile back to S3 immediately, in a
+            # worker thread (blocking boto3). Best-effort and isolated — a write-back
+            # failure keeps the successful local write and never fails the task.
+            try:
+                await asyncio.to_thread(upload_user_file, user_id, PREFERENCES_FILE)
+                logger.info("memory: wrote profile back to S3 for user_id=%s", user_id)
+            except Exception:
+                logger.warning(
+                    "memory: S3 write-back failed for user_id=%s (local copy kept)", user_id
+                )
         return line
     except Exception:  # best-effort; a profile-building failure is never fatal
         logger.info("memory: extraction skipped (error)", exc_info=False)
@@ -1212,6 +1216,40 @@ graph = build_graph()
 
 # --- public API -------------------------------------------------------------
 
+# Per-user vault lock (C-4): serializes the destructive vault sync (reset + download)
+# against a concurrent same-user sync and the detached memory write-back, so a
+# background profile write is never clobbered by another turn's vault reset.
+_vault_locks: dict[str, asyncio.Lock] = defaultdict(asyncio.Lock)
+
+
+def _initial_state(payload: IntentPayload, user_id: str) -> GraphState:
+    """Seed GraphState for a run — shared by run() and astream_run() so the two
+    entrypoints can never diverge (C-3/B1)."""
+    return {
+        "intent": payload,
+        "user_id": user_id,
+        "messages": [],
+        "prior_context": _seed_messages(payload),
+        "usage": TokenUsage(),
+        "visited": [],
+        "step": 0,
+        "next": "",
+        "status": "",
+        "tool_request": None,
+    }
+
+
+async def _prepare_vault(user_id: str) -> None:
+    """Localize the caller's Markdown vault before the graph runs. Best-effort — a
+    sync failure must not break the run. Held under the per-user lock so it can't
+    race a concurrent same-user sync or the detached memory write-back (C-4)."""
+    try:
+        async with _vault_locks[user_id]:
+            await sync_user_vault(user_id)
+    except Exception:
+        logger.debug("vault sync skipped for user_id=%s (error)", user_id)
+
+
 async def run(
     payload: IntentPayload, user_id: str = SANDBOX_USER_ID
 ) -> OrchestrationOutcome:
@@ -1228,18 +1266,8 @@ async def run(
     recursion-limit breach are captured into ``status="error"`` rather than
     propagating.
     """
-    initial: GraphState = {
-        "intent": payload,
-        "user_id": user_id,
-        "messages": [],
-        "prior_context": _seed_messages(payload),
-        "usage": TokenUsage(),
-        "visited": [],
-        "step": 0,
-        "next": "",
-        "status": "",
-        "tool_request": None,
-    }
+    initial = _initial_state(payload, user_id)
+    await _prepare_vault(user_id)  # C-3: parity with astream_run (was missing here)
     try:
         final = await graph.ainvoke(initial, config={"recursion_limit": RECURSION_LIMIT})
     except (GraphRecursionError, Exception) as exc:  # noqa: B014 - defensive catch-all
@@ -1286,32 +1314,16 @@ async def astream_run(
 
     The caller (router) is responsible for SSE framing; this yields plain dicts.
     """
-    initial: GraphState = {
-        "intent": payload,
-        "user_id": user_id,
-        "messages": [],
-        "prior_context": _seed_messages(payload),
-        "usage": TokenUsage(),
-        "visited": [],
-        "step": 0,
-        "next": "",
-        "status": "",
-        "tool_request": None,
-    }
+    initial = _initial_state(payload, user_id)
     final_status = "completed"
     streamed_local_tokens = False
     last_local_reply = ""  # captured for the detached memory extraction
 
     # Pre-execution: localize the caller's Markdown vault before the supervisor
     # fires, so downstream nodes read from /tmp/vaults/<user_id>/ rather than
-    # reaching across the network mid-run (Phase 2 of the multi-user bridge). The
-    # sandbox user resolves to a local mock folder, so this is credential-free
-    # offline. Best-effort: a vault-sync failure must not break the stream — the
-    # run proceeds with whatever context is already local.
-    try:
-        await sync_user_vault(user_id)
-    except Exception:
-        pass
+    # reaching across the network mid-run. Best-effort + per-user-locked (see
+    # _prepare_vault). Sandbox resolves to a local mock folder (offline).
+    await _prepare_vault(user_id)
 
     try:
         async for event in graph.astream_events(

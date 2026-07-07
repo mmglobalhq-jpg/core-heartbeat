@@ -234,3 +234,19 @@ def test_prior_context_reaches_answer_prompt_not_supervisor():
     sup_prompt = _build_prompt(state)
     assert "Worker replies so far: 0" in sup_prompt
     assert "My name is Heath." not in sup_prompt
+
+
+# --- C-3/C-4: entrypoint parity + vault prep -------------------------------
+
+def test_run_syncs_the_vault_like_astream_run(monkeypatch):
+    # C-3: the non-streaming /intent path (run) must localize the vault just like
+    # /intent/stream (astream_run) — previously only astream_run did.
+    calls = []
+
+    async def fake_sync(uid):
+        calls.append(uid)
+
+    monkeypatch.setattr(orchestrator, "sync_user_vault", fake_sync)
+    install(monkeypatch, ["finish"])
+    run(intent("greet"))
+    assert calls == [orchestrator.SANDBOX_USER_ID]
