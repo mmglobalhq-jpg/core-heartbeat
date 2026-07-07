@@ -137,3 +137,66 @@ def test_run_is_deterministic(monkeypatch):
     install(monkeypatch, GREET_PLAN)
     b = run(intent("greet"))
     assert a.model_dump() == b.model_dump()
+
+
+# --- chat-history seeding: IntentPayload.history -> initial run messages -----
+
+from models import HistoryTurn  # noqa: E402
+from orchestrator import HISTORY_LIMIT, _seed_messages  # noqa: E402
+
+
+def _payload_with_history(turns):
+    return IntentPayload(
+        intent="chat",
+        confidence=0.95,
+        raw_input="current question",
+        source="cli",
+        history=turns,
+    )
+
+
+def test_seed_messages_empty_when_no_history():
+    # Omitted history preserves today's stateless behavior: an empty seed.
+    assert _seed_messages(intent("greet")) == []
+    assert _seed_messages(_payload_with_history([])) == []
+
+
+def test_seed_messages_preserves_order_and_maps_roles():
+    turns = [
+        HistoryTurn(role="user", content="first ask"),
+        HistoryTurn(role="assistant", content="first answer"),
+        HistoryTurn(role="user", content="second ask"),
+    ]
+    seeded = _seed_messages(_payload_with_history(turns))
+    # order preserved, ascending step, roles mapped onto graph source vocabulary
+    assert [(m.source, m.content, m.step) for m in seeded] == [
+        ("user", "first ask", 0),
+        ("local_llm", "first answer", 1),
+        ("user", "second ask", 2),
+    ]
+
+
+def test_seed_messages_truncates_to_limit():
+    turns = [
+        HistoryTurn(role="user", content=f"turn {i}")
+        for i in range(HISTORY_LIMIT + 5)
+    ]
+    seeded = _seed_messages(_payload_with_history(turns))
+    assert len(seeded) == HISTORY_LIMIT
+    # the OLDEST turns are dropped — the most recent HISTORY_LIMIT are kept
+    assert seeded[0].content == f"turn {5}"
+    assert seeded[-1].content == f"turn {HISTORY_LIMIT + 4}"
+
+
+def test_run_seeds_history_into_outcome_messages(monkeypatch):
+    # A finish-first run does no worker turns, so the run's messages are exactly
+    # the seeded prior turns — proving history reaches the graph state (context).
+    install(monkeypatch, ["finish"])
+    turns = [
+        HistoryTurn(role="user", content="remember: my name is Heath"),
+        HistoryTurn(role="assistant", content="Got it, Heath."),
+    ]
+    outcome = run(_payload_with_history(turns))
+    contents = [m.content for m in outcome.messages]
+    assert "remember: my name is Heath" in contents
+    assert "Got it, Heath." in contents

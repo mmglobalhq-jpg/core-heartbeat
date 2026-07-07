@@ -17,6 +17,21 @@ def _utc_now() -> datetime:
     return datetime.now(timezone.utc)
 
 
+class HistoryTurn(BaseModel):
+    """One prior conversation turn supplied by the caller (feature: chat history).
+
+    The gateway is otherwise stateless per request — it seeds the graph with an
+    empty message list. When a UI reopens a saved conversation (or continues a
+    live multi-turn one) it passes the earlier turns here so the orchestrator can
+    seed them into the run's history, giving the agent context. Only the two
+    display roles are accepted; the current message stays in
+    ``IntentPayload.raw_input`` and is NOT repeated here.
+    """
+
+    role: Literal["user", "assistant"]
+    content: str
+
+
 class IntentPayload(BaseModel):
     """Self-contained parsed intent carried from the API boundary to the router.
 
@@ -40,6 +55,9 @@ class IntentPayload(BaseModel):
             Drives which provider the orchestrator's Supervisor uses; defaults to
             the Gemini flash model. Surfaced so a UI model dropdown can steer
             routing. Unknown values fall back to the default provider.
+        history: Optional prior conversation turns (chat-history feature). Empty by
+            default (stateless request); when present the orchestrator seeds them
+            into the run so the agent has conversational context.
     """
 
     model_config = ConfigDict(extra="forbid", frozen=True)
@@ -51,6 +69,7 @@ class IntentPayload(BaseModel):
     source: str = Field(min_length=1)
     timestamp: datetime = Field(default_factory=_utc_now)
     model_preference: str | None = "gemini-2.5-flash"
+    history: list[HistoryTurn] = Field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------

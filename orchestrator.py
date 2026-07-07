@@ -34,6 +34,7 @@ from auth import SANDBOX_USER_ID
 from services.storage_sync import sync_user_vault, upload_user_file
 from tools.user_vault import USER_VAULT_TOOLS, read_note, run_vault_tool, write_note
 from models import (
+    HistoryTurn,
     IntentPayload,
     MemoryExtraction,
     Message,
@@ -50,6 +51,7 @@ logger = logging.getLogger(__name__)
 
 MAX_STEPS = 8          # graceful step bound (Supervisor finishes at/after this)
 RECURSION_LIMIT = 25   # hard LangGraph catch
+HISTORY_LIMIT = 10     # max prior turns seeded from IntentPayload.history (token/latency bound)
 MODEL_NAME = "gemini-2.5-flash"
 GEMINI_API_KEY_ENV = "GEMINI_API_KEY"
 REQUEST_TIMEOUT_MS = 10_000  # bound each model call (FR-006); milliseconds
@@ -857,6 +859,36 @@ def tool_execution(state: GraphState) -> dict:
 
 # --- memory extractor (feature 008) -----------------------------------------
 
+def _seed_messages(payload: IntentPayload) -> list[Message]:
+    """Build a run's initial message history from any prior turns the caller passed.
+
+    The gateway is stateless per request, so this is empty by default (today's
+    behavior). When a UI reopens a saved conversation (or continues a live one) it
+    supplies earlier turns via ``IntentPayload.history``; seeding them gives the
+    supervisor routing prompt and the inference prompt real conversational context
+    (both already render ``f"{m.source}: {m.content}"`` over ``state["messages"]``).
+
+    Only the most recent ``HISTORY_LIMIT`` turns are kept (oldest dropped, logged)
+    to bound tokens/latency. Roles map onto the graph's ``source`` vocabulary so the
+    rendering reads naturally: user→"user", assistant→"local_llm". The current
+    message is NOT included here — it stays in ``payload.raw_input`` and enters the
+    graph exactly as it does today.
+    """
+    history: list[HistoryTurn] = list(payload.history or [])
+    if len(history) > HISTORY_LIMIT:
+        logger.info(
+            "seed history truncated: %d turns supplied, keeping last %d",
+            len(history),
+            HISTORY_LIMIT,
+        )
+        history = history[-HISTORY_LIMIT:]
+    role_source = {"user": "user", "assistant": "local_llm"}
+    return [
+        Message(source=role_source[turn.role], content=turn.content, step=i)
+        for i, turn in enumerate(history)
+    ]
+
+
 def _latest_local_reply(messages: list[Message]) -> str:
     """The most recent local_llm reply text (the user-visible assistant answer)."""
     for message in reversed(messages):
@@ -1111,7 +1143,7 @@ async def run(
     initial: GraphState = {
         "intent": payload,
         "user_id": user_id,
-        "messages": [],
+        "messages": _seed_messages(payload),
         "usage": TokenUsage(),
         "visited": [],
         "step": 0,
@@ -1168,7 +1200,7 @@ async def astream_run(
     initial: GraphState = {
         "intent": payload,
         "user_id": user_id,
-        "messages": [],
+        "messages": _seed_messages(payload),
         "usage": TokenUsage(),
         "visited": [],
         "step": 0,
