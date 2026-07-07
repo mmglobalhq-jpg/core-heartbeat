@@ -187,6 +187,13 @@ class GraphState(TypedDict):
     # downstream nodes; no reducer, so it is set-once and carried unchanged.
     user_id: str
     messages: Annotated[list[Message], operator.add]
+    # Prior conversation turns supplied by the caller (chat history), seeded once
+    # at run start. Kept SEPARATE from `messages` on purpose: `messages` is the
+    # this-run working set the Supervisor uses to detect completion (worker
+    # replies), so mixing prior turns in there makes it finish before answering
+    # the current question. Read only by the answering prompt (_build_local_prompt)
+    # to give the model context. Set-once, no reducer.
+    prior_context: list[Message]
     usage: Annotated[TokenUsage, add_usage]
     visited: Annotated[list[str], operator.add]
     step: Annotated[int, operator.add]
@@ -564,13 +571,16 @@ def _build_local_prompt(state: GraphState) -> str:
     durable preferences from the first turn of a new session.
     """
     intent = state["intent"]
-    history = "\n".join(f"{m.source}: {m.content}" for m in state.get("messages", []))
+    # Prior conversation (chat history) first, then this-run messages (e.g. tool
+    # results), so the model answers the current input with full context.
+    convo = list(state.get("prior_context", [])) + list(state.get("messages", []))
+    history = "\n".join(f"{m.source}: {m.content}" for m in convo)
     profile_block = _user_profile_block(state.get("user_id", SANDBOX_USER_ID))
     return (
         f"{profile_block}"
         f"Intent: {intent.intent}\n"
         f"Raw input: {intent.raw_input}\n"
-        f"History so far:\n{history or '(none)'}\n"
+        f"Conversation so far:\n{history or '(none)'}\n"
         "Respond helpfully to the intent above."
     )
 
@@ -869,10 +879,17 @@ def _seed_messages(payload: IntentPayload) -> list[Message]:
     (both already render ``f"{m.source}: {m.content}"`` over ``state["messages"]``).
 
     Only the most recent ``HISTORY_LIMIT`` turns are kept (oldest dropped, logged)
-    to bound tokens/latency. Roles map onto the graph's ``source`` vocabulary so the
-    rendering reads naturally: user→"user", assistant→"local_llm". The current
-    message is NOT included here — it stays in ``payload.raw_input`` and enters the
-    graph exactly as it does today.
+    to bound tokens/latency. Roles map onto message ``source`` as user→"user",
+    assistant→"assistant".
+
+    IMPORTANT: assistant turns must NOT be sourced as "local_llm". The Supervisor's
+    completion policy counts WORKER_NODES messages ("local_llm"/"tool_execution")
+    as replies already produced *in this run* and finishes as soon as one exists
+    (see _build_prompt). Seeding a prior assistant turn as "local_llm" makes it
+    think the CURRENT question is already answered, so it routes straight to finish
+    and streams nothing. "assistant" keeps the turn as visible context without
+    tripping that heuristic. The current message is NOT included here — it stays in
+    ``payload.raw_input`` and enters the graph exactly as it does today.
     """
     history: list[HistoryTurn] = list(payload.history or [])
     if len(history) > HISTORY_LIMIT:
@@ -882,7 +899,7 @@ def _seed_messages(payload: IntentPayload) -> list[Message]:
             HISTORY_LIMIT,
         )
         history = history[-HISTORY_LIMIT:]
-    role_source = {"user": "user", "assistant": "local_llm"}
+    role_source = {"user": "user", "assistant": "assistant"}
     return [
         Message(source=role_source[turn.role], content=turn.content, step=i)
         for i, turn in enumerate(history)
@@ -1143,7 +1160,8 @@ async def run(
     initial: GraphState = {
         "intent": payload,
         "user_id": user_id,
-        "messages": _seed_messages(payload),
+        "messages": [],
+        "prior_context": _seed_messages(payload),
         "usage": TokenUsage(),
         "visited": [],
         "step": 0,
@@ -1200,7 +1218,8 @@ async def astream_run(
     initial: GraphState = {
         "intent": payload,
         "user_id": user_id,
-        "messages": _seed_messages(payload),
+        "messages": [],
+        "prior_context": _seed_messages(payload),
         "usage": TokenUsage(),
         "visited": [],
         "step": 0,

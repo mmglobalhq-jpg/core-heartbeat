@@ -142,7 +142,13 @@ def test_run_is_deterministic(monkeypatch):
 # --- chat-history seeding: IntentPayload.history -> initial run messages -----
 
 from models import HistoryTurn  # noqa: E402
-from orchestrator import HISTORY_LIMIT, _seed_messages  # noqa: E402
+from orchestrator import (  # noqa: E402
+    HISTORY_LIMIT,
+    WORKER_NODES,
+    _build_local_prompt,
+    _build_prompt,
+    _seed_messages,
+)
 
 
 def _payload_with_history(turns):
@@ -171,9 +177,23 @@ def test_seed_messages_preserves_order_and_maps_roles():
     # order preserved, ascending step, roles mapped onto graph source vocabulary
     assert [(m.source, m.content, m.step) for m in seeded] == [
         ("user", "first ask", 0),
-        ("local_llm", "first answer", 1),
+        ("assistant", "first answer", 1),
         ("user", "second ask", 2),
     ]
+
+
+def test_seeded_history_never_counts_as_a_worker_reply():
+    # Regression: assistant turns must NOT be sourced as a WORKER_NODES value
+    # ("local_llm"/"tool_execution"), or the Supervisor's completion policy treats
+    # the CURRENT question as already answered and routes straight to finish
+    # (streaming nothing). Seeded turns are context only.
+    turns = [
+        HistoryTurn(role="user", content="hi"),
+        HistoryTurn(role="assistant", content="hello"),
+        HistoryTurn(role="assistant", content="anything else?"),
+    ]
+    seeded = _seed_messages(_payload_with_history(turns))
+    assert all(m.source not in WORKER_NODES for m in seeded)
 
 
 def test_seed_messages_truncates_to_limit():
@@ -188,15 +208,29 @@ def test_seed_messages_truncates_to_limit():
     assert seeded[-1].content == f"turn {HISTORY_LIMIT + 4}"
 
 
-def test_run_seeds_history_into_outcome_messages(monkeypatch):
-    # A finish-first run does no worker turns, so the run's messages are exactly
-    # the seeded prior turns — proving history reaches the graph state (context).
-    install(monkeypatch, ["finish"])
-    turns = [
-        HistoryTurn(role="user", content="remember: my name is Heath"),
-        HistoryTurn(role="assistant", content="Got it, Heath."),
-    ]
-    outcome = run(_payload_with_history(turns))
-    contents = [m.content for m in outcome.messages]
-    assert "remember: my name is Heath" in contents
-    assert "Got it, Heath." in contents
+def test_prior_context_reaches_answer_prompt_not_supervisor():
+    # The fix for the "finishes before answering" bug: prior turns live in
+    # `prior_context`, fed to the ANSWERING prompt (so the model has context) but
+    # NOT to the Supervisor's completion logic (so it doesn't think the current
+    # question is already answered and route straight to finish).
+    payload = _payload_with_history([
+        HistoryTurn(role="user", content="My name is Heath."),
+        HistoryTurn(role="assistant", content="Hello Heath."),
+    ])
+    state = {
+        "intent": payload,
+        "messages": [],
+        "prior_context": _seed_messages(payload),
+        "user_id": "sandbox-user",
+    }
+
+    # Answerer SEES the prior conversation.
+    local_prompt = _build_local_prompt(state)
+    assert "My name is Heath." in local_prompt
+    assert "Hello Heath." in local_prompt
+
+    # Supervisor does NOT see prior turns, and counts zero worker replies for
+    # this run — so it will still dispatch the current question to a worker.
+    sup_prompt = _build_prompt(state)
+    assert "Worker replies so far: 0" in sup_prompt
+    assert "My name is Heath." not in sup_prompt
