@@ -13,10 +13,13 @@ ENV PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1
 
-# docling pulls torch; install the CPU-only build first (this box has no GPU) so the
-# image doesn't carry the multi-GB CUDA wheels. requirements.txt then finds torch
-# already satisfied and won't pull the default CUDA build.
-RUN pip install --no-cache-dir torch==2.12.1 --index-url https://download.pytorch.org/whl/cpu
+# docling pulls torch + torchvision; install the CPU-only builds first (this box has
+# no GPU) from the pytorch CPU index so the image doesn't carry the multi-GB CUDA
+# wheels AND the two stay consistent — a CPU torch + CUDA torchvision mix breaks
+# docling's transformers import (torchvision::nms not found). requirements.txt then
+# finds both satisfied and won't pull the default CUDA builds.
+RUN pip install --no-cache-dir torch==2.12.1 torchvision==0.27.1 \
+    --index-url https://download.pytorch.org/whl/cpu
 
 # Install pinned runtime deps first so this layer caches across source changes.
 COPY requirements.txt ./
