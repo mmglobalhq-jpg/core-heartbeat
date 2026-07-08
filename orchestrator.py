@@ -53,6 +53,8 @@ logger = logging.getLogger(__name__)
 MAX_STEPS = 8          # graceful step bound (Supervisor finishes at/after this)
 RECURSION_LIMIT = 25   # hard LangGraph catch
 HISTORY_LIMIT = 10     # max prior turns seeded from IntentPayload.history (token/latency bound)
+DOC_CHAR_BUDGET = 12000  # max chars of attached-document text injected (local model window is small)
+MAX_DOCS_PER_TURN = 10   # cap attached docs per message
 MODEL_NAME = "gemini-2.5-flash"
 GEMINI_API_KEY_ENV = "GEMINI_API_KEY"
 REQUEST_TIMEOUT_MS = 10_000  # bound each model call (FR-006); milliseconds
@@ -195,6 +197,9 @@ class GraphState(TypedDict):
     # the current question. Read only by the answering prompt (_build_local_prompt)
     # to give the model context. Set-once, no reducer.
     prior_context: list[Message]
+    # Extracted text of the message's attached documents (budget-capped), injected
+    # into the answering prompt so the model can read them. Set-once, no reducer.
+    documents: str
     usage: Annotated[TokenUsage, add_usage]
     visited: Annotated[list[str], operator.add]
     step: Annotated[int, operator.add]
@@ -323,10 +328,17 @@ def _build_prompt(state: GraphState) -> str:
     history = _render_history(messages)
     worker_replies = sum(1 for m in messages if m.source in WORKER_NODES)
     profile_block = _user_profile_block(state.get("user_id", SANDBOX_USER_ID))
+    docs_note = (
+        "The user attached document(s) to this message; their text is already "
+        "available to local_llm — route there to answer from them.\n"
+        if state.get("documents")
+        else ""
+    )
     return (
         "You are the Supervisor in an orchestration graph. Decide the single "
         "next step for this run.\n"
         f"{profile_block}"
+        f"{docs_note}"
         "Routing policy:\n"
         "- Route to local_llm to generate a conversational or reasoned reply.\n"
         "- Route to tool_execution to act on the user's personal Markdown vault. "
@@ -596,8 +608,17 @@ def _build_local_prompt(state: GraphState) -> str:
     convo = list(state.get("prior_context", [])) + list(state.get("messages", []))
     history = _render_history(convo)
     profile_block = _user_profile_block(state.get("user_id", SANDBOX_USER_ID))
+    # Extracted text of any documents the user attached to this message.
+    docs = state.get("documents", "")
+    docs_block = (
+        f"The user attached document(s); use their contents to answer.\n"
+        f"--- ATTACHED DOCUMENTS ---\n{docs}\n--- END DOCUMENTS ---\n\n"
+        if docs
+        else ""
+    )
     return (
         f"{profile_block}"
+        f"{docs_block}"
         f"Intent: {intent.intent}\n"
         f"Raw input: {intent.raw_input}\n"
         f"Conversation so far:\n{history or '(none)'}\n"
@@ -1253,6 +1274,7 @@ def _initial_state(payload: IntentPayload, user_id: str) -> GraphState:
         "user_id": user_id,
         "messages": [],
         "prior_context": _seed_messages(payload),
+        "documents": "",  # populated by _load_documents in the async prelude
         "usage": TokenUsage(),
         "visited": [],
         "step": 0,
@@ -1260,6 +1282,32 @@ def _initial_state(payload: IntentPayload, user_id: str) -> GraphState:
         "status": "",
         "tool_request": None,
     }
+
+
+async def _load_documents(user_id: str, document_ids: list[str]) -> str:
+    """Fetch + concatenate the extracted text of the message's attached documents,
+    capped at DOC_CHAR_BUDGET (the local model's context window is small). Returns
+    "" when nothing is attached/readable. Best-effort per doc."""
+    if not document_ids:
+        return ""
+    from services import documents as docstore
+
+    parts: list[str] = []
+    remaining = DOC_CHAR_BUDGET
+    for doc_id in document_ids[:MAX_DOCS_PER_TURN]:
+        try:
+            text = await asyncio.to_thread(docstore.fetch_extracted, user_id, doc_id)
+        except Exception:
+            text = ""
+        if not text:
+            continue
+        chunk = text[:remaining]
+        parts.append(chunk)
+        remaining -= len(chunk)
+        if remaining <= 0:
+            parts.append("\n[attached documents truncated to fit the context window]")
+            break
+    return "\n\n---\n\n".join(parts)
 
 
 async def _prepare_vault(user_id: str) -> None:
@@ -1291,6 +1339,7 @@ async def run(
     """
     initial = _initial_state(payload, user_id)
     await _prepare_vault(user_id)  # C-3: parity with astream_run (was missing here)
+    initial["documents"] = await _load_documents(user_id, payload.document_ids)
     try:
         final = await graph.ainvoke(initial, config={"recursion_limit": RECURSION_LIMIT})
     except (GraphRecursionError, Exception) as exc:  # noqa: B014 - defensive catch-all
@@ -1347,6 +1396,7 @@ async def astream_run(
     # reaching across the network mid-run. Best-effort + per-user-locked (see
     # _prepare_vault). Sandbox resolves to a local mock folder (offline).
     await _prepare_vault(user_id)
+    initial["documents"] = await _load_documents(user_id, payload.document_ids)
 
     try:
         async for event in graph.astream_events(

@@ -70,6 +70,7 @@ class IntentPayload(BaseModel):
     timestamp: datetime = Field(default_factory=_utc_now)
     model_preference: str | None = "gemini-2.5-flash"
     history: list[HistoryTurn] = Field(default_factory=list)
+    document_ids: list[str] = Field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------
@@ -269,3 +270,21 @@ class TitleResponse(BaseModel):
     title (empty conversation, model refusal, or local inference unavailable)."""
 
     title: str | None = None
+
+
+class DocumentParseRequest(BaseModel):
+    """POST /documents/parse — parse an already-uploaded file's original bytes."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    doc_id: str = Field(min_length=1)
+    filename: str = Field(min_length=1)
+    content_type: str | None = None
+
+
+class DocumentParseResult(BaseModel):
+    """Result of a parse: ``ready`` with the extracted char count, or ``error``."""
+
+    status: str  # "ready" | "error"
+    char_count: int = 0
+    error: str | None = None
