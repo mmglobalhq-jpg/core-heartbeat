@@ -109,17 +109,27 @@ class OrchestrationOutcome(BaseModel):
 
 
 class ToolArgs(BaseModel):
-    """Arguments for a vault tool call — only the field the chosen tool needs is set.
+    """Arguments for a tool call — only the field(s) the chosen tool needs are set.
 
     Kept as a fixed, typed object (rather than a free-form dict) so it maps cleanly
-    onto every provider's structured-output schema. Mirrors the vault tools'
-    parameters: ``read_user_note(filename)``, ``search_user_vault(query)``,
-    ``write_user_note(filename, content)``.
+    onto every provider's structured-output schema. Covers two tool families:
+
+    * Vault tools: ``read_user_note(filename)``, ``search_user_vault(query)``,
+      ``write_user_note(filename, content)``.
+    * Fund-holdings tools (global market data, no user identity):
+      ``get_fund_holdings(ticker)``, ``get_type_exposure(ticker)``,
+      ``get_manager_exposure(manager_name)``,
+      ``get_manager_changes(manager_name, window)``,
+      ``search_holdings_by_cusip(cusip)``.
     """
 
     filename: str | None = None
     query: str | None = None
     content: str | None = None
+    ticker: str | None = None
+    manager_name: str | None = None
+    cusip: str | None = None
+    window: str | None = None
 
 
 class RoutingDecision(BaseModel):
@@ -136,7 +146,13 @@ class RoutingDecision(BaseModel):
     """
 
     next_node: Literal["local_llm", "tool_execution", "finish"]
-    tool_name: Literal["read_user_note", "search_user_vault", "write_user_note"] | None = None
+    tool_name: Literal[
+        # vault tools (per-user)
+        "read_user_note", "search_user_vault", "write_user_note",
+        # fund-holdings tools (global market data)
+        "get_fund_holdings", "get_type_exposure", "get_manager_exposure",
+        "get_manager_changes", "search_holdings_by_cusip",
+    ] | None = None
     tool_args: ToolArgs = Field(default_factory=ToolArgs)
 
 
