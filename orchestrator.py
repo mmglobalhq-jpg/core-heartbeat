@@ -302,6 +302,12 @@ def _user_profile_block(user_id: str) -> str:
     )
 
 
+def _render_history(messages) -> str:
+    """Render Message objects as "{source}: {content}" lines (the shared history
+    format used by the supervisor + inference prompts)."""
+    return "\n".join(f"{m.source}: {m.content}" for m in messages)
+
+
 def _build_prompt(state: GraphState) -> str:
     """Deterministic routing prompt derived from the intent + message history.
 
@@ -314,7 +320,7 @@ def _build_prompt(state: GraphState) -> str:
     """
     intent = state["intent"]
     messages = state.get("messages", [])
-    history = "\n".join(f"{m.source}: {m.content}" for m in messages)
+    history = _render_history(messages)
     worker_replies = sum(1 for m in messages if m.source in WORKER_NODES)
     profile_block = _user_profile_block(state.get("user_id", SANDBOX_USER_ID))
     return (
@@ -348,15 +354,25 @@ def _build_prompt(state: GraphState) -> str:
     )
 
 
-def _extract_usage(response) -> TokenUsage:
-    """Map the response's usage_metadata into TokenUsage (zeros if absent)."""
-    um = getattr(response, "usage_metadata", None)
-    if um is None:
+def _usage_from(source, in_key, out_key, total_key=None, get=getattr) -> TokenUsage:
+    """Build a TokenUsage from any provider's usage object/dict. `get` is getattr
+    for SDK objects or a dict getter for Ollama's JSON body; `total_key` reads a
+    provided total, else it's computed as input+output. Zeros when `source` absent."""
+    if source is None:
         return TokenUsage()
-    return TokenUsage(
-        input_tokens=getattr(um, "prompt_token_count", 0) or 0,
-        output_tokens=getattr(um, "candidates_token_count", 0) or 0,
-        total_tokens=getattr(um, "total_token_count", 0) or 0,
+    inp = get(source, in_key, 0) or 0
+    out = get(source, out_key, 0) or 0
+    total = (get(source, total_key, 0) or 0) if total_key else inp + out
+    return TokenUsage(input_tokens=inp, output_tokens=out, total_tokens=total)
+
+
+def _extract_usage(response) -> TokenUsage:
+    """Gemini: map response.usage_metadata into TokenUsage (zeros if absent)."""
+    return _usage_from(
+        getattr(response, "usage_metadata", None),
+        "prompt_token_count",
+        "candidates_token_count",
+        "total_token_count",
     )
 
 
@@ -512,25 +528,20 @@ def _decide_anthropic(
 
 
 def _openai_usage(response) -> TokenUsage:
-    """Map OpenAI's response.usage into TokenUsage (zeros if absent)."""
-    u = getattr(response, "usage", None)
-    if u is None:
-        return TokenUsage()
-    return TokenUsage(
-        input_tokens=getattr(u, "prompt_tokens", 0) or 0,
-        output_tokens=getattr(u, "completion_tokens", 0) or 0,
-        total_tokens=getattr(u, "total_tokens", 0) or 0,
+    """OpenAI: map response.usage into TokenUsage (zeros if absent)."""
+    return _usage_from(
+        getattr(response, "usage", None),
+        "prompt_tokens",
+        "completion_tokens",
+        "total_tokens",
     )
 
 
 def _anthropic_usage(response) -> TokenUsage:
-    """Map Anthropic's response.usage into TokenUsage (total = input + output)."""
-    u = getattr(response, "usage", None)
-    if u is None:
-        return TokenUsage()
-    inp = getattr(u, "input_tokens", 0) or 0
-    out = getattr(u, "output_tokens", 0) or 0
-    return TokenUsage(input_tokens=inp, output_tokens=out, total_tokens=inp + out)
+    """Anthropic: map response.usage into TokenUsage (total = input + output)."""
+    return _usage_from(
+        getattr(response, "usage", None), "input_tokens", "output_tokens"
+    )
 
 
 # --- local Ollama worker (feature 005) --------------------------------------
@@ -575,7 +586,7 @@ def _build_local_prompt(state: GraphState) -> str:
     # Prior conversation (chat history) first, then this-run messages (e.g. tool
     # results), so the model answers the current input with full context.
     convo = list(state.get("prior_context", [])) + list(state.get("messages", []))
-    history = "\n".join(f"{m.source}: {m.content}" for m in convo)
+    history = _render_history(convo)
     profile_block = _user_profile_block(state.get("user_id", SANDBOX_USER_ID))
     return (
         f"{profile_block}"
@@ -587,10 +598,13 @@ def _build_local_prompt(state: GraphState) -> str:
 
 
 def _extract_ollama_usage(body: dict) -> TokenUsage:
-    """Map Ollama's prompt_eval_count/eval_count into TokenUsage (zeros if absent)."""
-    inp = body.get("prompt_eval_count") or 0
-    out = body.get("eval_count") or 0
-    return TokenUsage(input_tokens=inp, output_tokens=out, total_tokens=inp + out)
+    """Ollama: map prompt_eval_count/eval_count into TokenUsage (total = in + out)."""
+    return _usage_from(
+        body,
+        "prompt_eval_count",
+        "eval_count",
+        get=lambda d, k, default: d.get(k, default),
+    )
 
 
 async def generate_local(
