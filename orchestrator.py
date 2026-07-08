@@ -336,7 +336,10 @@ def _build_prompt(state: GraphState) -> str:
     intent = state["intent"]
     messages = state.get("messages", [])
     history = _render_history(messages)
-    worker_replies = sum(1 for m in messages if m.source in WORKER_NODES)
+    # Count only ANSWERS (local_llm), not tool runs. A tool_execution result is raw
+    # data, not a reply that satisfies the intent; counting it here made the model
+    # believe the question was answered and finish before composing anything.
+    answers_composed = sum(1 for m in messages if m.source == "local_llm")
     profile_block = _user_profile_block(state.get("user_id", SANDBOX_USER_ID))
     docs_note = (
         "The user attached document(s) to this message; their text is already "
@@ -379,16 +382,17 @@ def _build_prompt(state: GraphState) -> str:
         "1D|7D|30D|1Y (default 30D)}.\n"
         "    * search_holdings_by_cusip — which funds hold a CUSIP. tool_args: "
         "{\"cusip\": <9-char CUSIP>}.\n"
-        "- After a tool result appears in the history, either issue another tool "
-        "call or route to local_llm to compose the final answer from it.\n"
-        "- Choose finish as soon as the intent has been satisfied. If a worker "
-        "has already produced a reply that answers the intent (e.g. a general "
-        "chat message), you MUST choose finish. Never re-dispatch local_llm once "
-        "it has answered.\n"
+        "- A tool result is raw DATA, not an answer. After a tool result appears in "
+        "the history you MUST either issue another tool call or route to local_llm "
+        "to compose the answer from it — NEVER choose finish directly after a "
+        "tool_execution result.\n"
+        "- Choose finish only once local_llm has produced the answer. If local_llm "
+        "has already answered the intent (a chat reply, or a reply composed from a "
+        "tool result), you MUST choose finish and never re-dispatch local_llm.\n"
         f"Intent: {intent.intent}\n"
         f"Confidence: {intent.confidence}\n"
         f"Raw input: {intent.raw_input}\n"
-        f"Worker replies so far: {worker_replies}\n"
+        f"Answers composed so far: {answers_composed}\n"
         f"History so far:\n{history or '(none)'}\n"
         "Respond with next_node = one of: local_llm, tool_execution, finish "
         "(plus tool_name + tool_args when tool_execution)."

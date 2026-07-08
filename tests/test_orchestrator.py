@@ -229,10 +229,10 @@ def test_prior_context_reaches_answer_prompt_not_supervisor():
     assert "My name is Heath." in local_prompt
     assert "Hello Heath." in local_prompt
 
-    # Supervisor does NOT see prior turns, and counts zero worker replies for
+    # Supervisor does NOT see prior turns, and counts zero composed answers for
     # this run — so it will still dispatch the current question to a worker.
     sup_prompt = _build_prompt(state)
-    assert "Worker replies so far: 0" in sup_prompt
+    assert "Answers composed so far: 0" in sup_prompt
     assert "My name is Heath." not in sup_prompt
 
 
