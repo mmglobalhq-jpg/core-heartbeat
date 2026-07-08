@@ -150,7 +150,7 @@ class RoutingDecision(BaseModel):
         # vault tools (per-user)
         "read_user_note", "search_user_vault", "write_user_note",
         # fund-holdings tools (global market data)
-        "get_fund_holdings", "get_type_exposure", "get_manager_exposure",
+        "list_funds", "get_fund_holdings", "get_type_exposure", "get_manager_exposure",
         "get_manager_changes", "search_holdings_by_cusip",
     ] | None = None
     tool_args: ToolArgs = Field(default_factory=ToolArgs)

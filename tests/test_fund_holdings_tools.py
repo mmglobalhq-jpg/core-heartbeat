@@ -22,6 +22,7 @@ from tools.fund_holdings import (
     get_manager_changes,
     get_manager_exposure,
     get_type_exposure,
+    list_funds,
     run_fund_tool,
     search_holdings_by_cusip,
 )
@@ -46,11 +47,21 @@ def _handler(request: httpx.Request) -> httpx.Response:
         if q.get("manager_id", "").startswith("eq."):
             return _json([{"id": "fjmtg", "ticker": "JMTG"},
                           {"id": "fjpie", "ticker": "JPIE"}])
-        return _json([])
+        # unfiltered catalog (list_funds fetches all, then filters client-side)
+        return _json([
+            {"id": "fjmtg", "ticker": "JMTG", "fund_name": "JPMorgan MBS ETF",
+             "manager_id": "mjpm", "is_hy": False},
+            {"id": "fjpie", "ticker": "JPIE", "fund_name": "JPMorgan Income ETF",
+             "manager_id": "mjpm", "is_hy": False},
+            {"id": "fsad", "ticker": "SADAX", "fund_name": "Allspring Ultra Short-Term Income",
+             "manager_id": "mall", "is_hy": False},
+        ])
 
     if path == "/rest/v1/fund_managers":
         return _json([{"id": "mjpm", "canonical_name": "J.P. Morgan",
-                       "aliases": ["JPMorgan", "JPM"]}])
+                       "aliases": ["JPMorgan", "JPM"]},
+                      {"id": "mall", "canonical_name": "AllSpring",
+                       "aliases": ["Allspring"]}])
 
     if path == "/rest/v1/v_latest_holdings":   # now only search_holdings_by_cusip
         if q.get("cusip", "").startswith("eq."):
@@ -126,6 +137,20 @@ def _fake_backend(monkeypatch):
 
 
 # --- per-tool happy paths + not-found ---------------------------------------
+
+def test_list_funds_all_grouped_by_manager():
+    out = list_funds()
+    assert "3 total" in out
+    assert "J.P. Morgan" in out and "AllSpring" in out
+    assert "JMTG" in out and "SADAX" in out
+
+
+def test_list_funds_filtered_to_manager():
+    out = list_funds("JPMorgan")
+    assert "2 total" in out
+    assert "JMTG" in out and "JPIE" in out
+    assert "SADAX" not in out  # AllSpring fund excluded
+
 
 def test_get_fund_holdings_formats():
     out = get_fund_holdings("JMTG")

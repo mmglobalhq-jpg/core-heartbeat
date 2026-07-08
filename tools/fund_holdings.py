@@ -442,9 +442,43 @@ def search_holdings_by_cusip(cusip: str) -> str:
     return "\n".join(lines)
 
 
+def list_funds(manager_name: str | None = None) -> str:
+    """List the tracked funds, grouped by manager (optionally filtered to one).
+
+    Answers 'what funds are we tracking?' / 'what JP Morgan funds do you cover?'.
+    Shows each fund's latest snapshot date so stale/baseline-only funds are visible.
+    """
+    managers = {m["id"]: m for m in _pg_get("fund_managers", {"select": "id,canonical_name,aliases"})}
+    funds = _pg_get("funds", {"select": "id,ticker,fund_name,manager_id,is_hy", "order": "ticker.asc"})
+    target = None
+    if manager_name:
+        target = _resolve_manager(manager_name)
+        if not target:
+            return f"No fund manager matched {manager_name!r} (known: J.P. Morgan, AllSpring, Victory Capital)."
+        funds = [f for f in funds if f.get("manager_id") == target["id"]]
+        if not funds:
+            return f"No funds tracked for {target['canonical_name']}."
+    last = _fund_dates_map([f["id"] for f in funds])
+    by_mgr: dict[str, list[dict]] = {}
+    for f in funds:
+        mgr = (managers.get(f.get("manager_id")) or {}).get("canonical_name", "Unknown")
+        by_mgr.setdefault(mgr, []).append(f)
+    scope = target["canonical_name"] if target else "all managers"
+    lines = [f"Tracked funds ({scope}) — {len(funds)} total:"]
+    for mgr in sorted(by_mgr):
+        lines.append(f"  {mgr}:")
+        for f in by_mgr[mgr]:
+            dates = last.get(f["id"]) or []
+            asof = dates[0] if dates else "no data"
+            hy = " [HY]" if f.get("is_hy") else ""
+            lines.append(f"    {_g(f, 'ticker'):<7} {f.get('fund_name') or ''}{hy}  (last: {asof})")
+    return "\n".join(lines)
+
+
 # --- dispatch (name -> callable(args) -> str) --------------------------------
 
 _DISPATCH = {
+    "list_funds": lambda a: list_funds(a.get("manager_name")),
     "get_fund_holdings": lambda a: get_fund_holdings(a["ticker"]),
     "get_type_exposure": lambda a: get_type_exposure(a["ticker"]),
     "get_manager_exposure": lambda a: get_manager_exposure(a["manager_name"]),

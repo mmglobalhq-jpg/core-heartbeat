@@ -96,8 +96,9 @@ ROUTING_JSON_SCHEMA: dict = {
             "type": ["string", "null"],
             "enum": [
                 "read_user_note", "search_user_vault", "write_user_note",
-                "get_fund_holdings", "get_type_exposure", "get_manager_exposure",
-                "get_manager_changes", "search_holdings_by_cusip", None,
+                "list_funds", "get_fund_holdings", "get_type_exposure",
+                "get_manager_exposure", "get_manager_changes",
+                "search_holdings_by_cusip", None,
             ],
         },
         "tool_args": {
@@ -364,6 +365,9 @@ def _build_prompt(state: GraphState) -> str:
         "from J.P. Morgan, AllSpring, Victory Capital). Use these for any question "
         "about fund holdings, positions, security-type exposure, CUSIPs, or what a "
         "fund/manager has been buying or selling:\n"
+        "    * list_funds — list the tracked funds (which funds/managers are "
+        "covered). Optional tool_args: {\"manager_name\": <e.g. JPMorgan>} to "
+        "filter to one manager.\n"
         "    * get_fund_holdings — a fund's current top holdings. tool_args: "
         "{\"ticker\": <fund ticker, e.g. JMTG>}.\n"
         "    * get_type_exposure — one fund's par by security type (MBS/CMO/UST/…). "
