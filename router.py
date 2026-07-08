@@ -7,15 +7,19 @@ The confidence-threshold policy lives here (per the IntentPayload spec's
 assumptions). No handler dispatch happens in this MVP.
 """
 
+import asyncio
 import json
+import logging
 from collections.abc import Mapping
 from os import environ
 
 from fastapi import APIRouter, Depends, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
-from auth import resolve_user_id
+from auth import SANDBOX_USER_ID, resolve_user_id
 from models import (
+    DocumentParseRequest,
+    DocumentParseResult,
     HealthStatus,
     IntentAccepted,
     IntentPayload,
@@ -25,6 +29,12 @@ from models import (
 )
 from orchestrator import astream_run, build_ollama_client, generate_title
 from orchestrator import run as run_orchestration
+from services import documents as docstore
+from services.document_parser import parse_document
+
+logger = logging.getLogger(__name__)
+
+MAX_DOC_BYTES = 20 * 1024 * 1024  # 20 MB upload cap
 
 THRESHOLD_ENV_VAR = "HEARTBEAT_CONFIDENCE_THRESHOLD"
 DEFAULT_THRESHOLD = 0.5
@@ -150,6 +160,35 @@ async def make_title(payload: TitleRequest) -> TitleResponse:
     # Shared, keep-alive client (not closed per-request — see build_ollama_client).
     title = await generate_title(payload.messages, build_ollama_client())
     return TitleResponse(title=title)
+
+
+@router.post("/documents/parse", response_model=None)
+async def parse_document_endpoint(
+    payload: DocumentParseRequest,
+    user_id: str = Depends(resolve_user_id),
+) -> DocumentParseResult | JSONResponse:
+    """Parse an already-uploaded document to plain text and store it alongside the
+    original. Docs are per-user (Storage path is keyed by user_id), so a real
+    identity is required. Never 500s: parse/storage failures return an ``error``
+    result the frontend reflects on the doc chip.
+    """
+    if user_id == SANDBOX_USER_ID:
+        return JSONResponse(
+            status_code=401, content={"detail": "authentication required for documents"}
+        )
+    try:
+        data = await asyncio.to_thread(docstore.fetch_original, user_id, payload.doc_id)
+    except Exception:
+        return DocumentParseResult(status="error", error="original file not found")
+    if len(data) > MAX_DOC_BYTES:
+        return DocumentParseResult(status="error", error="file exceeds the 20 MB limit")
+    try:
+        text = await parse_document(data, payload.filename, payload.content_type)
+    except Exception as exc:  # docling failure / timeout — surface, don't crash
+        logger.warning("document parse failed for doc_id=%s: %s", payload.doc_id, exc)
+        return DocumentParseResult(status="error", error=f"{type(exc).__name__}: {exc}"[:200])
+    await asyncio.to_thread(docstore.store_extracted, user_id, payload.doc_id, text)
+    return DocumentParseResult(status="ready", char_count=len(text))
 
 
 @router.api_route("/health", methods=["GET", "HEAD"])
