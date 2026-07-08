@@ -267,3 +267,50 @@ def test_fresh_sync_restores_profile_from_s3(monkeypatch, tmp_path):
     dest = _run("user-123")
     assert "user_preferences.md" in _listdir_md(dest)  # restored on startup
     assert (sync_root / "user-123" / "user_preferences.md").is_file()
+
+
+# --- ETag skip-if-unchanged (perf: no full re-download every message) --------
+
+class _FakeS3ETag:
+    """Fake whose list_objects_v2 returns ETags and always reports the current
+    `objects` map (repeatable across syncs)."""
+
+    def __init__(self, objects):  # objects: {key: etag}
+        self.objects = dict(objects)
+        self.downloaded: list[str] = []
+
+    def list_objects_v2(self, **kwargs):
+        return {"Contents": [{"Key": k, "ETag": e} for k, e in self.objects.items()]}
+
+    def download_file(self, bucket, key, path):
+        self.downloaded.append(key)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write("x")
+
+
+def test_s3_sync_skips_redownload_when_unchanged(monkeypatch, tmp_path):
+    _redirect_roots(monkeypatch, tmp_path)
+    storage_sync._vault_etags.clear()
+    fake = _FakeS3ETag({"user-1/a.md": '"e-a"', "user-1/b.md": '"e-b"'})
+    _install_s3(monkeypatch, fake)
+
+    _run("user-1")
+    assert len(fake.downloaded) == 2  # first sync downloads both
+
+    _run("user-1")
+    assert len(fake.downloaded) == 2  # unchanged ETags -> skipped, no new downloads
+
+
+def test_s3_sync_redownloads_when_etag_changes(monkeypatch, tmp_path):
+    _redirect_roots(monkeypatch, tmp_path)
+    storage_sync._vault_etags.clear()
+    fake = _FakeS3ETag({"user-1/a.md": '"e-a"'})
+    _install_s3(monkeypatch, fake)
+
+    _run("user-1")
+    assert len(fake.downloaded) == 1
+
+    fake.objects["user-1/a.md"] = '"e-a2"'  # remote changed
+    _run("user-1")
+    assert len(fake.downloaded) == 2  # re-downloaded on ETag drift

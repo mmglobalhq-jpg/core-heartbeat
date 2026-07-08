@@ -147,8 +147,8 @@ async def make_title(payload: TitleRequest) -> TitleResponse:
         return JSONResponse(
             status_code=422, content={"detail": "messages must not be empty"}
         )
-    async with build_ollama_client() as client:
-        title = await generate_title(payload.messages, client)
+    # Shared, keep-alive client (not closed per-request — see build_ollama_client).
+    title = await generate_title(payload.messages, build_ollama_client())
     return TitleResponse(title=title)
 
 
