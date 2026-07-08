@@ -566,14 +566,22 @@ def _ollama_timeout_s() -> float:
     return ms / 1000.0
 
 
-def build_ollama_client() -> httpx.AsyncClient:
-    """Construct an AsyncClient bound to the configured timeout (feature 005).
+_ollama_client: httpx.AsyncClient | None = None
 
-    This is the test seam: the local_llm node calls it at invoke time, so tests
-    monkeypatch ``orchestrator.build_ollama_client`` to return a client wired with
-    ``httpx.MockTransport`` — no network, no daemon (FR-011).
-    """
-    return httpx.AsyncClient(timeout=_ollama_timeout_s())
+
+def build_ollama_client() -> httpx.AsyncClient:
+    """Return the shared, keep-alive Ollama client (perf: avoids building a fresh
+    AsyncClient — and paying TCP/TLS setup — on every request). Lazily created and
+    reused across requests; callers must NOT wrap it in ``async with`` (that would
+    close the shared client). Still the test seam: tests monkeypatch this to return
+    a per-call ``httpx.MockTransport`` client (FR-011)."""
+    global _ollama_client
+    if _ollama_client is None or _ollama_client.is_closed:
+        _ollama_client = httpx.AsyncClient(
+            timeout=_ollama_timeout_s(),
+            limits=httpx.Limits(max_keepalive_connections=32, max_connections=64),
+        )
+    return _ollama_client
 
 
 def _build_local_prompt(state: GraphState) -> str:
@@ -892,8 +900,9 @@ async def local_llm(state: GraphState) -> dict:
         except Exception:
             pass
 
-    async with client:
-        text, failure, usage = await generate_local(state, client, on_token=_emit)
+    # Shared client — not closed here (see build_ollama_client); generate_local
+    # scopes only the per-request stream/response, not the client.
+    text, failure, usage = await generate_local(state, client, on_token=_emit)
     if failure is not None:
         return {
             "messages": [

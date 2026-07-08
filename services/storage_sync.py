@@ -127,11 +127,19 @@ def build_s3_client():
     )
 
 
-def _iter_object_keys(client, bucket: str, prefix: str):
-    """Yield every object key under ``prefix``, following pagination.
+# Per-user cache of the last successful S3 listing ({key: etag}). When a fresh
+# sync sees an identical listing, the reset + re-download is skipped (perf: no full
+# vault re-fetch on every message). Bounded by the user count.
+_vault_etags: dict[str, dict[str, str]] = {}
 
-    Uses a manual ContinuationToken loop rather than a paginator so the fake
-    client in tests only needs to implement ``list_objects_v2``.
+
+def _list_vault_objects(client, bucket: str, prefix: str):
+    """Yield ``(key, etag)`` for every object under ``prefix``, following pagination.
+
+    Manual ContinuationToken loop (not a paginator) so the fake client in tests
+    only needs ``list_objects_v2``. ``etag`` is None when the listing omits it (the
+    test fake), which disables the skip-if-unchanged optimization below — so that
+    path behaves exactly as before.
     """
     token: str | None = None
     while True:
@@ -142,23 +150,37 @@ def _iter_object_keys(client, bucket: str, prefix: str):
         for obj in resp.get("Contents", []):
             key = obj.get("Key")
             if key:
-                yield key
+                yield key, obj.get("ETag")
         if not resp.get("IsTruncated"):
             return
         token = resp.get("NextContinuationToken")
 
 
-def _sync_from_s3(user_id: str, dest: str) -> str:
-    """Download every ``.md`` object under ``<user_id>/`` into ``dest`` (blocking).
+def _sync_from_s3(user_id: str) -> str:
+    """Localize the user's ``.md`` vault from S3 (blocking; runs in a worker thread).
 
-    Runs in a worker thread (see :func:`sync_user_vault`); boto3 is synchronous.
-    Non-Markdown objects and the bare prefix "folder" placeholder are skipped,
-    and nested key structure under the prefix is preserved on disk.
+    Perf: skips the reset + re-download when the remote listing is byte-identical
+    to the last sync (ETag match) — avoids a full vault re-fetch on every message.
+    When ETags are unavailable (the test fake), it always syncs, so that path is
+    unchanged. Non-Markdown objects and the bare prefix marker are skipped; nested
+    key structure is preserved on disk.
     """
     client = build_s3_client()
     bucket = _vault_bucket()
     prefix = f"{user_id}/"
-    for key in _iter_object_keys(client, bucket, prefix):
+    listing = dict(_list_vault_objects(client, bucket, prefix))  # {key: etag}
+    dest = os.path.join(_sync_root(), user_id)
+
+    etags_available = bool(listing) and all(listing.values())
+    if (
+        etags_available
+        and listing == _vault_etags.get(user_id)
+        and os.path.isdir(dest)
+    ):
+        return dest  # unchanged since last sync — keep the local snapshot as-is
+
+    dest = _reset_dest(user_id)
+    for key in listing:
         if not key.endswith(VAULT_SUFFIX):
             continue
         rel = key[len(prefix):] if key.startswith(prefix) else key
@@ -167,6 +189,8 @@ def _sync_from_s3(user_id: str, dest: str) -> str:
         local_path = os.path.join(dest, rel)
         os.makedirs(os.path.dirname(local_path), exist_ok=True)
         client.download_file(bucket, key, local_path)
+    if etags_available:
+        _vault_etags[user_id] = listing
     return dest
 
 
@@ -222,7 +246,8 @@ async def sync_user_vault(user_id: str) -> str:
     hitting S3, so offline/isolated runs need no credentials. The blocking boto3
     work runs in a worker thread so this stays non-blocking on the event loop.
     """
-    dest = _reset_dest(user_id)
     if user_id == SANDBOX_USER_ID:
+        dest = _reset_dest(user_id)
         return _sync_from_mock(user_id, dest)
-    return await asyncio.to_thread(_sync_from_s3, user_id, dest)
+    # Real user: _sync_from_s3 owns the reset (it skips both when unchanged).
+    return await asyncio.to_thread(_sync_from_s3, user_id)
