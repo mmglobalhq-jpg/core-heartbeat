@@ -223,5 +223,7 @@ def resolve_user_id(request: Request) -> str:
     if user_id == SANDBOX_USER_ID and _has_cf_access_service_token(request):
         logger.debug("CF Access service-token request resolved to the sandbox user.")
 
-    logger.info("Resolved active user_id: %s", user_id)
+    # Don't log the resolved user id at INFO — it's identity (PII-adjacent) in every
+    # access-log line. Debug only, and just whether we resolved a real user.
+    logger.debug("resolved active identity: %s", "sandbox" if user_id == SANDBOX_USER_ID else "user")
     return user_id
