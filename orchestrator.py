@@ -35,7 +35,7 @@ from auth import SANDBOX_USER_ID
 from services.storage_sync import sync_user_vault, upload_user_file
 from tools.user_vault import USER_VAULT_TOOLS, read_note, run_vault_tool, write_note
 from tools.fund_holdings import FUND_TOOL_REGISTRY, run_fund_tool
-from tools.graphrag import GRAPHRAG_TOOL_REGISTRY, run_graphrag_tool
+from tools.graphrag import GRAPHRAG_TOOL_REGISTRY, kb_configured, run_graphrag_tool
 from models import (
     HistoryTurn,
     IntentPayload,
@@ -212,6 +212,9 @@ class GraphState(TypedDict):
     # Extracted text of the message's attached documents (budget-capped), injected
     # into the answering prompt so the model can read them. Set-once, no reducer.
     documents: str
+    # Source-document titles from the most recent knowledge_base retrieval, so the
+    # streamed answer can cite them at the end. Last-write-wins (set by tool_execution).
+    kb_sources: list[str]
     usage: Annotated[TokenUsage, add_usage]
     visited: Annotated[list[str], operator.add]
     step: Annotated[int, operator.add]
@@ -385,13 +388,23 @@ def _build_prompt(state: GraphState) -> str:
         "    * search_holdings_by_cusip — which funds hold a CUSIP. tool_args: "
         "{\"cusip\": <9-char CUSIP>}.\n"
         "  Personal knowledge base (this user's saved documents plus shared/global "
-        "docs — their \"core knowledge\" that persists across all chats). Use this "
-        "when the user asks about something they've saved or uploaded, refers to "
-        "their own documents/reference material, or the question likely relates to "
-        "their saved knowledge:\n"
+        "docs — their \"core knowledge\" that persists across all chats):\n"
         "    * query_knowledge_base — semantic search over the user's knowledge base. "
-        "tool_args: {\"query\": <what to look up>}. Returns cited context to compose "
-        "the answer from; already scoped to THIS user + global docs.\n"
+        "tool_args: {\"query\": <what to look up>}. Returns cited context; already "
+        "scoped to THIS user + global docs. Consult it ONCE at the start of a "
+        "substantive or topical turn — the user curated this knowledge because they "
+        "consider it important, so it should be checked even when you could answer "
+        "from general knowledge. This includes FOLLOW-UP turns on an ongoing topic "
+        "(e.g. \"give me other options\", \"what about X instead\", \"tell me more\"): "
+        "query with terms built from the follow-up PLUS the topic in the conversation "
+        "so far. Skip it ONLY for pure small-talk/greetings or a request with no "
+        "topical content.\n"
+        "    CRITICAL — query the KB AT MOST ONCE per turn. The moment a "
+        "query_knowledge_base result already appears in the history for THIS turn "
+        "(including a \"No relevant information found\" result), you MUST route to "
+        "local_llm to compose the answer — do NOT call query_knowledge_base again, do "
+        "NOT re-query with reworded terms. A single retrieval is enough; local_llm "
+        "will use that context plus general knowledge to answer.\n"
         "- A tool result is raw DATA, not an answer. After a tool result appears in "
         "the history you MUST either issue another tool call or route to local_llm "
         "to compose the answer from it — NEVER choose finish directly after a "
@@ -665,7 +678,12 @@ def _build_local_prompt(state: GraphState) -> str:
         f"Intent: {intent.intent}\n"
         f"Raw input: {intent.raw_input}\n"
         f"Conversation so far:\n{history or '(none)'}\n"
-        "Respond helpfully to the intent above."
+        "Answer the user's request above directly, and stay strictly on its "
+        "specific subject — do NOT drift onto related-but-different topics or list "
+        "things the user didn't ask about. If retrieved knowledge-base or tool "
+        "context appears above, ground your answer in it and prefer it over guessing; "
+        "you may extend it with general knowledge only when that stays directly on "
+        "topic. Keep it focused and concise, with no unrelated filler."
     )
 
 
@@ -890,6 +908,47 @@ def supervisor(state: GraphState) -> dict:
 
     nxt = decision.next_node
 
+    # Has the KB already been consulted THIS turn? (a query_knowledge_base result in
+    # this run's messages). Shared by both KB guards below.
+    _kb_prefixes = tuple(f"[tool:{n}]" for n in GRAPHRAG_TOOL_REGISTRY)
+    kb_consulted = any(
+        m.source == "tool_execution" and m.content.startswith(_kb_prefixes)
+        for m in state.get("messages", [])
+    )
+
+    # Deterministic KB retrieve-once guard (do not rely on the model to stop).
+    # The KB is a consult-once-per-turn tool: once a query_knowledge_base result is
+    # already in THIS run's messages, re-dispatching it adds nothing and can loop
+    # the supervisor to the MAX_STEPS halt (observed on follow-up questions like
+    # "any other options?"). Redirect any repeat KB call to local_llm so it composes
+    # from what was already retrieved (plus general knowledge). Runs before the
+    # local_llm guard below so an already-answered turn still finishes cleanly.
+    if nxt == "tool_execution" and decision.tool_name in GRAPHRAG_TOOL_REGISTRY and kb_consulted:
+        nxt = "local_llm"
+
+    # Deterministic retrieve-first guard (do not rely on the model to consult the KB).
+    # The user's curated knowledge base MUST be checked before we answer a fresh turn
+    # from general knowledge — Gemini follows the "consult the KB" prose only some of
+    # the time (observed: it consulted a follow-up but skipped the direct question).
+    # So if it routes STRAIGHT to local_llm on the first step of a turn (no worker has
+    # run yet) and the KB hasn't been consulted, redirect that first step to a
+    # query_knowledge_base call built from the user's input. The retrieve-once guard
+    # then blocks a second query, and once the result is in messages this is false so
+    # local_llm composes normally. Gated on the KB being configured so it never fires
+    # in tests / KB-less deploys; tool turns (fund/vault) route to tool_execution not
+    # local_llm, so they are untouched.
+    forced_kb_query: str | None = None
+    if (
+        nxt == "local_llm"
+        and not state.get("visited")
+        and not kb_consulted
+        and kb_configured()
+    ):
+        raw = (getattr(state["intent"], "raw_input", "") or "").strip()
+        if raw:
+            forced_kb_query = raw
+            nxt = "tool_execution"
+
     # Deterministic anti-reloop guard (do not rely on the model to terminate).
     # Scoped to local_llm: if the model re-dispatches local_llm after it has
     # ALREADY produced a reply this run, override to a clean finish. This kills the
@@ -920,7 +979,10 @@ def supervisor(state: GraphState) -> dict:
     # tool_request channel. Written fresh (dict or None) on EVERY routing turn so
     # tool_execution never replays a stale request from an earlier turn.
     tool_request: dict | None = None
-    if nxt == "tool_execution" and decision.tool_name:
+    if forced_kb_query is not None:
+        # retrieve-first guard fired: synthesize the KB call the model skipped.
+        tool_request = {"name": "query_knowledge_base", "args": {"query": forced_kb_query}}
+    elif nxt == "tool_execution" and decision.tool_name:
         tool_request = {
             "name": decision.tool_name,
             "args": decision.tool_args.model_dump(exclude_none=True),
@@ -1002,6 +1064,7 @@ def tool_execution(state: GraphState) -> dict:
     request = state.get("tool_request")
     name = request.get("name") if isinstance(request, dict) else None
     args = (request.get("args") or {}) if isinstance(request, dict) else {}
+    kb_sources: list[str] | None = None  # set by the KB tool, for the answer's citation
     if name in FUND_TOOL_REGISTRY:
         # Fund-holdings tools query GLOBAL market data — no user_id is passed
         # (there is no per-user boundary, unlike the vault tools below).
@@ -1017,7 +1080,7 @@ def tool_execution(state: GraphState) -> dict:
         # KB tools are per-user (own + global): thread the state-resolved user_id
         # (sent as X-User-Id to the KB service), never a model-supplied argument.
         user_id = state.get("user_id", SANDBOX_USER_ID)
-        result = run_graphrag_tool(name, user_id, args)
+        result, kb_sources = run_graphrag_tool(name, user_id, args)
         content = f"[tool:{name}] {result}"
         try:
             dispatch_custom_event(
@@ -1041,12 +1104,17 @@ def tool_execution(state: GraphState) -> dict:
             pass
     else:
         content = "[stub] tool executed"
-    return {
+    out: dict = {
         "messages": [Message(source="tool_execution", content=content, step=state["step"])],
         "usage": TOOL_USAGE,
         "visited": ["tool_execution"],
         "step": 1,
     }
+    # Record the KB source titles (only when a KB tool ran) so astream_run can cite
+    # them at the end of the composed answer. Last-write-wins on the channel.
+    if kb_sources is not None:
+        out["kb_sources"] = kb_sources
+    return out
 
 
 # --- memory extractor (feature 008) -----------------------------------------
@@ -1341,6 +1409,7 @@ def _initial_state(payload: IntentPayload, user_id: str) -> GraphState:
         "messages": [],
         "prior_context": _seed_messages(payload),
         "documents": "",  # populated by _load_documents in the async prelude
+        "kb_sources": [],
         "usage": TokenUsage(),
         "visited": [],
         "step": 0,
@@ -1456,6 +1525,7 @@ async def astream_run(
     final_status = "completed"
     streamed_local_tokens = False
     last_local_reply = ""  # captured for the detached memory extraction
+    kb_sources: list[str] = []  # titles from the last KB retrieval, cited after the answer
 
     # Pre-execution: localize the caller's Markdown vault before the supervisor
     # fires, so downstream nodes read from /tmp/vaults/<user_id>/ rather than
@@ -1500,12 +1570,22 @@ async def astream_run(
                         last_local_reply = message.content
                     if not streamed_local_tokens:
                         yield {"token": message.content}
+            # Capture KB source titles from a tool_execution turn (only KB tools set
+            # this) so we can cite them once the answer is composed.
+            if "kb_sources" in output:
+                kb_sources = output.get("kb_sources") or []
             # The supervisor stamps the terminal status on finish/degrade/halt.
             if output.get("status"):
                 final_status = output["status"]
     except (GraphRecursionError, Exception) as exc:  # noqa: B014 - never break the stream
         yield {"status": "error", "detail": f"{type(exc).__name__}: {exc}"[:200]}
         return
+    # Cite the KB source document(s) at the end of a completed, KB-grounded answer —
+    # deterministic (doesn't rely on the small local model to remember to cite).
+    if kb_sources and last_local_reply and final_status == "completed":
+        src_line = "\n\nSource: " + ", ".join(kb_sources)
+        yield {"token": src_line}
+        last_local_reply += src_line
     # Detached, non-blocking profile update — the stream closes immediately after
     # the status event while extraction runs in parallel.
     schedule_memory_extraction(user_id, payload, last_local_reply)

@@ -194,6 +194,112 @@ def test_supervisor_no_reloop_guard_forces_finish(monkeypatch):
     assert "guard" in update["messages"][0].content
 
 
+def test_supervisor_kb_retrieve_once_guard_redirects_to_local_llm(monkeypatch):
+    # Deterministic KB guard: once a query_knowledge_base result is already in this
+    # run's messages, a repeat KB dispatch is redirected to local_llm (compose from
+    # what was retrieved) rather than re-querying and looping to the step bound.
+    from models import Message
+    monkeypatch.setattr(
+        orchestrator,
+        "get_client",
+        lambda *a, **k: returns(parsed=RoutingDecision(
+            next_node="tool_execution", tool_name="query_knowledge_base",
+        )),
+    )
+    s = state(messages=[
+        Message(source="tool_execution", content="[tool:query_knowledge_base] some context", step=0),
+    ])
+    update = supervisor(s)
+    assert update["next"] == "local_llm"
+    assert update.get("tool_request") is None
+
+
+def test_supervisor_first_kb_query_not_guarded(monkeypatch):
+    # The FIRST KB query in a turn (no prior KB result in messages) routes normally.
+    monkeypatch.setattr(
+        orchestrator,
+        "get_client",
+        lambda *a, **k: returns(parsed=RoutingDecision(
+            next_node="tool_execution", tool_name="query_knowledge_base",
+        )),
+    )
+    update = supervisor(state())  # messages == []
+    assert update["next"] == "tool_execution"
+    assert update["tool_request"]["name"] == "query_knowledge_base"
+
+
+def test_supervisor_retrieve_first_forces_kb_before_general_answer(monkeypatch):
+    # Deterministic retrieve-first guard: with the KB configured, if the model routes
+    # straight to local_llm on the first step (nothing visited), redirect to a
+    # query_knowledge_base call built from the user's raw input.
+    monkeypatch.setenv("GRAPHRAG_SERVICE_URL", "http://kb")  # opens the kb_configured() gate
+    monkeypatch.setattr(
+        orchestrator,
+        "get_client",
+        lambda *a, **k: returns(parsed=RoutingDecision(next_node="local_llm")),
+    )
+    s = state()  # visited == [], messages == []
+    s["intent"] = IntentPayload(
+        intent="chat", confidence=0.9, raw_input="what is a roasted chicken recipe?", source="cli",
+    )
+    update = supervisor(s)
+    assert update["next"] == "tool_execution"
+    assert update["tool_request"]["name"] == "query_knowledge_base"
+    assert update["tool_request"]["args"]["query"] == "what is a roasted chicken recipe?"
+
+
+def test_supervisor_retrieve_first_off_when_kb_not_configured(monkeypatch):
+    # Without a configured KB, the guard never fires — a first-step local_llm routes
+    # normally (keeps KB-less deployments and the test suite unaffected).
+    monkeypatch.delenv("GRAPHRAG_SERVICE_URL", raising=False)
+    monkeypatch.setattr(
+        orchestrator,
+        "get_client",
+        lambda *a, **k: returns(parsed=RoutingDecision(next_node="local_llm")),
+    )
+    s = state()
+    s["intent"] = IntentPayload(
+        intent="chat", confidence=0.9, raw_input="what is a roasted chicken recipe?", source="cli",
+    )
+    update = supervisor(s)
+    assert update["next"] == "local_llm"
+    assert update.get("tool_request") is None
+
+
+def test_supervisor_retrieve_first_skips_after_worker_ran(monkeypatch):
+    # Once a worker has run this turn (KB already consulted), a later local_llm route
+    # is NOT redirected — it composes normally.
+    from models import Message
+    monkeypatch.setenv("GRAPHRAG_SERVICE_URL", "http://kb")
+    monkeypatch.setattr(
+        orchestrator,
+        "get_client",
+        lambda *a, **k: returns(parsed=RoutingDecision(next_node="local_llm")),
+    )
+    s = state(messages=[
+        Message(source="tool_execution", content="[tool:query_knowledge_base] ctx", step=0),
+    ])
+    s["visited"] = ["tool_execution"]
+    update = supervisor(s)
+    assert update["next"] == "local_llm"
+    assert update.get("tool_request") is None
+
+
+def test_supervisor_retrieve_first_does_not_touch_tool_turns(monkeypatch):
+    # A first-step tool route (e.g. a fund tool) is untouched by retrieve-first.
+    monkeypatch.setenv("GRAPHRAG_SERVICE_URL", "http://kb")
+    monkeypatch.setattr(
+        orchestrator,
+        "get_client",
+        lambda *a, **k: returns(parsed=RoutingDecision(
+            next_node="tool_execution", tool_name="list_funds",
+        )),
+    )
+    update = supervisor(state())  # visited == []
+    assert update["next"] == "tool_execution"
+    assert update["tool_request"]["name"] == "list_funds"
+
+
 def test_supervisor_first_dispatch_not_guarded(monkeypatch):
     # A worker not yet in `visited` routes normally (guard must not over-fire).
     monkeypatch.setattr(
