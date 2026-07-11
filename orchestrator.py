@@ -35,6 +35,7 @@ from auth import SANDBOX_USER_ID
 from services.storage_sync import sync_user_vault, upload_user_file
 from tools.user_vault import USER_VAULT_TOOLS, read_note, run_vault_tool, write_note
 from tools.fund_holdings import FUND_TOOL_REGISTRY, run_fund_tool
+from tools.graphrag import GRAPHRAG_TOOL_REGISTRY, run_graphrag_tool
 from models import (
     HistoryTurn,
     IntentPayload,
@@ -98,7 +99,8 @@ ROUTING_JSON_SCHEMA: dict = {
                 "read_user_note", "search_user_vault", "write_user_note",
                 "list_funds", "get_fund_holdings", "get_type_exposure",
                 "get_manager_exposure", "get_manager_changes",
-                "search_holdings_by_cusip", None,
+                "search_holdings_by_cusip",
+                "query_knowledge_base", None,
             ],
         },
         "tool_args": {
@@ -382,6 +384,14 @@ def _build_prompt(state: GraphState) -> str:
         "1D|7D|30D|1Y (default 30D)}.\n"
         "    * search_holdings_by_cusip — which funds hold a CUSIP. tool_args: "
         "{\"cusip\": <9-char CUSIP>}.\n"
+        "  Personal knowledge base (this user's saved documents plus shared/global "
+        "docs — their \"core knowledge\" that persists across all chats). Use this "
+        "when the user asks about something they've saved or uploaded, refers to "
+        "their own documents/reference material, or the question likely relates to "
+        "their saved knowledge:\n"
+        "    * query_knowledge_base — semantic search over the user's knowledge base. "
+        "tool_args: {\"query\": <what to look up>}. Returns cited context to compose "
+        "the answer from; already scoped to THIS user + global docs.\n"
         "- A tool result is raw DATA, not an answer. After a tool result appears in "
         "the history you MUST either issue another tool call or route to local_llm "
         "to compose the answer from it — NEVER choose finish directly after a "
@@ -996,6 +1006,18 @@ def tool_execution(state: GraphState) -> dict:
         # Fund-holdings tools query GLOBAL market data — no user_id is passed
         # (there is no per-user boundary, unlike the vault tools below).
         result = run_fund_tool(name, args)
+        content = f"[tool:{name}] {result}"
+        try:
+            dispatch_custom_event(
+                TOOL_CALL_EVENT, {"name": name, "args": args, "result": result}
+            )
+        except Exception:
+            pass
+    elif name in GRAPHRAG_TOOL_REGISTRY:
+        # KB tools are per-user (own + global): thread the state-resolved user_id
+        # (sent as X-User-Id to the KB service), never a model-supplied argument.
+        user_id = state.get("user_id", SANDBOX_USER_ID)
+        result = run_graphrag_tool(name, user_id, args)
         content = f"[tool:{name}] {result}"
         try:
             dispatch_custom_event(

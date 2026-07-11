@@ -152,6 +152,8 @@ class RoutingDecision(BaseModel):
         # fund-holdings tools (global market data)
         "list_funds", "get_fund_holdings", "get_type_exposure", "get_manager_exposure",
         "get_manager_changes", "search_holdings_by_cusip",
+        # knowledge base (per-user own + global)
+        "query_knowledge_base",
     ] | None = None
     tool_args: ToolArgs = Field(default_factory=ToolArgs)
 
