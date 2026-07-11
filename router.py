@@ -23,6 +23,7 @@ from models import (
     HealthStatus,
     IntentAccepted,
     IntentPayload,
+    KbIngestRequest,
     ThresholdRejected,
     TitleRequest,
     TitleResponse,
@@ -30,6 +31,7 @@ from models import (
 from orchestrator import astream_run, build_ollama_client, generate_title
 from orchestrator import run as run_orchestration
 from services import documents as docstore
+from services import kb as kbstore
 from services.document_parser import parse_document
 
 logger = logging.getLogger(__name__)
@@ -189,6 +191,68 @@ async def parse_document_endpoint(
         return DocumentParseResult(status="error", error=f"{type(exc).__name__}: {exc}"[:200])
     await asyncio.to_thread(docstore.store_extracted, user_id, payload.doc_id, text)
     return DocumentParseResult(status="ready", char_count=len(text))
+
+
+@router.post("/kb/ingest", response_model=None)
+async def kb_ingest(
+    payload: KbIngestRequest,
+    user_id: str = Depends(resolve_user_id),
+) -> JSONResponse:
+    """Add an already-uploaded document to the knowledge base (async → returns job_id).
+
+    Fetches the uploaded original from the caller's user-docs storage and forwards the
+    bytes to the KB service. Private by default (owner = user_id); ``scope=global`` is
+    admin-only (profiles.is_admin) — the KB service is told owner=global. This gateway
+    is the trust boundary: the global scope is NEVER taken from an unverified client.
+    """
+    if user_id == SANDBOX_USER_ID:
+        return JSONResponse(status_code=401, content={"detail": "authentication required for the knowledge base"})
+
+    owner = user_id
+    if payload.scope == "global":
+        try:
+            admin = await kbstore.is_admin(user_id)
+        except Exception:
+            admin = False
+        if not admin:
+            return JSONResponse(status_code=403, content={"detail": "admin required to add global documents"})
+        owner = kbstore.GLOBAL_OWNER
+
+    try:
+        data = await asyncio.to_thread(docstore.fetch_original, user_id, payload.doc_id)
+    except Exception:
+        return JSONResponse(status_code=404, content={"detail": "original file not found"})
+    if len(data) > MAX_DOC_BYTES:
+        return JSONResponse(status_code=413, content={"detail": "file exceeds the 20 MB limit"})
+
+    try:
+        result = await kbstore.ingest(owner, payload.filename, data)
+    except Exception as exc:  # KB unreachable / rejected — surface, don't crash
+        logger.warning("kb ingest failed for doc_id=%s: %s", payload.doc_id, exc)
+        return JSONResponse(status_code=502, content={"detail": "knowledge base ingest failed"})
+    return JSONResponse(status_code=200, content=result)
+
+
+@router.get("/kb/jobs/{job_id}", response_model=None)
+async def kb_job(job_id: str, user_id: str = Depends(resolve_user_id)) -> JSONResponse:
+    """Poll a KB ingest job's status (proxied from the KB service)."""
+    try:
+        return JSONResponse(status_code=200, content=await kbstore.get_job(job_id, user_id))
+    except Exception as exc:
+        logger.warning("kb job fetch failed for %s: %s", job_id, exc)
+        return JSONResponse(status_code=502, content={"detail": "knowledge base unavailable"})
+
+
+@router.get("/kb/documents", response_model=None)
+async def kb_documents(user_id: str = Depends(resolve_user_id)) -> JSONResponse:
+    """List the caller's knowledge-base documents (own + global)."""
+    if user_id == SANDBOX_USER_ID:
+        return JSONResponse(status_code=401, content={"detail": "authentication required for the knowledge base"})
+    try:
+        return JSONResponse(status_code=200, content=await kbstore.list_documents(user_id))
+    except Exception as exc:
+        logger.warning("kb documents fetch failed: %s", exc)
+        return JSONResponse(status_code=502, content={"detail": "knowledge base unavailable"})
 
 
 @router.api_route("/health", methods=["GET", "HEAD"])

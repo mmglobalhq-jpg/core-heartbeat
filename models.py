@@ -300,6 +300,21 @@ class DocumentParseRequest(BaseModel):
     content_type: str | None = None
 
 
+class KbIngestRequest(BaseModel):
+    """POST /kb/ingest — add an already-uploaded doc to the knowledge base.
+
+    ``scope="global"`` is admin-gated server-side (profiles.is_admin); everyone else
+    ingests to their own private scope.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    doc_id: str = Field(min_length=1)
+    filename: str = Field(min_length=1)
+    content_type: str | None = None
+    scope: Literal["private", "global"] = "private"
+
+
 class DocumentParseResult(BaseModel):
     """Result of a parse: ``ready`` with the extracted char count, or ``error``."""
 
