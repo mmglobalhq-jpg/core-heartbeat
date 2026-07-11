@@ -255,6 +255,38 @@ async def kb_documents(user_id: str = Depends(resolve_user_id)) -> JSONResponse:
         return JSONResponse(status_code=502, content={"detail": "knowledge base unavailable"})
 
 
+@router.delete("/kb/documents/{doc_id}", response_model=None)
+async def kb_delete_document(
+    doc_id: str,
+    scope: str = "private",
+    user_id: str = Depends(resolve_user_id),
+) -> JSONResponse:
+    """Remove a document from the knowledge base. Users delete their own; deleting a
+    ``scope=global`` (shared) doc is admin-only (profiles.is_admin) — else 403.
+    """
+    if user_id == SANDBOX_USER_ID:
+        return JSONResponse(status_code=401, content={"detail": "authentication required for the knowledge base"})
+
+    owner = user_id
+    if scope == "global":
+        try:
+            admin = await kbstore.is_admin(user_id)
+        except Exception:
+            admin = False
+        if not admin:
+            return JSONResponse(status_code=403, content={"detail": "admin required to delete global documents"})
+        owner = kbstore.GLOBAL_OWNER
+
+    try:
+        ok = await kbstore.delete_document(doc_id, owner)
+    except Exception as exc:
+        logger.warning("kb delete failed for %s: %s", doc_id, exc)
+        return JSONResponse(status_code=502, content={"detail": "knowledge base unavailable"})
+    if not ok:
+        return JSONResponse(status_code=404, content={"detail": "document not found or not permitted"})
+    return JSONResponse(status_code=200, content={"deleted": doc_id})
+
+
 @router.api_route("/health", methods=["GET", "HEAD"])
 def health() -> HealthStatus:
     """Liveness check: reports the gateway is online. No body, no side effects.

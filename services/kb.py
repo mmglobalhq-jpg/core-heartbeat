@@ -83,3 +83,13 @@ async def list_documents(owner: str) -> dict:
         r = await c.get("/api/documents")
         r.raise_for_status()
         return r.json()
+
+
+async def delete_document(doc_id: str, owner: str) -> bool:
+    """Delete a doc in the given scope. False if it wasn't found in that scope (404)."""
+    async with httpx.AsyncClient(base_url=_kb_base(), headers=_kb_headers(owner), timeout=TIMEOUT_S) as c:
+        r = await c.delete(f"/api/documents/{doc_id}")
+        if r.status_code == 404:
+            return False
+        r.raise_for_status()
+        return True
