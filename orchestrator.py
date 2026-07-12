@@ -1104,6 +1104,71 @@ def supervisor(state: GraphState) -> dict:
     return update
 
 
+# Answer-composition model. Default "ollama" (local qwen2.5:7b) so tests and offline
+# deploys are unchanged. Set COMPOSE_MODEL=gemini-2.5-flash to offload generation to
+# the cloud — ~15-20x faster than CPU for long answers, with a local fallback.
+COMPOSE_MODEL_ENV = "COMPOSE_MODEL"
+
+
+def _compose_model() -> str:
+    return (os.environ.get(COMPOSE_MODEL_ENV) or "ollama").strip()
+
+
+def _is_local_compose() -> bool:
+    return _compose_model().lower() in ("", "ollama", "local")
+
+
+async def generate_cloud(
+    state: GraphState,
+    on_token: Callable[[str], Awaitable[None]] | None = None,
+) -> tuple[str | None, WorkerFailure | None, TokenUsage]:
+    """Stream the answer from a cloud model (gemini-2.5-flash) instead of the local
+    CPU model. Uses the same prompt as generate_local. Never raises. A mid-stream
+    failure AFTER any token is kept as a (partial) success; a failure BEFORE the
+    first token returns (None, failure, ...) so local_llm can fall back to Ollama.
+    """
+    model_pref = _compose_model()
+    provider, api_model = _resolve_model(model_pref)
+    client = get_client(model_pref)
+    if client is None:
+        return None, WorkerFailure(category="unreachable",
+                                   detail=f"no client for compose model {model_pref!r}"), TokenUsage()
+    if provider != "gemini":  # only Gemini streaming is wired; fall back otherwise
+        return None, WorkerFailure(category="invalid_output",
+                                   detail=f"cloud compose unsupported for provider {provider!r}"), TokenUsage()
+    prompt = _build_local_prompt(state)
+    parts: list[str] = []
+    usage = TokenUsage()
+    # Disable 2.5-flash "thinking" for composition — we're writing an answer from
+    # already-retrieved context, not solving a reasoning task, and thinking adds
+    # several seconds of pre-output latency. Guarded: if the SDK/model rejects the
+    # config, the except below degrades to local rather than crashing.
+    try:
+        config = types.GenerateContentConfig(
+            thinking_config=types.ThinkingConfig(thinking_budget=0)
+        )
+    except Exception:  # SDK without ThinkingConfig -> no override
+        config = None
+    try:
+        stream = await client.aio.models.generate_content_stream(
+            model=api_model, contents=prompt, config=config
+        )
+        async for chunk in stream:
+            piece = getattr(chunk, "text", None)
+            if piece:
+                parts.append(piece)
+                if on_token is not None:
+                    await on_token(piece)
+            if getattr(chunk, "usage_metadata", None) is not None:
+                usage = _extract_usage(chunk)  # last chunk carries the running totals
+    except Exception as exc:  # never crash the graph
+        if parts:  # already streamed a partial answer — keep it rather than regress
+            return "".join(parts), None, usage
+        category = "timeout" if isinstance(exc, httpx.TimeoutException) else "unreachable"
+        return None, WorkerFailure(category=category, detail=_detail(exc)), usage
+    return "".join(parts), None, usage
+
+
 async def local_llm(state: GraphState) -> dict:
     """Live local inference via Ollama (feature 005). Degrades safely on any failure.
 
@@ -1113,7 +1178,6 @@ async def local_llm(state: GraphState) -> dict:
     the node counts as executed. See specs/005-local-ollama-worker/.
     """
     step = state["step"]
-    client = build_ollama_client()
 
     async def _emit(token: str) -> None:
         # Best-effort per-token streaming: dispatch a LangGraph custom event that
@@ -1126,9 +1190,21 @@ async def local_llm(state: GraphState) -> dict:
         except Exception:
             pass
 
-    # Shared client — not closed here (see build_ollama_client); generate_local
-    # scopes only the per-request stream/response, not the client.
-    text, failure, usage = await generate_local(state, client, on_token=_emit)
+    if _is_local_compose():
+        # Shared client — not closed here (see build_ollama_client); generate_local
+        # scopes only the per-request stream/response, not the client.
+        text, failure, usage = await generate_local(state, build_ollama_client(), on_token=_emit)
+    else:
+        # Offload composition to the cloud model (much faster than CPU). Fall back to
+        # local Ollama only if it fails BEFORE streaming, so we never regress below
+        # the always-available local path.
+        text, failure, usage = await generate_cloud(state, on_token=_emit)
+        if failure is not None:
+            logger.warning(
+                "cloud compose failed (%s: %s); falling back to local Ollama",
+                failure.category, failure.detail,
+            )
+            text, failure, usage = await generate_local(state, build_ollama_client(), on_token=_emit)
     if failure is not None:
         return {
             "messages": [
