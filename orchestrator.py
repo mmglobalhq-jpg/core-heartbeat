@@ -624,6 +624,34 @@ def _ollama_model() -> str:
     return os.environ.get(OLLAMA_MODEL_ENV) or DEFAULT_OLLAMA_MODEL
 
 
+def _ollama_embed_model() -> str:
+    """Embed model to pre-warm — mirrors graph-rag's OLLAMA_EMBED_MODEL default."""
+    return os.environ.get("OLLAMA_EMBED_MODEL") or "nomic-embed-text"
+
+
+async def warm_ollama_models() -> None:
+    """Best-effort: load the generation + embed models into Ollama at startup so the
+    first user doesn't pay the ~15s cold-load (keep_alive holds them resident after).
+    Never raises — Ollama may be unreachable at boot; failures are logged and ignored.
+    """
+    keep_alive = os.environ.get("OLLAMA_KEEP_ALIVE", "30m")
+    gen_url = _ollama_url()
+    embed_url = gen_url.replace("/api/generate", "/api/embeddings")
+    targets = (
+        (gen_url, {"model": _ollama_model(), "prompt": "hi", "stream": False,
+                   "options": {"num_predict": 1}, "keep_alive": keep_alive}, "generation"),
+        (embed_url, {"model": _ollama_embed_model(), "prompt": "warmup",
+                     "keep_alive": keep_alive}, "embed"),
+    )
+    async with httpx.AsyncClient(timeout=180.0) as client:
+        for url, body, label in targets:
+            try:
+                r = await client.post(url, json=body)
+                logger.info("ollama warmup (%s): HTTP %s", label, r.status_code)
+            except Exception as exc:  # noqa: BLE001 — warmup must never crash startup
+                logger.warning("ollama warmup (%s) skipped: %s: %s", label, type(exc).__name__, exc)
+
+
 def _ollama_timeout_s() -> float:
     """Per-call time bound in seconds, env-overridable (FR-007). Falls back on junk."""
     raw = os.environ.get(OLLAMA_TIMEOUT_MS_ENV)
