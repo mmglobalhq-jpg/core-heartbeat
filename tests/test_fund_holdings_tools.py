@@ -267,3 +267,23 @@ def test_fund_tools_registered_in_schema():
     # The routing schema + model enum must advertise every dispatchable fund tool.
     enum = orchestrator.ROUTING_JSON_SCHEMA["properties"]["tool_name"]["enum"]
     assert fh.FUND_TOOL_REGISTRY.issubset(set(enum))
+
+
+# --- ticker validation (L6): block PostgREST filter injection via model input ---
+
+def test_resolve_fund_rejects_injectiony_ticker_without_network():
+    # A ticker carrying PostgREST filter operators must be rejected BEFORE it reaches
+    # the eq. filter — _resolve_fund returns None early, so no request is made and the
+    # (unset) transport/env is never touched.
+    assert fh._resolve_fund("AAA,owner_id.not.is.null") is None
+    assert fh._resolve_fund("'; drop table funds;--") is None
+    assert fh._resolve_fund("") is None
+    assert fh._resolve_fund("x" * 50) is None
+
+
+def test_ticker_regex_accepts_real_symbols():
+    assert fh._TICKER_RE.fullmatch("JMTG")
+    assert fh._TICKER_RE.fullmatch("BRK.B")   # class share with a dot
+    assert fh._TICKER_RE.fullmatch("BF-B")    # hyphenated
+    assert not fh._TICKER_RE.fullmatch("AAA,BBB")
+    assert not fh._TICKER_RE.fullmatch("a b")

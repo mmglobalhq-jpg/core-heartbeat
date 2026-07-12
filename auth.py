@@ -70,6 +70,13 @@ DEFAULT_SUPABASE_JWKS_URL = (
     "https://ulzhtdnjwikcadtskzgi.supabase.co/auth/v1/.well-known/jwks.json"
 )
 
+# Optional issuer pinning (hardening). When SUPABASE_JWT_ISSUER is set, the token's
+# `iss` claim must match it exactly, so a token minted by a *different* Supabase
+# project that happens to share the JWKS/secret is rejected. Left unset by default
+# so existing verification behavior is unchanged (opt-in, no breakage). For this
+# deployment set it to: https://ulzhtdnjwikcadtskzgi.supabase.co/auth/v1
+SUPABASE_JWT_ISSUER_ENV = "SUPABASE_JWT_ISSUER"
+
 # Cloudflare Access service-token headers — automation authenticated at the edge.
 _CF_ACCESS_CLIENT_ID_HEADER = "cf-access-client-id"
 _CF_ACCESS_CLIENT_SECRET_HEADER = "cf-access-client-secret"
@@ -132,11 +139,12 @@ def _decode_and_extract_sub(token: str, key, algorithms) -> str | None:
 
     Enforces expiry and the ``authenticated``/``anon`` audience. Never raises.
     """
+    issuer = os.environ.get(SUPABASE_JWT_ISSUER_ENV) or None  # None => not enforced
     try:
         payload = jwt.decode(
-            token, key, algorithms=algorithms, audience=JWT_AUDIENCES
+            token, key, algorithms=algorithms, audience=JWT_AUDIENCES, issuer=issuer
         )
-    except jwt.PyJWTError as exc:  # expired, bad signature, wrong alg/aud, malformed
+    except jwt.PyJWTError as exc:  # expired, bad signature, wrong alg/aud/iss, malformed
         logger.info("JWT verification failed: %s: %s", type(exc).__name__, exc)
         return None
     sub = payload.get("sub")

@@ -174,9 +174,18 @@ def _desc(row: dict) -> str:
 
 # --- resolvers ---------------------------------------------------------------
 
+# A ticker is a short alphanumeric symbol (allow '.'/'-' for classes like BRK.B).
+# Validating before it goes into the PostgREST `eq.` filter blocks any attempt to
+# smuggle filter operators through model-supplied input.
+_TICKER_RE = re.compile(r"^[A-Z0-9.\-]{1,15}$")
+
+
 def _resolve_fund(ticker: str) -> dict | None:
+    sym = (ticker or "").strip().upper()
+    if not _TICKER_RE.fullmatch(sym):
+        return None  # not a plain ticker -> no match (and never reaches the filter)
     rows = _pg_get("funds", {
-        "ticker": f"eq.{(ticker or '').strip().upper()}",
+        "ticker": f"eq.{sym}",
         "select": "id,ticker,fund_name",
         "limit": "1",
     })

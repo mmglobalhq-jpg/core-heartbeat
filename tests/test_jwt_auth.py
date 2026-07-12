@@ -27,13 +27,15 @@ class _Req:
         self.headers = Headers(headers or {})
 
 
-def _make_token(secret=SECRET, sub=None, aud="authenticated", exp_delta=3600, alg="HS256", key=None):
+def _make_token(secret=SECRET, sub=None, aud="authenticated", exp_delta=3600, alg="HS256", key=None, iss=None):
     """Mint a JWT. `key` overrides the signing key (for wrong-secret cases)."""
     sub = sub or str(uuid.uuid4())
     now = int(time.time())
     payload = {"sub": sub, "iat": now, "exp": now + exp_delta}
     if aud is not None:
         payload["aud"] = aud
+    if iss is not None:
+        payload["iss"] = iss
     token = jwt.encode(payload, key if key is not None else secret, algorithm=alg)
     return token, sub
 
@@ -229,3 +231,29 @@ def test_jwks_url_default_is_wellknown_not_rpc():
     # Guard against regressing to the non-existent /rest/v1/rpc/get_jwks path.
     assert auth.DEFAULT_SUPABASE_JWKS_URL.endswith("/auth/v1/.well-known/jwks.json")
     assert "rpc/get_jwks" not in auth.DEFAULT_SUPABASE_JWKS_URL
+
+
+# --- optional issuer pinning (L1) -------------------------------------------
+
+ISSUER = "https://ulzhtdnjwikcadtskzgi.supabase.co/auth/v1"
+
+
+def test_issuer_unset_does_not_enforce_iss(secret_set, monkeypatch):
+    # Default: no SUPABASE_JWT_ISSUER -> issuer is not checked (backward compatible).
+    monkeypatch.delenv(auth.SUPABASE_JWT_ISSUER_ENV, raising=False)
+    token, sub = _make_token(iss="https://some-other-project.supabase.co/auth/v1")
+    assert verify_supabase_jwt(token) == sub
+    token2, sub2 = _make_token(iss=None)  # no iss claim at all
+    assert verify_supabase_jwt(token2) == sub2
+
+
+def test_matching_issuer_is_accepted(secret_set, monkeypatch):
+    monkeypatch.setenv(auth.SUPABASE_JWT_ISSUER_ENV, ISSUER)
+    token, sub = _make_token(iss=ISSUER)
+    assert verify_supabase_jwt(token) == sub
+
+
+def test_wrong_issuer_is_rejected(secret_set, monkeypatch):
+    monkeypatch.setenv(auth.SUPABASE_JWT_ISSUER_ENV, ISSUER)
+    token, _ = _make_token(iss="https://attacker-project.supabase.co/auth/v1")
+    assert verify_supabase_jwt(token) is None

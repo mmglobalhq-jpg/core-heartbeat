@@ -1,6 +1,7 @@
 venv/
 .env*
 !.env*.example
+.mcp.json
 __pycache__/
 .specify/*
 !.specify/memory/
