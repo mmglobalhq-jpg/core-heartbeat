@@ -24,9 +24,13 @@ GRAPHRAG_KEY_ENV = "GRAPHRAG_API_KEY"
 REQUEST_TIMEOUT_S = 30.0
 MAX_ATTEMPTS = 3
 RETRY_BACKOFF_S = 0.4
-DEFAULT_TOP_K = 5
-MAX_CHUNKS = 8      # cap chunks fed into the (small) local model's context
-MAX_CHARS = 900     # per-chunk char cap for the context block
+# KB context size fed into the (small, CPU-bound) local model. Smaller = far less
+# prompt prefill = faster TTFT: measured ~34s of a recipe turn's ~37s TTFT was CPU
+# prefill of the injected chunks. Tunable via env to trade grounding for speed
+# without a rebuild (raise for more complete answers, lower for faster ones).
+DEFAULT_TOP_K = int(os.environ.get("KB_TOP_K", "4"))       # chunks retrieved (was 5)
+MAX_CHUNKS = int(os.environ.get("KB_MAX_CHUNKS", "4"))     # chunks kept in the prompt (was 8)
+MAX_CHARS = int(os.environ.get("KB_MAX_CHARS", "600"))     # per-chunk char cap (was 900)
 
 # Test seam: unit tests set this to an ``httpx.MockTransport`` to exercise the tool
 # without a live service. None -> real network.
