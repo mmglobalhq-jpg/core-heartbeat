@@ -228,6 +228,23 @@ def test_supervisor_first_kb_query_not_guarded(monkeypatch):
     assert update["tool_request"]["name"] == "query_knowledge_base"
 
 
+def test_supervisor_kb_compose_fastpath_skips_model_call(monkeypatch):
+    # Latency fast-path: once a KB result is in this run's messages, composing is the
+    # only next hop, so the supervisor must route to local_llm WITHOUT a model call.
+    # Wire get_client to explode to prove the routing round-trip is skipped.
+    from models import Message
+    def _boom(*a, **k):
+        raise AssertionError("routing model must not be called on the KB compose fast-path")
+    monkeypatch.setattr(orchestrator, "get_client", _boom)
+    s = state(messages=[
+        Message(source="tool_execution", content="[tool:query_knowledge_base] ctx", step=0),
+    ])
+    update = supervisor(s)
+    assert update["next"] == "local_llm"
+    assert update["usage"].total_tokens == 0  # no Gemini round-trip billed
+    assert update.get("tool_request") is None
+
+
 def test_supervisor_retrieve_first_forces_kb_before_general_answer(monkeypatch):
     # Deterministic retrieve-first guard: with the KB configured, if the model routes
     # straight to local_llm on the first step (nothing visited), redirect to a

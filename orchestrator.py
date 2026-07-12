@@ -717,6 +717,12 @@ async def generate_local(
         "model": _ollama_model(),
         "prompt": _build_local_prompt(state),
         "stream": True,
+        # Keep the model resident between turns. Measured cold-load added ~15s to
+        # TTFT (25s cold vs 10s warm); with the default 5m Ollama TTL an idle chat
+        # or an interleaved embed model eviction reloads qwen2.5:7b on the next
+        # message. Hold it for OLLAMA_KEEP_ALIVE (default 30m; set "-1" to never
+        # unload if the host has the RAM for embed + generation models together).
+        "keep_alive": os.environ.get("OLLAMA_KEEP_ALIVE", "30m"),
     }
     parts: list[str] = []
     saw_response = False
@@ -869,6 +875,25 @@ def supervisor(state: GraphState) -> dict:
             "status": "halted_step_bound",
             "step": 1,
             "messages": [Message(source="supervisor", content="route -> finish (step bound)", step=step)],
+        }
+
+    # Deterministic fast-path (latency): the KB is a retrieve-once-then-compose tool,
+    # so once its result is in this run's messages the next hop is ALWAYS local_llm.
+    # Skipping the model routing call here removes a ~1.2s Gemini round-trip that sits
+    # BEFORE generation, cutting time-to-first-token on every KB-grounded turn. The
+    # retrieve-once guard below enforces the same transition when the model is asked;
+    # this just avoids paying for a decision that's already determined.
+    _kb_prefixes = tuple(f"[tool:{n}]" for n in GRAPHRAG_TOOL_REGISTRY)
+    if "local_llm" not in state.get("visited", []) and any(
+        m.source == "tool_execution" and m.content.startswith(_kb_prefixes)
+        for m in state.get("messages", [])
+    ):
+        return {
+            "next": "local_llm",
+            "step": 1,
+            "usage": TokenUsage(),
+            "tool_request": None,
+            "messages": [Message(source="supervisor", content="route -> local_llm (fast-path: compose KB)", step=step)],
         }
 
     # Feature 006: the caller's model_preference selects the provider/model.
