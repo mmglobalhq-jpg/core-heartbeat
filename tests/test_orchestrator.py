@@ -73,7 +73,7 @@ def intent(identity="greet", confidence=0.9):
     return IntentPayload(intent=identity, confidence=confidence, raw_input="x", source="cli")
 
 
-GREET_PLAN = ["local_llm", "tool_execution", "finish"]
+GREET_PLAN = ["tool_execution", "local_llm", "finish"]
 
 
 # --- US1: terminates with a structured outcome (SC-001) ---------------------
@@ -92,15 +92,15 @@ def test_run_terminates_with_outcome(monkeypatch):
 def test_cyclic_plan_visits_both_workers_in_order(monkeypatch):
     install(monkeypatch, GREET_PLAN)
     o = run(intent("greet"))
-    assert o.nodes_executed == ["local_llm", "tool_execution"]
+    assert o.nodes_executed == ["tool_execution", "local_llm"]
 
 
 def test_message_history_ordered_with_provenance(monkeypatch):
     install(monkeypatch, GREET_PLAN)
     o = run(intent("greet"))
     sources = [m.source for m in o.messages]
-    assert sources == ["supervisor", "local_llm", "supervisor", "tool_execution", "supervisor"]
-    assert [s for s in sources if s != "supervisor"] == ["local_llm", "tool_execution"]
+    assert sources == ["supervisor", "tool_execution", "supervisor", "local_llm", "supervisor"]
+    assert [s for s in sources if s != "supervisor"] == ["tool_execution", "local_llm"]
 
 
 def test_usage_totals_equal_sum_of_increments(monkeypatch):

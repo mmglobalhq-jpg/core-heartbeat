@@ -45,7 +45,7 @@ class _FakeClient:
         self.models = _Models()
 
 
-GREET_PLAN = ["local_llm", "tool_execution", "finish"]
+GREET_PLAN = ["tool_execution", "local_llm", "finish"]
 
 
 # Mocked Ollama counts preserve the historical stub totals (local 10/20/30 +
@@ -100,7 +100,7 @@ def test_accept_confident_intent(monkeypatch):
     # (was null in feature 002) and an orchestration outcome is present.
     assert isinstance(body["usage"], dict)
     assert body["orchestration"] is not None
-    assert body["orchestration"]["nodes_executed"] == ["local_llm", "tool_execution"]
+    assert body["orchestration"]["nodes_executed"] == ["tool_execution", "local_llm"]
 
 
 def test_accept_exactly_at_threshold(monkeypatch):
@@ -257,7 +257,7 @@ def test_accepted_intent_triggers_orchestration_with_usage(monkeypatch):
     r = client.post("/intent", json=valid_payload(intent="greet", confidence=0.9))
     assert r.status_code == 200
     body = r.json()
-    assert body["orchestration"]["nodes_executed"] == ["local_llm", "tool_execution"]
+    assert body["orchestration"]["nodes_executed"] == ["tool_execution", "local_llm"]
     assert body["orchestration"]["status"] == "completed"
     assert body["usage"]["total_tokens"] == 35  # fixed increments (10+20+30) + (5+0+5)
 

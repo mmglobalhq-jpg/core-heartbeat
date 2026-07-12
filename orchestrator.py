@@ -933,6 +933,22 @@ def supervisor(state: GraphState) -> dict:
             "messages": [Message(source="supervisor", content="route -> finish (step bound)", step=step)],
         }
 
+    # Deterministic finish fast-path (latency/throughput): local_llm composes the
+    # single answer per turn, and the completion policy is "finish once local_llm has
+    # replied, never re-dispatch it". So once local_llm is in visited the turn is done
+    # — finish WITHOUT a routing model call. Saves the final ~1.2s Gemini round-trip on
+    # every turn (post-generation, so it frees the worker sooner under concurrent load)
+    # and subsumes the anti-reloop guard below for the local_llm case.
+    if "local_llm" in state.get("visited", []):
+        return {
+            "next": "finish",
+            "status": "completed",
+            "step": 1,
+            "usage": TokenUsage(),
+            "tool_request": None,
+            "messages": [Message(source="supervisor", content="route -> finish (fast-path: answered)", step=step)],
+        }
+
     # Deterministic fast-path (latency): the KB is a retrieve-once-then-compose tool,
     # so once its result is in this run's messages the next hop is ALWAYS local_llm.
     # Skipping the model routing call here removes a ~1.2s Gemini round-trip that sits

@@ -173,25 +173,21 @@ def test_supervisor_step_bound_no_model_call(monkeypatch):
     assert update["next"] == "finish" and update["status"] == "halted_step_bound"
 
 
-def test_supervisor_no_reloop_guard_forces_finish(monkeypatch):
-    # Deterministic guard: if the model re-dispatches a worker that already ran
-    # (its name is in `visited`), override to a clean finish rather than looping
-    # to the MAX_STEPS halt. Usage from the model call is still recorded.
-    monkeypatch.setattr(
-        orchestrator,
-        "get_client",
-        lambda *a, **k: returns(
-            parsed=RoutingDecision(next_node="local_llm"),
-            usage=FakeUsage(prompt=3, candidates=1, total=4),
-        ),
-    )
+def test_supervisor_finish_fastpath_skips_model_call(monkeypatch):
+    # Deterministic finish fast-path: once local_llm has produced the answer, the turn
+    # is done (completion policy: finish once answered, never re-dispatch). The
+    # supervisor must finish WITHOUT a routing model call — wire get_client to explode
+    # to prove the round-trip is skipped.
+    def _boom(*a, **k):
+        raise AssertionError("routing model must not be called on the finish fast-path")
+    monkeypatch.setattr(orchestrator, "get_client", _boom)
     s = state()
     s["visited"] = ["local_llm"]  # local_llm has already replied this run
     update = supervisor(s)
     assert update["next"] == "finish"
     assert update["status"] == "completed"
-    assert update["usage"].total_tokens == 4
-    assert "guard" in update["messages"][0].content
+    assert update["usage"].total_tokens == 0  # no Gemini round-trip billed
+    assert update.get("tool_request") is None
 
 
 def test_supervisor_kb_retrieve_once_guard_redirects_to_local_llm(monkeypatch):
