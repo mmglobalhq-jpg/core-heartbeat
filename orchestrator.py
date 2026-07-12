@@ -16,6 +16,7 @@ import json
 import logging
 import operator
 import os
+import re
 from collections import defaultdict
 from collections.abc import AsyncIterator, Awaitable, Callable
 from typing import Annotated
@@ -892,6 +893,33 @@ def _degraded(step: int, failure: RoutingFailure, usage: TokenUsage | None = Non
     }
 
 
+# Pure greetings / pleasantries / acknowledgements that never need the knowledge
+# base. Stored in normalized form (lowercased, punctuation stripped).
+_TRIVIAL_TURNS = frozenset({
+    "hi", "hey", "hello", "yo", "hiya", "howdy", "sup", "hey there", "hi there",
+    "hello there", "good morning", "good afternoon", "good evening", "good night",
+    "morning", "evening", "greetings",
+    "thanks", "thank you", "thank you so much", "thanks so much", "ty", "thx",
+    "much appreciated", "appreciate it", "cheers",
+    "bye", "goodbye", "see you", "see ya", "cya", "later", "take care",
+    "ok", "okay", "k", "kk", "cool", "nice", "great", "awesome", "perfect",
+    "got it", "sounds good", "makes sense", "understood", "gotcha",
+    "yes", "no", "yep", "yeah", "yup", "nope", "nah", "sure", "please",
+    "how are you", "hows it going", "how s it going", "whats up", "what s up",
+    "how are things",
+})
+
+
+def _is_trivial_turn(raw: str) -> bool:
+    """True for a pure greeting / pleasantry / acknowledgement — a turn that never
+    needs the knowledge base. Exact-match on the WHOLE normalized input, so it never
+    fires on a real question that merely starts with a greeting (e.g. "hello, how do
+    I roast a chicken?"). Used to skip the forced KB retrieval on trivial turns. Pure.
+    """
+    norm = " ".join(re.sub(r"[^a-z0-9\s]", " ", (raw or "").lower()).split())
+    return norm in _TRIVIAL_TURNS
+
+
 def supervisor(state: GraphState) -> dict:
     """Model-driven routing hub. Falls back to a safe finish on any failure."""
     step = state["step"]
@@ -991,13 +1019,16 @@ def supervisor(state: GraphState) -> dict:
     # in tests / KB-less deploys; tool turns (fund/vault) route to tool_execution not
     # local_llm, so they are untouched.
     forced_kb_query: str | None = None
+    raw = (getattr(state["intent"], "raw_input", "") or "").strip()
     if (
         nxt == "local_llm"
         and not state.get("visited")
         and not kb_consulted
         and kb_configured()
+        # Skip the embed+search+rerank on pure greetings/pleasantries — they never
+        # need the KB, and forcing it there just adds latency to a trivial reply.
+        and not _is_trivial_turn(raw)
     ):
-        raw = (getattr(state["intent"], "raw_input", "") or "").strip()
         if raw:
             forced_kb_query = raw
             nxt = "tool_execution"

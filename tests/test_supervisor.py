@@ -265,6 +265,46 @@ def test_supervisor_retrieve_first_forces_kb_before_general_answer(monkeypatch):
     assert update["tool_request"]["args"]["query"] == "what is a roasted chicken recipe?"
 
 
+def test_supervisor_retrieve_first_skips_greetings(monkeypatch):
+    # A pure greeting must NOT force a KB retrieval — it routes straight to local_llm.
+    monkeypatch.setenv("GRAPHRAG_SERVICE_URL", "http://kb")
+    monkeypatch.setattr(
+        orchestrator, "get_client",
+        lambda *a, **k: returns(parsed=RoutingDecision(next_node="local_llm")),
+    )
+    for greeting in ("hello", "Hi!", "thanks so much", "ok", "how are you?"):
+        s = state()
+        s["intent"] = IntentPayload(intent="chat", confidence=0.9, raw_input=greeting, source="cli")
+        update = supervisor(s)
+        assert update["next"] == "local_llm", f"{greeting!r} should skip KB"
+        assert update.get("tool_request") is None
+
+
+def test_supervisor_retrieve_first_still_fires_for_real_question_with_greeting_prefix(monkeypatch):
+    # A real question that merely starts with a greeting must STILL consult the KB.
+    monkeypatch.setenv("GRAPHRAG_SERVICE_URL", "http://kb")
+    monkeypatch.setattr(
+        orchestrator, "get_client",
+        lambda *a, **k: returns(parsed=RoutingDecision(next_node="local_llm")),
+    )
+    s = state()
+    s["intent"] = IntentPayload(
+        intent="chat", confidence=0.9, raw_input="hello, how do I roast a chicken?", source="cli",
+    )
+    update = supervisor(s)
+    assert update["next"] == "tool_execution"
+    assert update["tool_request"]["name"] == "query_knowledge_base"
+
+
+def test_is_trivial_turn_matching():
+    assert orchestrator._is_trivial_turn("Hello!")
+    assert orchestrator._is_trivial_turn("  thanks. ")
+    assert orchestrator._is_trivial_turn("how are you?")
+    assert not orchestrator._is_trivial_turn("how do I roast a chicken?")
+    assert not orchestrator._is_trivial_turn("hello, what is the temperature?")
+    assert not orchestrator._is_trivial_turn("")
+
+
 def test_supervisor_retrieve_first_off_when_kb_not_configured(monkeypatch):
     # Without a configured KB, the guard never fires — a first-step local_llm routes
     # normally (keeps KB-less deployments and the test suite unaffected).
