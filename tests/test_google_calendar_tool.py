@@ -150,3 +150,12 @@ def test_expired_token_is_refreshed(env):
 def test_unknown_tool(env):
     out = gc.run_calendar_tool("nope", UID, {})
     assert "unknown tool" in out
+
+
+def test_to_rfc3339_normalizes_naive_and_passes_through():
+    from tools.google_calendar import _to_rfc3339
+    out = _to_rfc3339("2026-07-20T00:00:00", "d", lambda: "America/Chicago")
+    assert out.startswith("2026-07-20T00:00:00-0")   # got an offset (CDT -05 / CST -06)
+    assert _to_rfc3339("2026-07-20T00:00:00Z", "d", lambda: "UTC") == "2026-07-20T00:00:00Z"
+    assert _to_rfc3339("2026-07-20T00:00:00-05:00", "d", lambda: "UTC") == "2026-07-20T00:00:00-05:00"
+    assert _to_rfc3339("", "DEFAULT", lambda: "UTC") == "DEFAULT"

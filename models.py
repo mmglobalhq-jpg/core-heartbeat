@@ -71,6 +71,7 @@ class IntentPayload(BaseModel):
     model_preference: str | None = "gemini-2.5-flash"
     history: list[HistoryTurn] = Field(default_factory=list)
     document_ids: list[str] = Field(default_factory=list)
+    timezone: str | None = None  # caller's IANA tz (e.g. "America/Chicago"), for date grounding
 
 
 # ---------------------------------------------------------------------------

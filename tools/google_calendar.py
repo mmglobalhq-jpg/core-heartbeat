@@ -14,7 +14,9 @@ dispatch, and a ``run_calendar_tool`` entrypoint that degrades to a friendly str
 from __future__ import annotations
 
 import os
+import re
 from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 
 import httpx
 
@@ -28,7 +30,8 @@ CAL_BASE = "https://www.googleapis.com/calendar/v3"
 REQUEST_TIMEOUT_S = 30.0
 EXPIRY_BUFFER_S = 60          # refresh a little before actual expiry
 MAX_RESULTS_CAP = 25
-DEFAULT_WINDOW_DAYS = 7
+DEFAULT_WINDOW_DAYS = 7      # "what's coming up" (no search term)
+SEARCH_WINDOW_DAYS = 180     # widen when searching by name/keyword
 
 # Test seam: unit tests set this to an httpx.MockTransport. None -> real network.
 _transport: httpx.BaseTransport | None = None
@@ -166,10 +169,37 @@ def _fmt_event(e: dict) -> str:
     return f"• {summary} — {start} to {end}{tail}  [id: {e.get('id')}]"
 
 
+_HAS_TZ = re.compile(r"(Z|[+-]\d{2}:?\d{2})$")
+
+
+def _to_rfc3339(value: str | None, default: str, tz_getter) -> str:
+    """Google's list timeMin/timeMax require an offset. The model emits NAIVE local
+    datetimes (consistent with create/update), so attach the calendar's timezone to
+    any naive value; pass through anything already offset-aware or the default."""
+    if not value:
+        return default
+    v = value.strip()
+    if _HAS_TZ.search(v):
+        return v
+    try:
+        return datetime.fromisoformat(v).replace(tzinfo=ZoneInfo(tz_getter())).isoformat()
+    except Exception:
+        return v  # malformed -> let Google reject it rather than guess
+
+
 def list_events(user_id: str, args: dict) -> str:
     token = _access_token(user_id)
-    time_min = args.get("time_min") or _rfc3339(_now())
-    time_max = args.get("time_max") or _rfc3339(_now() + timedelta(days=DEFAULT_WINDOW_DAYS))
+    _tz_cache: list[str] = []
+    def _tz() -> str:
+        if not _tz_cache:
+            _tz_cache.append(_calendar_tz(token))
+        return _tz_cache[0]
+    # A name search ("when is my dentist appointment?") shouldn't be capped to the
+    # next week — widen the default window when a query is given so it finds events
+    # further out. An explicit time_min/time_max still wins.
+    window_days = SEARCH_WINDOW_DAYS if args.get("query") else DEFAULT_WINDOW_DAYS
+    time_min = _to_rfc3339(args.get("time_min"), _rfc3339(_now()), _tz)
+    time_max = _to_rfc3339(args.get("time_max"), _rfc3339(_now() + timedelta(days=window_days)), _tz)
     try:
         max_results = int(args.get("max_results") or 10)
     except (TypeError, ValueError):

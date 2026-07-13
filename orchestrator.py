@@ -17,6 +17,8 @@ import logging
 import operator
 import os
 import re
+from datetime import datetime
+from zoneinfo import ZoneInfo
 from collections import defaultdict
 from collections.abc import AsyncIterator, Awaitable, Callable
 from typing import Annotated
@@ -330,6 +332,33 @@ def _render_history(messages) -> str:
     return "\n".join(f"{m.source}: {m.content}" for m in messages)
 
 
+DEFAULT_TZ_ENV = "DEFAULT_TIMEZONE"
+
+
+def _now_context(intent) -> str:
+    """A 'current date & time' grounding line for every prompt so the model can
+    resolve relative/partial dates and local times. Uses the caller's timezone
+    (IntentPayload.timezone, from the browser); falls back to DEFAULT_TIMEZONE or
+    UTC. The orchestrator ALWAYS carries the current time — this is injected into
+    both the supervisor (which emits tool date args) and the compose prompt.
+    """
+    tzname = (getattr(intent, "timezone", None) or os.environ.get(DEFAULT_TZ_ENV) or "UTC").strip()
+    try:
+        tz = ZoneInfo(tzname)
+    except Exception:  # unknown zone -> UTC
+        tzname, tz = "UTC", ZoneInfo("UTC")
+    now = datetime.now(tz)
+    off = now.strftime("%z")
+    off = f"{off[:3]}:{off[3:]}" if len(off) == 5 else (off or "+00:00")
+    return (
+        f"Current date & time: {now.strftime('%A')}, {now.strftime('%Y-%m-%d %H:%M')} "
+        f"in {tzname} (UTC{off}). Resolve any date/time the user gives relative to "
+        f"this: a date with no year means the NEXT upcoming occurrence (this year if "
+        f"it is still in the future, otherwise next year); read clock times in the "
+        f"user's timezone above.\n"
+    )
+
+
 def _build_prompt(state: GraphState) -> str:
     """Deterministic routing prompt derived from the intent + message history.
 
@@ -421,7 +450,10 @@ def _build_prompt(state: GraphState) -> str:
         "    * delete_calendar_event — remove an event. tool_args: {\"event_id\"}.\n"
         "    To update or delete, you usually must FIRST list_calendar_events to find "
         "the event_id, then call update/delete with that id. Ask the user to confirm "
-        "before deleting. Use ISO 8601 for times; if a date/time is ambiguous, ask.\n"
+        "before deleting. For start/end and time_min/time_max emit NAIVE local "
+        "datetimes (e.g. 2026-07-20T09:00:00 — NO timezone offset/Z); the calendar "
+        "applies the user's timezone and DST. Resolve dates against the current "
+        "date/time given below. If a date/time is genuinely ambiguous, ask.\n"
         "- A tool result is raw DATA, not an answer. After a tool result appears in "
         "the history you MUST either issue another tool call or route to local_llm "
         "to compose the answer from it — NEVER choose finish directly after a "
@@ -429,6 +461,7 @@ def _build_prompt(state: GraphState) -> str:
         "- Choose finish only once local_llm has produced the answer. If local_llm "
         "has already answered the intent (a chat reply, or a reply composed from a "
         "tool result), you MUST choose finish and never re-dispatch local_llm.\n"
+        f"{_now_context(intent)}"
         f"Intent: {intent.intent}\n"
         f"Confidence: {intent.confidence}\n"
         f"Raw input: {intent.raw_input}\n"
@@ -720,6 +753,7 @@ def _build_local_prompt(state: GraphState) -> str:
     return (
         f"{profile_block}"
         f"{docs_block}"
+        f"{_now_context(intent)}"
         f"Intent: {intent.intent}\n"
         f"Raw input: {intent.raw_input}\n"
         f"Conversation so far:\n{history or '(none)'}\n"

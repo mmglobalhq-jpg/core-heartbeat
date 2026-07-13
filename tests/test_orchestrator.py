@@ -250,3 +250,36 @@ def test_run_syncs_the_vault_like_astream_run(monkeypatch):
     install(monkeypatch, ["finish"])
     run(intent("greet"))
     assert calls == [orchestrator.SANDBOX_USER_ID]
+
+
+# --- current-date/time grounding (timezone-aware) ---------------------------
+
+def test_now_context_uses_caller_timezone():
+    from orchestrator import _now_context
+    from models import IntentPayload
+    line = _now_context(IntentPayload(intent="chat", confidence=0.9, raw_input="x",
+                                      source="t", timezone="America/Chicago"))
+    assert "America/Chicago" in line
+    assert "Current date & time" in line
+    assert "NEXT upcoming" in line  # the resolution rule is present
+
+
+def test_now_context_bad_timezone_falls_back_to_utc():
+    from orchestrator import _now_context
+    from models import IntentPayload
+    line = _now_context(IntentPayload(intent="chat", confidence=0.9, raw_input="x",
+                                      source="t", timezone="Not/ARealZone"))
+    assert "UTC" in line
+
+
+def test_prompts_include_now_context():
+    from orchestrator import _build_local_prompt, _build_prompt
+    from models import IntentPayload
+    state = {
+        "intent": IntentPayload(intent="chat", confidence=0.9, raw_input="what's on the 20th?",
+                                source="t", timezone="America/Chicago"),
+        "messages": [], "prior_context": [], "documents": "", "user_id": "sandbox-user",
+        "visited": [], "usage": None, "step": 1,
+    }
+    assert "Current date & time" in _build_local_prompt(state)
+    assert "Current date & time" in _build_prompt(state)
