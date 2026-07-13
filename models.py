@@ -130,6 +130,16 @@ class ToolArgs(BaseModel):
     manager_name: str | None = None
     cusip: str | None = None
     window: str | None = None
+    # Google Calendar tools (per-user):
+    event_id: str | None = None       # target event for update/delete
+    summary: str | None = None        # event title
+    start: str | None = None          # ISO 8601 datetime, or YYYY-MM-DD for all-day
+    end: str | None = None
+    description: str | None = None
+    location: str | None = None
+    time_min: str | None = None       # list window (ISO 8601)
+    time_max: str | None = None
+    max_results: int | None = None
 
 
 class RoutingDecision(BaseModel):
@@ -154,6 +164,9 @@ class RoutingDecision(BaseModel):
         "get_manager_changes", "search_holdings_by_cusip",
         # knowledge base (per-user own + global)
         "query_knowledge_base",
+        # google calendar (per-user)
+        "list_calendar_events", "create_calendar_event",
+        "update_calendar_event", "delete_calendar_event",
     ] | None = None
     tool_args: ToolArgs = Field(default_factory=ToolArgs)
 

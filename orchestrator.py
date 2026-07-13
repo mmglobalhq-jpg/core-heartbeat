@@ -37,6 +37,7 @@ from services.storage_sync import sync_user_vault, upload_user_file
 from tools.user_vault import USER_VAULT_TOOLS, read_note, run_vault_tool, write_note
 from tools.fund_holdings import FUND_TOOL_REGISTRY, run_fund_tool
 from tools.graphrag import GRAPHRAG_TOOL_REGISTRY, kb_configured, run_graphrag_tool
+from tools.google_calendar import CALENDAR_TOOL_REGISTRY, run_calendar_tool
 from models import (
     HistoryTurn,
     IntentPayload,
@@ -406,6 +407,21 @@ def _build_prompt(state: GraphState) -> str:
         "local_llm to compose the answer — do NOT call query_knowledge_base again, do "
         "NOT re-query with reworded terms. A single retrieval is enough; local_llm "
         "will use that context plus general knowledge to answer.\n"
+        "  Google Calendar (this user's own calendar). Use these when the user asks "
+        "about their schedule/events/meetings/appointments or wants to add, change, "
+        "or cancel something:\n"
+        "    * list_calendar_events — view events. tool_args: optional {\"time_min\", "
+        "\"time_max\"} (ISO 8601; defaults to the next 7 days), \"query\" (text "
+        "search), \"max_results\". Returns events each ending with [id: <event_id>].\n"
+        "    * create_calendar_event — add an event. tool_args: {\"summary\", "
+        "\"start\", \"end\"} (start/end ISO 8601 datetime, or YYYY-MM-DD for all-day) "
+        "plus optional \"description\", \"location\".\n"
+        "    * update_calendar_event — change an event. tool_args: {\"event_id\"} plus "
+        "the field(s) to change (summary/start/end/location/description).\n"
+        "    * delete_calendar_event — remove an event. tool_args: {\"event_id\"}.\n"
+        "    To update or delete, you usually must FIRST list_calendar_events to find "
+        "the event_id, then call update/delete with that id. Ask the user to confirm "
+        "before deleting. Use ISO 8601 for times; if a date/time is ambiguous, ask.\n"
         "- A tool result is raw DATA, not an answer. After a tool result appears in "
         "the history you MUST either issue another tool call or route to local_llm "
         "to compose the answer from it — NEVER choose finish directly after a "
@@ -1257,6 +1273,18 @@ def tool_execution(state: GraphState) -> dict:
         # (sent as X-User-Id to the KB service), never a model-supplied argument.
         user_id = state.get("user_id", SANDBOX_USER_ID)
         result, kb_sources = run_graphrag_tool(name, user_id, args)
+        content = f"[tool:{name}] {result}"
+        try:
+            dispatch_custom_event(
+                TOOL_CALL_EVENT, {"name": name, "args": args, "result": result}
+            )
+        except Exception:
+            pass
+    elif name in CALENDAR_TOOL_REGISTRY:
+        # Google Calendar tools are per-user: thread the state-resolved user_id (used
+        # to load THAT user's OAuth tokens), never a model-supplied argument.
+        user_id = state.get("user_id", SANDBOX_USER_ID)
+        result = run_calendar_tool(name, user_id, args)
         content = f"[tool:{name}] {result}"
         try:
             dispatch_custom_event(
