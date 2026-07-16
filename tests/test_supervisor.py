@@ -339,18 +339,18 @@ def test_supervisor_retrieve_first_skips_after_worker_ran(monkeypatch):
 
 
 def test_supervisor_retrieve_first_does_not_touch_tool_turns(monkeypatch):
-    # A first-step tool route (e.g. a fund tool) is untouched by retrieve-first.
+    # A first-step tool route (e.g. a vault tool) is untouched by retrieve-first.
     monkeypatch.setenv("GRAPHRAG_SERVICE_URL", "http://kb")
     monkeypatch.setattr(
         orchestrator,
         "get_client",
         lambda *a, **k: returns(parsed=RoutingDecision(
-            next_node="tool_execution", tool_name="list_funds",
+            next_node="tool_execution", tool_name="read_user_note",
         )),
     )
     update = supervisor(state())  # visited == []
     assert update["next"] == "tool_execution"
-    assert update["tool_request"]["name"] == "list_funds"
+    assert update["tool_request"]["name"] == "read_user_note"
 
 
 def test_supervisor_first_dispatch_not_guarded(monkeypatch):

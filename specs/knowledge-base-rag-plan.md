@@ -60,7 +60,7 @@ Legend: **[dep: x]** = depends on task x.
   `/api/health`. **[dep: 1.5]**
 
 ## Phase 2 — core-heartbeat: orchestrator tool + ingest routes
-- **2.1** `tools/graphrag.py` httpx client — clone `tools/fund_holdings.py:50-109` (`_transport` seam +
+- **2.1** `tools/graphrag.py` httpx client (`_transport` seam +
   retrying `_request`). Base URL `GRAPHRAG_SERVICE_URL`; `Authorization: Bearer <GRAPHRAG_API_KEY>`;
   all calls send `X-User-Id`. **[dep: 0.3]**
 - **2.2** Tool `query_knowledge_base(user_id, args)` → POST `/api/query`
@@ -81,7 +81,7 @@ Legend: **[dep: x]** = depends on task x.
   - `GET /kb/jobs/{id}` — proxy KB `/api/jobs/[id]`.
   - `GET /kb/documents` — proxy KB `/api/documents` + `X-User-Id`. **[dep: 2.1]**
 - **2.6** Env `GRAPHRAG_SERVICE_URL`, `GRAPHRAG_API_KEY` in `.env.example` (read at call time,
-  `fund_holdings.py:34-35` pattern). Unit-test tool formatter + admin gating. **[dep: 2.5]**
+  env-var pattern). Unit-test tool formatter + admin gating. **[dep: 2.5]**
 
 ## Phase 3 — core-chat: KB upload UI + management page
 - **3.1** `app/api/kb/*` proxies (`ingest`, `jobs/[id]`, `documents`) via `lib/backendProxy.ts`
@@ -89,7 +89,7 @@ Legend: **[dep: x]** = depends on task x.
 - **3.2** Reuse upload plumbing: `createDocument`/`uploadOriginal` (`lib/documents.ts`) land bytes in
   `user-docs` with `chat_id=null`, then call `/api/kb/ingest {doc_id, scope}`; poll `/api/kb/jobs`. **[dep: 3.1]**
 - **3.3** Apps sidebar "Knowledge" `<Link href="/kb">` (`components/layout/Sidebar.tsx:177-190`);
-  `app/kb/page.tsx` mirroring `app/funds/page.tsx` (list from `/api/kb/documents`, dropzone,
+  `app/kb/page.tsx` (list from `/api/kb/documents`, dropzone,
   status/delete). **[dep: 3.1]**
 - **3.4** Admin-only "Make available to everyone" toggle (reuse profiles/role check from
   `/settings/admin`) → sets `scope:"global"`; enforced server-side in 2.5. **[dep: 3.3]**

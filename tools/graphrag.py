@@ -6,8 +6,8 @@ ranked chunks + ``[doc:<id>]`` citations as compact CONTEXT — the service does
 generate an answer (retrieve_only); the orchestrator's local_llm composes the reply
 from this context alongside general knowledge and chat history.
 
-Mirrors the httpx pattern in tools/fund_holdings.py (test-injectable transport, retry
-on transient 5xx / transport errors). ``user_id`` is threaded from graph state (like
+Uses a test-injectable httpx transport and retries on transient 5xx / transport
+errors. ``user_id`` is threaded from graph state (like
 the vault tools) and sent as the ``X-User-Id`` header — never a model-supplied arg, so
 a query can't be redirected to another user's knowledge base.
 """

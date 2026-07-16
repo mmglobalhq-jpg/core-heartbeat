@@ -113,24 +113,17 @@ class ToolArgs(BaseModel):
     """Arguments for a tool call — only the field(s) the chosen tool needs are set.
 
     Kept as a fixed, typed object (rather than a free-form dict) so it maps cleanly
-    onto every provider's structured-output schema. Covers two tool families:
+    onto every provider's structured-output schema. Covers three tool families:
 
     * Vault tools: ``read_user_note(filename)``, ``search_user_vault(query)``,
       ``write_user_note(filename, content)``.
-    * Fund-holdings tools (global market data, no user identity):
-      ``get_fund_holdings(ticker)``, ``get_type_exposure(ticker)``,
-      ``get_manager_exposure(manager_name)``,
-      ``get_manager_changes(manager_name, window)``,
-      ``search_holdings_by_cusip(cusip)``.
+    * Knowledge-base tool: ``query_knowledge_base(query)``.
+    * Google Calendar tools — see the per-user fields below.
     """
 
     filename: str | None = None
     query: str | None = None
     content: str | None = None
-    ticker: str | None = None
-    manager_name: str | None = None
-    cusip: str | None = None
-    window: str | None = None
     # Google Calendar tools (per-user):
     event_id: str | None = None       # target event for update/delete
     summary: str | None = None        # event title
@@ -160,9 +153,6 @@ class RoutingDecision(BaseModel):
     tool_name: Literal[
         # vault tools (per-user)
         "read_user_note", "search_user_vault", "write_user_note",
-        # fund-holdings tools (global market data)
-        "list_funds", "get_fund_holdings", "get_type_exposure", "get_manager_exposure",
-        "get_manager_changes", "search_holdings_by_cusip",
         # knowledge base (per-user own + global)
         "query_knowledge_base",
         # google calendar (per-user)

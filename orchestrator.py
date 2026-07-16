@@ -37,7 +37,6 @@ from langgraph.graph import END, StateGraph
 from auth import SANDBOX_USER_ID
 from services.storage_sync import sync_user_vault, upload_user_file
 from tools.user_vault import USER_VAULT_TOOLS, read_note, run_vault_tool, write_note
-from tools.fund_holdings import FUND_TOOL_REGISTRY, run_fund_tool
 from tools.graphrag import GRAPHRAG_TOOL_REGISTRY, kb_configured, run_graphrag_tool
 from tools.google_calendar import CALENDAR_TOOL_REGISTRY, run_calendar_tool
 from models import (
@@ -101,9 +100,6 @@ ROUTING_JSON_SCHEMA: dict = {
             "type": ["string", "null"],
             "enum": [
                 "read_user_note", "search_user_vault", "write_user_note",
-                "list_funds", "get_fund_holdings", "get_type_exposure",
-                "get_manager_exposure", "get_manager_changes",
-                "search_holdings_by_cusip",
                 "query_knowledge_base", None,
             ],
         },
@@ -113,10 +109,6 @@ ROUTING_JSON_SCHEMA: dict = {
                 "filename": {"type": ["string", "null"]},
                 "query": {"type": ["string", "null"]},
                 "content": {"type": ["string", "null"]},
-                "ticker": {"type": ["string", "null"]},
-                "manager_name": {"type": ["string", "null"]},
-                "cusip": {"type": ["string", "null"]},
-                "window": {"type": ["string", "null"]},
             },
             "additionalProperties": False,
         },
@@ -391,7 +383,7 @@ def _build_prompt(state: GraphState) -> str:
         "Routing policy:\n"
         "- Route to local_llm to generate a conversational or reasoned reply.\n"
         "- Route to tool_execution to run a tool. You then MUST set tool_name and "
-        "tool_args (only the fields that tool needs). Two tool families:\n"
+        "tool_args (only the fields that tool needs). Three tool families:\n"
         "  Personal Markdown vault (this user's private notes):\n"
         "    * read_user_note — read one note. tool_args: {\"filename\": <path>}.\n"
         "    * search_user_vault — case-insensitive text/regex search across the "
@@ -400,24 +392,6 @@ def _build_prompt(state: GraphState) -> str:
         "{\"filename\": <path>, \"content\": <text>}.\n"
         "  The vault tools are already scoped to THIS user — never put a user id "
         "or absolute/`..` path in a filename.\n"
-        "  Fixed-income fund holdings (shared market data on 28 tracked bond funds "
-        "from J.P. Morgan, AllSpring, Victory Capital). Use these for any question "
-        "about fund holdings, positions, security-type exposure, CUSIPs, or what a "
-        "fund/manager has been buying or selling:\n"
-        "    * list_funds — list the tracked funds (which funds/managers are "
-        "covered). Optional tool_args: {\"manager_name\": <e.g. JPMorgan>} to "
-        "filter to one manager.\n"
-        "    * get_fund_holdings — a fund's current top holdings. tool_args: "
-        "{\"ticker\": <fund ticker, e.g. JMTG>}.\n"
-        "    * get_type_exposure — one fund's par by security type (MBS/CMO/UST/…). "
-        "tool_args: {\"ticker\": <ticker>}.\n"
-        "    * get_manager_exposure — a manager's aggregate exposure by security "
-        "type. tool_args: {\"manager_name\": <e.g. JPMorgan>}.\n"
-        "    * get_manager_changes — what a manager has been buying/selling over a "
-        "window. tool_args: {\"manager_name\": <name>, \"window\": one of "
-        "1D|7D|30D|1Y (default 30D)}.\n"
-        "    * search_holdings_by_cusip — which funds hold a CUSIP. tool_args: "
-        "{\"cusip\": <9-char CUSIP>}.\n"
         "  Personal knowledge base (this user's saved documents plus shared/global "
         "docs — their \"core knowledge\" that persists across all chats):\n"
         "    * query_knowledge_base — semantic search over the user's knowledge base. "
@@ -1082,7 +1056,7 @@ def supervisor(state: GraphState) -> dict:
     # query_knowledge_base call built from the user's input. The retrieve-once guard
     # then blocks a second query, and once the result is in messages this is false so
     # local_llm composes normally. Gated on the KB being configured so it never fires
-    # in tests / KB-less deploys; tool turns (fund/vault) route to tool_execution not
+    # in tests / KB-less deploys; tool turns (vault) route to tool_execution not
     # local_llm, so they are untouched.
     forced_kb_query: str | None = None
     raw = (getattr(state["intent"], "raw_input", "") or "").strip()
@@ -1291,18 +1265,7 @@ def tool_execution(state: GraphState) -> dict:
     name = request.get("name") if isinstance(request, dict) else None
     args = (request.get("args") or {}) if isinstance(request, dict) else {}
     kb_sources: list[str] | None = None  # set by the KB tool, for the answer's citation
-    if name in FUND_TOOL_REGISTRY:
-        # Fund-holdings tools query GLOBAL market data — no user_id is passed
-        # (there is no per-user boundary, unlike the vault tools below).
-        result = run_fund_tool(name, args)
-        content = f"[tool:{name}] {result}"
-        try:
-            dispatch_custom_event(
-                TOOL_CALL_EVENT, {"name": name, "args": args, "result": result}
-            )
-        except Exception:
-            pass
-    elif name in GRAPHRAG_TOOL_REGISTRY:
+    if name in GRAPHRAG_TOOL_REGISTRY:
         # KB tools are per-user (own + global): thread the state-resolved user_id
         # (sent as X-User-Id to the KB service), never a model-supplied argument.
         user_id = state.get("user_id", SANDBOX_USER_ID)
