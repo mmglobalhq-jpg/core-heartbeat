@@ -1,12 +1,13 @@
 """End-to-end: the Supervisor tool loop runs a REIT tool and surfaces it.
 
 A scripted supervisor client (no routing network) emits a real get_latest_reit_report
-call; a MockTransport stands in for the ARR engine's PostgREST. We verify the graph
-routes into tool_execution, runs the tool globally (user_id threaded but not leaked
-into args), and surfaces the call on both the non-streaming outcome and the SSE
+call; a MockTransport stands in for the ARR engine's reader-contract RPCs. We verify the
+graph routes into tool_execution, runs the tool globally (user_id threaded but not
+leaked into args), and surfaces the call on both the non-streaming outcome and the SSE
 ``tool_call`` event.
 """
 import asyncio
+import json
 
 import httpx
 
@@ -15,19 +16,22 @@ import services.storage_sync as storage_sync
 import tools.reit_research as reit
 from models import IntentPayload, RoutingDecision, ToolArgs
 
-REPORTS = [{"id": "rep-a", "issuer_code": "ARR", "portfolio_as_of_date": "2026-05-31", "current_version_id": "v-a", "status": "completed"}]
-VERSIONS = [{"id": "v-a", "headline": "ARR adds $466mm in May", "version": 1, "source_document_id": "d-a", "status": "completed", "markdown": "# Exec summary\n\nGrew $466mm."}]
-DOCS = [{"id": "d-a", "publication_date": "2026-06-12"}]
+ARR_ID = "arr:aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+_SUMMARY = {"report_id": ARR_ID, "issuer_code": "ARR", "issuer_name": "ARMOUR Residential REIT",
+            "portfolio_as_of_date": "2026-05-31", "publication_date": "2026-06-12",
+            "title": "ARR adds $466mm in May", "version": 1, "status": "completed"}
+_DETAIL = {**_SUMMARY, "markdown": "# Exec summary\n\nGrew $466mm."}
 
 
-def _postgrest(request: httpx.Request) -> httpx.Response:
+def _rpc(request: httpx.Request) -> httpx.Response:
     path = request.url.path
-    if path.endswith("/reit_arr_reports"):
-        return httpx.Response(200, json=REPORTS)
-    if path.endswith("/reit_arr_report_versions"):
-        return httpx.Response(200, json=VERSIONS)
-    if path.endswith("/reit_arr_source_documents"):
-        return httpx.Response(200, json=DOCS)
+    body = json.loads(request.content or b"{}")
+    if path.endswith("/rpc/reit_research_list_reports_v1"):
+        rows = [_SUMMARY] if (body.get("p_issuer_code") or "").upper() == "ARR" else []
+        return httpx.Response(200, json=rows)
+    if path.endswith("/rpc/reit_research_get_report_v1"):
+        rows = [_DETAIL] if body.get("p_report_id") == ARR_ID else []
+        return httpx.Response(200, json=rows)
     return httpx.Response(404, json=[])
 
 
@@ -56,7 +60,7 @@ def _setup(monkeypatch, tmp_path):
     # REIT service credentials + mock transport.
     monkeypatch.setenv("REITS_SUPABASE_URL", "http://reits.local")
     monkeypatch.setenv("REITS_SUPABASE_SERVICE_ROLE_KEY", "svc")
-    monkeypatch.setattr(reit, "_transport", httpx.MockTransport(_postgrest))
+    monkeypatch.setattr(reit, "_transport", httpx.MockTransport(_rpc))
     # Keep any vault sync off real directories.
     monkeypatch.setenv(storage_sync.VAULT_SYNC_ROOT_ENV, str(tmp_path / "vaults"))
     monkeypatch.setenv(storage_sync.VAULT_MOCK_ROOT_ENV, str(tmp_path / "mock"))
@@ -83,7 +87,7 @@ def test_reit_tool_runs_and_surfaces_on_outcome(monkeypatch, tmp_path):
     assert "tool_execution" in outcome.nodes_executed
     tool_msgs = [m for m in outcome.messages if m.source == "tool_execution"]
     assert tool_msgs and tool_msgs[0].content.startswith("[tool:get_latest_reit_report]")
-    assert "Report ID: rep-a" in tool_msgs[0].content
+    assert f"Report ID: {ARR_ID}" in tool_msgs[0].content
     assert "# Exec summary" in tool_msgs[0].content
 
 
@@ -99,4 +103,4 @@ def test_reit_tool_call_surfaces_as_stream_event(monkeypatch, tmp_path):
     call = tool_calls[0]
     assert call["name"] == "get_latest_reit_report"
     assert call["args"] == {"reit_symbol": "ARR"}  # user_id never leaks into args
-    assert "Report ID: rep-a" in call["result"]
+    assert f"Report ID: {ARR_ID}" in call["result"]

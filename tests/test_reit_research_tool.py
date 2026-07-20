@@ -1,76 +1,104 @@
 """Unit tests for the read-only REIT report tools (tools/reit_research.py).
 
-No live service: a MockTransport emulates the ARR engine's PostgREST endpoints over
-an in-memory dataset that honors the status/issuer/id/order/limit filters the tools
-send. Covers listing, detail, latest, alias normalization, invalid input, result
-limits, output cap + truncation marker, exclusion of superseded/draft reports, and
-that the service-role key never leaks into output or errors.
+No live service: a MockTransport emulates the ARR engine's **reader-contract RPCs**
+(reit_research_list_issuers_v1 / _list_reports_v1 / _get_report_v1) over an in-memory
+dataset of already-publishable rows (the contract does completed/current filtering
+server-side). Covers listing, detail, latest, alias normalization (ARR + ORC),
+namespaced ids, legacy bare ARR UUIDs, colliding UUIDs across issuers, malformed ids,
+result limits, output cap + truncation marker, and that the service-role key never
+leaks into output or errors. The module names no issuer-specific table.
 """
 import httpx
 import pytest
 
 import tools.reit_research as reit
 
-# --- in-memory dataset ------------------------------------------------------
-# rep-c's current version is superseded (excluded); rep-gen is still generating.
-REPORTS = [
-    {"id": "rep-a", "issuer_code": "ARR", "portfolio_as_of_date": "2026-05-31", "current_version_id": "v-a", "status": "completed"},
-    {"id": "rep-b", "issuer_code": "ARR", "portfolio_as_of_date": "2026-04-30", "current_version_id": "v-b", "status": "completed"},
-    {"id": "rep-c", "issuer_code": "ARR", "portfolio_as_of_date": "2026-03-31", "current_version_id": "v-c", "status": "completed"},
-    {"id": "rep-gen", "issuer_code": "ARR", "portfolio_as_of_date": "2026-02-28", "current_version_id": "v-gen", "status": "generating"},
-    {"id": "rep-x", "issuer_code": "XYZ", "portfolio_as_of_date": "2026-05-31", "current_version_id": "v-x", "status": "completed"},
+# A UUID deliberately shared by an ARR report and an ORC report (namespacing must
+# disambiguate). Distinct UUIDs for the other rows.
+UUID_A = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+UUID_B = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"
+UUID_EXCLUDED = "cccccccc-cccc-cccc-cccc-cccccccccccc"  # superseded/non-current upstream
+
+ARR_A = f"arr:{UUID_A}"
+ARR_B = f"arr:{UUID_B}"
+ORC_A = f"orc:{UUID_A}"
+
+# Rows exactly as the reader RPCs return them (already completed/current + namespaced).
+_PUBLISHABLE = [
+    {"report_id": ARR_A, "issuer_code": "ARR", "issuer_name": "ARMOUR Residential REIT",
+     "portfolio_as_of_date": "2026-05-31", "publication_date": "2026-06-12",
+     "title": "ARR adds $466mm to portfolio in May", "version": 1, "status": "completed",
+     "markdown": "# Exec summary\n\nThe portfolio grew by $466mm in May."},
+    {"report_id": ARR_B, "issuer_code": "ARR", "issuer_name": "ARMOUR Residential REIT",
+     "portfolio_as_of_date": "2026-04-30", "publication_date": "2026-05-14",
+     "title": None, "version": 1, "status": "completed", "markdown": "# April body"},
+    {"report_id": ORC_A, "issuer_code": "ORC", "issuer_name": "Orchid Island Capital, Inc.",
+     "portfolio_as_of_date": "2026-04-30", "publication_date": "2026-05-03",
+     "title": "Orchid Island Capital, Inc. (ORC) — RMBS as of April 30, 2026",
+     "version": 1, "status": "completed", "markdown": "# ORC body"},
 ]
-VERSIONS = [
-    {"id": "v-a", "headline": "ARR adds $466mm to portfolio in May", "version": 1, "source_document_id": "d-a", "status": "completed", "markdown": "# Exec summary\n\nThe portfolio grew by $466mm in May."},
-    {"id": "v-b", "headline": None, "version": 1, "source_document_id": "d-b", "status": "completed", "markdown": "# April body"},
-    {"id": "v-c", "headline": "OLD SUPERSEDED", "version": 2, "source_document_id": "d-c", "status": "superseded", "markdown": "old body"},
-    {"id": "v-gen", "headline": "GENERATING", "version": 1, "source_document_id": "d-gen", "status": "generating", "markdown": "draft"},
-    {"id": "v-x", "headline": "XYZ Q1 report", "version": 1, "source_document_id": "d-x", "status": "completed", "markdown": "# XYZ body"},
-]
-DOCS = [
-    {"id": "d-a", "publication_date": "2026-06-12"},
-    {"id": "d-b", "publication_date": "2026-05-14"},
-    {"id": "d-c", "publication_date": "2026-04-15"},
-    {"id": "d-x", "publication_date": "2026-06-10"},
-]
 
 
-def _apply(rows, params):
-    out = list(rows)
-    status = params.get("status")
-    if status and status.startswith("eq."):
-        out = [r for r in out if r.get("status") == status[3:]]
-    for col in ("issuer_code", "id"):
-        val = params.get(col)
-        if not val:
-            continue
-        if val.startswith("eq."):
-            out = [r for r in out if r.get(col) == val[3:]]
-        elif val.startswith("in.("):
-            ids = val[len("in.("):-1].split(",")
-            out = [r for r in out if r.get(col) in ids]
-    order = params.get("order", "")
-    if order.startswith("portfolio_as_of_date.desc"):
-        out = sorted(out, key=lambda r: r.get("portfolio_as_of_date") or "", reverse=True)
-    limit = params.get("limit")
-    if limit:
-        out = out[: int(limit)]
-    return out
+def _summary(row):
+    return {k: v for k, v in row.items() if k != "markdown"}
 
 
-def _postgrest(request: httpx.Request) -> httpx.Response:
+def _list_issuers():
+    agg = {}
+    for r in _PUBLISHABLE:
+        a = agg.setdefault(r["issuer_code"], {
+            "issuer_code": r["issuer_code"], "issuer_name": r["issuer_name"],
+            "report_count": 0, "latest_portfolio_as_of_date": None,
+            "latest_publication_date": None,
+        })
+        a["report_count"] += 1
+        if (a["latest_portfolio_as_of_date"] or "") < r["portfolio_as_of_date"]:
+            a["latest_portfolio_as_of_date"] = r["portfolio_as_of_date"]
+        if (a["latest_publication_date"] or "") < (r["publication_date"] or ""):
+            a["latest_publication_date"] = r["publication_date"]
+    return list(agg.values())
+
+
+def _list_reports(code, limit):
+    lim = max(1, min(int(limit or 20), 100))
+    rows = [_summary(r) for r in _PUBLISHABLE if r["issuer_code"] == (code or "").upper()]
+    rows.sort(key=lambda r: (r["portfolio_as_of_date"], r["publication_date"] or "",
+                             r["report_id"]), reverse=True)
+    return rows[:lim]
+
+
+def _get_report(rid):
+    low = (rid or "").lower()
+    if low.startswith("arr:"):
+        issuer, uuid = "ARR", low[4:]
+    elif low.startswith("orc:"):
+        issuer, uuid = "ORC", low[4:]
+    elif ":" not in low:
+        issuer, uuid = "ARR", low  # bare UUID -> legacy ARR only
+    else:
+        return []
+    for r in _PUBLISHABLE:
+        if r["issuer_code"] == issuer and r["report_id"].split(":", 1)[1] == uuid:
+            return [r]
+    return []
+
+
+def _rpc_handler(request: httpx.Request) -> httpx.Response:
+    import json
+
     path = request.url.path
-    params = request.url.params
-    if path.endswith("/reit_arr_reports"):
-        return httpx.Response(200, json=_apply(REPORTS, params))
-    if path.endswith("/reit_arr_report_versions"):
-        return httpx.Response(200, json=_apply(VERSIONS, params))
-    if path.endswith("/reit_arr_source_documents"):
-        return httpx.Response(200, json=_apply(DOCS, params))
+    body = json.loads(request.content or b"{}")
+    if path.endswith("/rpc/reit_research_list_issuers_v1"):
+        return httpx.Response(200, json=_list_issuers())
+    if path.endswith("/rpc/reit_research_list_reports_v1"):
+        return httpx.Response(200, json=_list_reports(body.get("p_issuer_code"),
+                                                       body.get("p_limit")))
+    if path.endswith("/rpc/reit_research_get_report_v1"):
+        return httpx.Response(200, json=_get_report(body.get("p_report_id")))
     return httpx.Response(404, json=[])
 
 
-def _install(monkeypatch, handler=_postgrest, *, secret="svc-secret"):
+def _install(monkeypatch, handler=_rpc_handler, *, secret="svc-secret"):
     monkeypatch.setenv("REITS_SUPABASE_URL", "http://reits.local")
     monkeypatch.setenv("REITS_SUPABASE_SERVICE_ROLE_KEY", secret)
     monkeypatch.setattr(reit, "_transport", httpx.MockTransport(handler))
@@ -95,14 +123,25 @@ def test_unknown_tool_name():
     assert "unknown tool" in reit.run_reit_tool("nope", "u1", {})
 
 
+# --- module hides issuer-specific schema ------------------------------------
+
+def test_module_names_no_issuer_specific_tables():
+    import inspect
+
+    src = inspect.getsource(reit)
+    assert "reit_arr_" not in src
+    assert "reit_orc_" not in src
+
+
 # --- list_reit_issuers ------------------------------------------------------
 
-def test_list_issuers_is_data_driven(monkeypatch):
+def test_list_issuers_shows_both_issuers(monkeypatch):
     _install(monkeypatch)
     out = reit.run_reit_tool("list_reit_issuers", "u1", {})
     assert "ARMOUR Residential REIT (ARR)" in out
-    assert "XYZ (XYZ)" in out  # unknown code -> name falls back to the code
-    assert "3 reports" in out  # rep-a/b/c completed; rep-gen (generating) excluded
+    assert "Orchid Island Capital, Inc. (ORC)" in out
+    assert "2 reports" in out  # ARR: A + B
+    assert "1 report" in out and "1 reports" not in out  # ORC: exactly one
     assert "latest 2026-05-31" in out
 
 
@@ -111,19 +150,27 @@ def test_list_issuers_is_data_driven(monkeypatch):
 def test_list_reports_newest_first_metadata_only(monkeypatch):
     _install(monkeypatch)
     out = reit.run_reit_tool("list_reit_reports", "u1", {"reit_symbol": "ARR"})
-    assert out.index("[rep-a]") < out.index("[rep-b]")           # newest first
-    assert "[rep-c]" not in out and "SUPERSEDED" not in out       # superseded excluded
-    assert "[rep-gen]" not in out                                 # generating excluded
-    assert "# Exec summary" not in out                            # no body in a list
+    assert out.index(f"[{ARR_A}]") < out.index(f"[{ARR_B}]")   # newest first
+    assert "# Exec summary" not in out                         # no body in a list
     assert "ARMOUR Residential REIT — April 2026 Monthly Report" in out  # fallback title
     assert "published 2026-06-12" in out
+
+
+def test_list_reports_orc_newest_first(monkeypatch):
+    _install(monkeypatch)
+    out = reit.run_reit_tool("list_reit_reports", "u1", {"reit_symbol": "Orchid"})
+    assert f"[{ORC_A}]" in out
+    assert "Orchid Island Capital, Inc. (ORC)" in out
 
 
 def test_list_reports_alias_normalization(monkeypatch):
     _install(monkeypatch)
     for alias in ("ARMOUR", "armour residential reit", "arr"):
-        out = reit.run_reit_tool("list_reit_reports", "u1", {"reit_symbol": alias})
-        assert "[rep-a]" in out
+        assert f"[{ARR_A}]" in reit.run_reit_tool("list_reit_reports", "u1",
+                                                  {"reit_symbol": alias})
+    for alias in ("ORC", "Orchid", "orchid island", "Orchid Island Capital, Inc."):
+        assert f"[{ORC_A}]" in reit.run_reit_tool("list_reit_reports", "u1",
+                                                  {"reit_symbol": alias})
 
 
 def test_list_reports_invalid_symbol(monkeypatch):
@@ -146,26 +193,48 @@ def test_list_reports_empty_for_unknown_issuer(monkeypatch):
 
 # --- get_reit_report --------------------------------------------------------
 
-def test_get_report_labeled_sections_and_body(monkeypatch):
+def test_get_report_namespaced_arr(monkeypatch):
     _install(monkeypatch)
-    out = reit.run_reit_tool("get_reit_report", "u1", {"report_id": "rep-a"})
+    out = reit.run_reit_tool("get_reit_report", "u1", {"report_id": ARR_A})
     assert "Issuer: ARMOUR Residential REIT (ARR)" in out
-    assert "Report ID: rep-a" in out
-    assert "Version: 1" in out
-    assert "Publication date: 2026-06-12" in out
+    assert f"Report ID: {ARR_A}" in out
     assert "Report:\n# Exec summary" in out
 
 
-def test_get_report_superseded_current_is_not_found(monkeypatch):
+def test_get_report_namespaced_orc(monkeypatch):
     _install(monkeypatch)
-    out = reit.run_reit_tool("get_reit_report", "u1", {"report_id": "rep-c"})
-    assert "No completed report found with id rep-c" in out
+    out = reit.run_reit_tool("get_reit_report", "u1", {"report_id": ORC_A})
+    assert "Issuer: Orchid Island Capital, Inc. (ORC)" in out
+    assert "Report:\n# ORC body" in out
 
 
-def test_get_report_unknown_and_missing_id(monkeypatch):
+def test_get_report_colliding_uuid_disambiguated_by_namespace(monkeypatch):
     _install(monkeypatch)
-    assert "No completed report found" in reit.run_reit_tool("get_reit_report", "u1", {"report_id": "nope"})
+    arr = reit.run_reit_tool("get_reit_report", "u1", {"report_id": ARR_A})
+    orc = reit.run_reit_tool("get_reit_report", "u1", {"report_id": ORC_A})
+    assert "# Exec summary" in arr and "# ORC body" not in arr
+    assert "# ORC body" in orc and "# Exec summary" not in orc
+
+
+def test_get_report_bare_uuid_is_legacy_arr(monkeypatch):
+    _install(monkeypatch)
+    out = reit.run_reit_tool("get_reit_report", "u1", {"report_id": UUID_A})
+    assert "Issuer: ARMOUR Residential REIT (ARR)" in out  # never ORC
+    assert "# Exec summary" in out
+
+
+def test_get_report_malformed_and_missing_id(monkeypatch):
+    _install(monkeypatch)
+    for bad in ("nope", "xyz:" + UUID_A, "arr:not-a-uuid", "'; DROP"):
+        out = reit.run_reit_tool("get_reit_report", "u1", {"report_id": bad})
+        assert out.startswith("error:") and "unrecognized report id" in out
     assert reit.run_reit_tool("get_reit_report", "u1", {}).startswith("error:")
+
+
+def test_get_report_excluded_id_not_found(monkeypatch):
+    _install(monkeypatch)
+    out = reit.run_reit_tool("get_reit_report", "u1", {"report_id": f"arr:{UUID_EXCLUDED}"})
+    assert "No completed report found" in out
 
 
 # --- get_latest_reit_report -------------------------------------------------
@@ -173,7 +242,13 @@ def test_get_report_unknown_and_missing_id(monkeypatch):
 def test_get_latest_returns_newest(monkeypatch):
     _install(monkeypatch)
     out = reit.run_reit_tool("get_latest_reit_report", "u1", {"reit_symbol": "ARR"})
-    assert "Report ID: rep-a" in out and "# Exec summary" in out
+    assert f"Report ID: {ARR_A}" in out and "# Exec summary" in out
+
+
+def test_get_latest_orc(monkeypatch):
+    _install(monkeypatch)
+    out = reit.run_reit_tool("get_latest_reit_report", "u1", {"reit_symbol": "Orchid Island"})
+    assert f"Report ID: {ORC_A}" in out and "# ORC body" in out
 
 
 def test_get_latest_unknown_issuer(monkeypatch):
@@ -188,9 +263,8 @@ def test_get_latest_unknown_issuer(monkeypatch):
 def test_report_body_is_capped_with_explicit_marker(monkeypatch):
     _install(monkeypatch)
     monkeypatch.setenv("REITS_REPORT_MAX_CHARS", "20")
-    out = reit.run_reit_tool("get_reit_report", "u1", {"report_id": "rep-a"})
+    out = reit.run_reit_tool("get_reit_report", "u1", {"report_id": ARR_A})
     assert "report truncated at 20 characters" in out
-    # Body is cut to the cap (the full sentence must not survive).
     assert "The portfolio grew by $466mm" not in out
 
 

@@ -100,6 +100,57 @@ def test_reit_tool_result_routes_to_local_llm_not_finish(monkeypatch):
     assert update["next"] == "local_llm"
 
 
+# --- ORC (Orchid) routing ---------------------------------------------------
+
+def test_orc_latest_wording_routes_to_get_latest(monkeypatch):
+    _install(monkeypatch, RoutingDecision(
+        next_node="tool_execution", tool_name="get_latest_reit_report",
+        tool_args=ToolArgs(reit_symbol="ORC"),
+    ))
+    update = supervisor(_state(raw="What is the latest ORC report?"))
+    assert update["tool_request"]["name"] == "get_latest_reit_report"
+    assert update["tool_request"]["args"] == {"reit_symbol": "ORC"}
+
+
+def test_orchid_wording_routes_to_list(monkeypatch):
+    _install(monkeypatch, RoutingDecision(
+        next_node="tool_execution", tool_name="list_reit_reports",
+        tool_args=ToolArgs(reit_symbol="Orchid Island"),
+    ))
+    update = supervisor(_state(raw="Show me Orchid Island's reports."))
+    assert update["tool_request"]["name"] == "list_reit_reports"
+
+
+def test_orc_namespaced_id_routes_to_get_report(monkeypatch):
+    rid = "orc:aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+    _install(monkeypatch, RoutingDecision(
+        next_node="tool_execution", tool_name="get_reit_report",
+        tool_args=ToolArgs(report_id=rid),
+    ))
+    update = supervisor(_state(raw=f"Get report {rid}."))
+    assert update["tool_request"]["name"] == "get_reit_report"
+    assert update["tool_request"]["args"] == {"report_id": rid}
+
+
+def test_orchid_question_exempt_from_forced_kb(monkeypatch):
+    # An Orchid/ORC reference must be exempt from the forced generic-KB retrieval.
+    monkeypatch.setenv("GRAPHRAG_SERVICE_URL", "http://kb")
+    _install(monkeypatch, RoutingDecision(next_node="local_llm"))
+    for q in ("What changed in Orchid Island Capital's RMBS portfolio?",
+              "latest ORC report"):
+        update = supervisor(_state(raw=q))
+        assert update["next"] == "local_llm"
+        assert update.get("tool_request") is None
+
+
+def test_looks_like_reit_reference_matches_orc_terms():
+    from tools.reit_research import looks_like_reit_reference
+
+    for q in ("latest ORC report", "Orchid Island Capital", "what did ARMOUR do"):
+        assert looks_like_reit_reference(q)
+    assert not looks_like_reit_reference("how do I roast a chicken?")
+
+
 # --- schema parity ----------------------------------------------------------
 
 REIT_NAMES = {"list_reit_issuers", "list_reit_reports", "get_reit_report", "get_latest_reit_report"}
