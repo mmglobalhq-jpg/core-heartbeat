@@ -39,6 +39,11 @@ from services.storage_sync import sync_user_vault, upload_user_file
 from tools.user_vault import USER_VAULT_TOOLS, read_note, run_vault_tool, write_note
 from tools.graphrag import GRAPHRAG_TOOL_REGISTRY, kb_configured, run_graphrag_tool
 from tools.google_calendar import CALENDAR_TOOL_REGISTRY, run_calendar_tool
+from tools.reit_research import (
+    REIT_TOOL_REGISTRY,
+    looks_like_reit_reference,
+    run_reit_tool,
+)
 from models import (
     HistoryTurn,
     IntentPayload,
@@ -100,7 +105,10 @@ ROUTING_JSON_SCHEMA: dict = {
             "type": ["string", "null"],
             "enum": [
                 "read_user_note", "search_user_vault", "write_user_note",
-                "query_knowledge_base", None,
+                "query_knowledge_base",
+                "list_reit_issuers", "list_reit_reports",
+                "get_reit_report", "get_latest_reit_report",
+                None,
             ],
         },
         "tool_args": {
@@ -109,6 +117,9 @@ ROUTING_JSON_SCHEMA: dict = {
                 "filename": {"type": ["string", "null"]},
                 "query": {"type": ["string", "null"]},
                 "content": {"type": ["string", "null"]},
+                "reit_symbol": {"type": ["string", "null"]},
+                "report_id": {"type": ["string", "null"]},
+                "limit": {"type": ["integer", "null"]},
             },
             "additionalProperties": False,
         },
@@ -428,6 +439,22 @@ def _build_prompt(state: GraphState) -> str:
         "datetimes (e.g. 2026-07-20T09:00:00 — NO timezone offset/Z); the calendar "
         "applies the user's timezone and DST. Resolve dates against the current "
         "date/time given below. If a date/time is genuinely ambiguous, ask.\n"
+        "  REIT research reports (read-only). Use these — NOT query_knowledge_base — "
+        "for any question about a REIT's research reports (what changed, summaries, "
+        "which reports exist). \"ARR\", \"ARMOUR\", and \"ARMOUR Residential REIT\" all "
+        "mean the same issuer (symbol ARR):\n"
+        "    * list_reit_issuers — which REITs are covered. tool_args: {} (none).\n"
+        "    * list_reit_reports — the reports that exist for a REIT (metadata only, "
+        "newest first). Use for \"what reports are available\" or an ambiguous period. "
+        "tool_args: {\"reit_symbol\": <e.g. ARR>, optional \"limit\"}. Each line begins "
+        "with the report's [id].\n"
+        "    * get_latest_reit_report — the newest/current/most-recent report for a "
+        "REIT. Use for \"latest\", \"current\", \"most recent\", or \"summarize ARR's "
+        "monthly report\". tool_args: {\"reit_symbol\": <e.g. ARR>}.\n"
+        "    * get_reit_report — a specific report when you already have its id. "
+        "tool_args: {\"report_id\": <id from list_reit_reports>}.\n"
+        "    Do NOT claim a report exists unless a tool returned it, and never generate "
+        "or alter a report — these tools only read.\n"
         "- A tool result is raw DATA, not an answer. After a tool result appears in "
         "the history you MUST either issue another tool call or route to local_llm "
         "to compose the answer from it — NEVER choose finish directly after a "
@@ -1068,6 +1095,11 @@ def supervisor(state: GraphState) -> dict:
         # Skip the embed+search+rerank on pure greetings/pleasantries — they never
         # need the KB, and forcing it there just adds latency to a trivial reply.
         and not _is_trivial_turn(raw)
+        # A clear REIT-report question belongs to the dedicated REIT tools, not the
+        # generic KB. Don't preempt it with a forced query_knowledge_base retrieval
+        # (the prompt steers the model to a REIT tool; this is the deterministic
+        # backstop for the case where it routed straight to local_llm).
+        and not looks_like_reit_reference(raw)
     ):
         if raw:
             forced_kb_query = raw
@@ -1282,6 +1314,18 @@ def tool_execution(state: GraphState) -> dict:
         # to load THAT user's OAuth tokens), never a model-supplied argument.
         user_id = state.get("user_id", SANDBOX_USER_ID)
         result = run_calendar_tool(name, user_id, args)
+        content = f"[tool:{name}] {result}"
+        try:
+            dispatch_custom_event(
+                TOOL_CALL_EVENT, {"name": name, "args": args, "result": result}
+            )
+        except Exception:
+            pass
+    elif name in REIT_TOOL_REGISTRY:
+        # REIT report tools are read-only and global (not per-user); user_id is
+        # threaded for a uniform signature. run_reit_tool never raises.
+        user_id = state.get("user_id", SANDBOX_USER_ID)
+        result = run_reit_tool(name, user_id, args)
         content = f"[tool:{name}] {result}"
         try:
             dispatch_custom_event(
