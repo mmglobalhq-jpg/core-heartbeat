@@ -41,7 +41,7 @@ REITS_REPORT_MAX_CHARS_ENV = "REITS_REPORT_MAX_CHARS"
 REQUEST_TIMEOUT_S = 20.0
 DEFAULT_REPORT_MAX_CHARS = 50_000
 DEFAULT_LIST_LIMIT = 50
-MAX_LIST_LIMIT = 100  # matches the reader contract's server-side clamp
+MAX_LIST_LIMIT = 250  # matches the reader contract's server-side clamp (migration 0006)
 
 # Reader-contract RPC names (versioned). The names are constants — never derived from
 # user input — so a caller can never select a different function.

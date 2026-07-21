@@ -60,7 +60,7 @@ def _list_issuers():
 
 
 def _list_reports(code, limit):
-    lim = max(1, min(int(limit or 20), 100))
+    lim = max(1, min(int(limit or 20), 250))  # reader contract clamp (migration 0006)
     rows = [_summary(r) for r in _PUBLISHABLE if r["issuer_code"] == (code or "").upper()]
     rows.sort(key=lambda r: (r["portfolio_as_of_date"], r["publication_date"] or "",
                              r["report_id"]), reverse=True)
