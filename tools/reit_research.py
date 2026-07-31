@@ -179,12 +179,22 @@ def _sb_url() -> str:
 
 
 def _sb_headers() -> dict[str, str]:
+    """Headers for a REITS reader-contract RPC call.
+
+    The configured server key is sent ONLY in ``apikey``. It is deliberately NOT
+    duplicated into ``Authorization: Bearer`` — the current Supabase secret keys
+    (``sb_secret_*``) are opaque, not JWTs, and a raw request that puts one in
+    ``Authorization`` may be rejected as an invalid JWT. ``apikey`` alone resolves
+    the role for both the legacy JWT service-role key and a new secret key, so this
+    form works before, during, and after rotation.
+
+    The key is never logged; it exists only in the returned mapping.
+    """
     key = os.environ.get(REITS_SERVICE_ROLE_ENV)
     if not key:
         raise ReitError(f"{REITS_SERVICE_ROLE_ENV} is not set")
     return {
         "apikey": key,
-        "Authorization": f"Bearer {key}",
         "Accept": "application/json",
         "Content-Type": "application/json",
     }

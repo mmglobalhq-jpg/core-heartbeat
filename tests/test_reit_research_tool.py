@@ -278,3 +278,89 @@ def test_service_role_key_never_appears_in_errors(monkeypatch):
     out = reit.run_reit_tool("list_reit_issuers", "u1", {})
     assert out.startswith("error:")
     assert "TOP-SECRET-KEY" not in out
+
+
+# --- auth header contract (sb_secret_* compatibility) ------------------------
+# Supabase secret keys (sb_secret_*) are OPAQUE, not JWTs: they go in `apikey`
+# only. Duplicating one into `Authorization: Bearer` can be rejected as an invalid
+# JWT, so these pin the header shape for every reader-contract RPC.
+
+_SYNTHETIC_KEY = "sb_secret_test_value"  # opaque + synthetic; never a real key
+
+
+def _capture_headers(monkeypatch, *, secret=_SYNTHETIC_KEY):
+    """Run each approved RPC and return the captured request headers/paths."""
+    seen: list[httpx.Headers] = []
+    paths: list[str] = []
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request.headers)
+        paths.append(request.url.path)
+        return _rpc_handler(request)
+
+    _install(monkeypatch, _handler, secret=secret)
+    return seen, paths
+
+
+def test_apikey_header_is_sent(monkeypatch):
+    seen, _ = _capture_headers(monkeypatch)
+    reit.run_reit_tool("list_reit_issuers", "u1", {})
+    assert seen, "expected at least one request"
+    assert seen[0].get("apikey") == _SYNTHETIC_KEY
+
+
+def test_authorization_header_is_absent(monkeypatch):
+    seen, _ = _capture_headers(monkeypatch)
+    reit.run_reit_tool("list_reit_issuers", "u1", {})
+    assert "authorization" not in seen[0]  # httpx.Headers is case-insensitive
+
+
+def test_opaque_key_is_passed_through_unparsed(monkeypatch):
+    # The key must never be decoded, split, or validated as a JWT: an opaque
+    # sb_secret_* value has to reach the wire byte-for-byte.
+    seen, _ = _capture_headers(monkeypatch)
+    out = reit.run_reit_tool("list_reit_issuers", "u1", {})
+    assert not out.startswith("error:")
+    assert seen[0]["apikey"] == _SYNTHETIC_KEY
+
+
+@pytest.mark.parametrize(
+    ("tool", "args", "rpc_path"),
+    [
+        ("list_reit_issuers", {}, "/rest/v1/rpc/reit_research_list_issuers_v1"),
+        ("list_reit_reports", {"reit_symbol": "ARR"}, "/rest/v1/rpc/reit_research_list_reports_v1"),
+        ("get_reit_report", {"report_id": ARR_A}, "/rest/v1/rpc/reit_research_get_report_v1"),
+    ],
+)
+def test_all_approved_rpcs_keep_the_same_request_contract(monkeypatch, tool, args, rpc_path):
+    seen, paths = _capture_headers(monkeypatch)
+    out = reit.run_reit_tool(tool, "u1", args)
+    assert not out.startswith("error:")
+    assert rpc_path in paths
+    for h in seen:
+        assert h.get("apikey") == _SYNTHETIC_KEY
+        assert "authorization" not in h
+        assert h.get("content-type") == "application/json"
+        assert h.get("accept") == "application/json"
+
+
+def test_opaque_key_never_leaks_from_a_failing_rpc(monkeypatch):
+    def _boom(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(500, json={"message": "internal"})
+
+    _install(monkeypatch, _boom, secret=_SYNTHETIC_KEY)
+    out = reit.run_reit_tool("list_reit_issuers", "u1", {})
+    assert out.startswith("error:")
+    assert _SYNTHETIC_KEY not in out
+
+
+def test_credentials_come_only_from_the_process_environment(monkeypatch):
+    # No test may reach a real env file. Credentials resolve from os.environ only,
+    # so clearing them must fail closed even though env files exist on disk beside
+    # the repo — proving there is no filesystem fallback for a fixture to hit.
+    monkeypatch.delenv("REITS_SUPABASE_URL", raising=False)
+    monkeypatch.delenv("REITS_SUPABASE_SERVICE_ROLE_KEY", raising=False)
+    monkeypatch.setattr(reit, "_transport", httpx.MockTransport(_rpc_handler))
+    out = reit.run_reit_tool("list_reit_issuers", "u1", {})
+    assert out.startswith("error:")
+    assert not hasattr(reit, "load_dotenv")

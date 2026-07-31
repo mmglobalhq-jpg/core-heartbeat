@@ -94,6 +94,71 @@ read reports. This may be the same Supabase project as `SUPABASE_URL`, but the R
 use these dedicated vars and an isolated client. Inject these via the deployment's
 compose/systemd env (not baked into the image).
 
+### Auth header contract (`apikey` only)
+
+`REITS_SUPABASE_SERVICE_ROLE_KEY` holds **either** a legacy JWT service-role key **or** a
+current `sb_secret_*` key. `sb_secret_*` keys are **opaque, not JWTs**. This client sends
+the key in **`apikey` only**:
+
+```
+apikey: <key>
+```
+
+It must **NOT** be duplicated into `Authorization: Bearer <key>` — a raw request that does
+so may be rejected as an invalid JWT once the value is an opaque secret key. `apikey`
+alone resolves the role for both key generations, so this form works before, during, and
+after rotation. `tests/test_reit_research_tool.py` pins it (`apikey` present,
+`Authorization` absent, opaque value passed through unparsed).
+
+Note the asymmetry with Core Chat: its `lib/supabaseReits.ts` uses
+`createClient(url, key)`, the documented server-side migration pattern, and that SDK sends
+**both** `apikey` and `Authorization: Bearer`. That is supported for the SDK path and is
+pinned by `core-chat/lib/__tests__/supabaseReits.headers.test.ts`. The two paths therefore
+need **separate** live verification — a passing `apikey`-only probe does not prove the SDK
+path works.
+
+### Rotating to an `sb_secret_*` key
+
+Legacy and new keys stay active simultaneously, so rotate create → install → verify →
+revoke. **No key may appear in a command line, terminal output, log, or shell history** —
+read it from a protected temporary file (mode `0600`, deleted afterward) or a secure
+interactive prompt.
+
+1. **Create** the new `sb_secret_*` key in the project's API settings. Leave the legacy
+   service-role key active.
+2. **Pre-rotation live probe — `apikey` only.** Validates the backend's raw-HTTP contract
+   before anything is installed:
+   ```
+   POST <REITS_SUPABASE_URL>/rest/v1/rpc/reit_research_list_issuers_v1
+   apikey: <new sb_secret key>
+   content-type: application/json
+   body: {}
+   ```
+   **Expect HTTP 200 with a JSON array.** Send the key by reading it from the protected
+   file — never inline it as a shell argument.
+   **Prohibited:** `Authorization: Bearer <sb_secret key>`. Do not add that header to this
+   probe; it is the failure mode this contract exists to avoid.
+3. **Install** the new value in the deployment env and recreate the consumers. The key
+   lives in `core-heartbeat/.env`, which **both** `backend` and `frontend` load — recreate
+   both together. Runtime-only: **no image rebuild required**.
+4. **Verify both paths independently:**
+   - *backend* — ask the assistant to list covered REITs; the issuer list must render.
+   - *Core Chat* — load `/reits`, then open a report (exercises
+     `reit_research_get_report_v1` through the SDK, which sends the Bearer header).
+   - `docker compose logs --since 5m backend frontend` — grep for `401`, `403`, `PGRST`,
+     `JWT`. Never grep for key values.
+5. **Revoke** the legacy service-role key **only after both paths pass**, then re-run
+   step 4 to prove nothing was still relying on the old key.
+
+**Stop conditions:** the probe returns anything other than 200; any REITS RPC returns
+`401`, `403`, or a `PGRST` role error; the issuer list or report fetch returns empty where
+it previously returned rows; any key value appears in output or logs. On any of these,
+halt and keep the legacy key active — do not revoke.
+
+**Rollback:** the legacy key remains valid until explicitly revoked, so restoring the
+previous env value and recreating both containers is a complete rollback. Once revoked it
+cannot be restored — never revoke before step 4 passes.
+
 ## How a future REIT appears
 
 Once the engine's reader contract lists a new issuer code (i.e. it has completed/current
