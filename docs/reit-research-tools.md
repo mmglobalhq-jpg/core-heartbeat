@@ -94,28 +94,47 @@ read reports. This may be the same Supabase project as `SUPABASE_URL`, but the R
 use these dedicated vars and an isolated client. Inject these via the deployment's
 compose/systemd env (not baked into the image).
 
-### Auth header contract (`apikey` only)
+### Auth header contract (format-aware)
 
 `REITS_SUPABASE_SERVICE_ROLE_KEY` holds **either** a legacy JWT service-role key **or** a
-current `sb_secret_*` key. `sb_secret_*` keys are **opaque, not JWTs**. This client sends
-the key in **`apikey` only**:
+current `sb_secret_*` key. **The two generations need different headers**, so
+`_sb_headers()` branches on the key's format (a prefix check — the key is never decoded or
+validated):
+
+| Key format | `apikey` | `Authorization: Bearer` |
+| --- | --- | --- |
+| legacy JWT service-role key | ✅ required | ✅ **required** |
+| `sb_secret_*` (opaque) | ✅ required | ❌ omitted |
+
+**Legacy keys need BOTH headers.** PostgREST resolves the role from the Bearer JWT; with
+`apikey` alone the request is admitted but runs as `anon`, which holds no `EXECUTE` grant
+on the reader RPCs. Verified in production — `apikey` alone returns:
 
 ```
-apikey: <key>
+401  permission denied for function reit_research_list_issuers_v1
 ```
 
-It must **NOT** be duplicated into `Authorization: Bearer <key>` — a raw request that does
-so may be rejected as an invalid JWT once the value is an opaque secret key. `apikey`
-alone resolves the role for both key generations, so this form works before, during, and
-after rotation. `tests/test_reit_research_tool.py` pins it (`apikey` present,
-`Authorization` absent, opaque value passed through unparsed).
+> **Correction.** An earlier revision of this document claimed `apikey` alone "works
+> before, during, and after rotation." **That was wrong** and was disproven in
+> production: an `apikey`-only build returned 401 for every reader RPC and was rolled
+> back. Do not reintroduce that claim.
 
-Note the asymmetry with Core Chat: its `lib/supabaseReits.ts` uses
-`createClient(url, key)`, the documented server-side migration pattern, and that SDK sends
-**both** `apikey` and `Authorization: Bearer`. That is supported for the SDK path and is
-pinned by `core-chat/lib/__tests__/supabaseReits.headers.test.ts`. The two paths therefore
-need **separate** live verification — a passing `apikey`-only probe does not prove the SDK
-path works.
+**`sb_secret_*` keys use `apikey` only.** They are opaque, not JWTs, so putting one in
+`Authorization` risks rejection as an invalid JWT.
+
+Anything without the exact `sb_secret_` prefix keeps the legacy behavior — the safe
+default, since an unknown-format value behaves exactly as it did before.
+
+**Because the code handles both generations, it can be deployed while the legacy key is
+still active and keeps working after rotation. There is no flag day**: code and key no
+longer have to change in the same instant. `tests/test_reit_research_tool.py` pins both
+paths across all three approved RPCs.
+
+Core Chat's `lib/supabaseReits.ts` reaches the same behavior differently: supabase-js
+sends both headers for every key shape, so it installs a scoped `global.fetch` wrapper
+that strips `Authorization` for `sb_secret_*` keys only. Both paths still need
+**separate** live verification during rotation — a passing backend probe does not prove
+the SDK path works.
 
 ### Rotating to an `sb_secret_*` key
 
@@ -124,40 +143,54 @@ revoke. **No key may appear in a command line, terminal output, log, or shell hi
 read it from a protected temporary file (mode `0600`, deleted afterward) or a secure
 interactive prompt.
 
-1. **Create** the new `sb_secret_*` key in the project's API settings. Leave the legacy
+**Deploy the dual-format code first, while the legacy key is still active.** That is what
+removes the flag day: after step 2 the running code already supports both generations, so
+the key swap is the only remaining variable.
+
+1. **Deploy the dual-format compatibility code** (backend image + Core Chat image) with
+   the **legacy key unchanged**. Nothing about auth changes yet — legacy keys still get
+   both headers.
+2. **Verify both REITS paths still work on the legacy key** — backend issuer list renders;
+   `/reits` loads and a report opens. This proves the compatibility code is a no-op for
+   the current key before any credential moves.
+3. **Create** the new `sb_secret_*` key in the project's API settings. Leave the legacy
    service-role key active.
-2. **Pre-rotation live probe — `apikey` only.** Validates the backend's raw-HTTP contract
-   before anything is installed:
+4. **Pre-rotation live probe — `apikey` only,** with the new key:
    ```
    POST <REITS_SUPABASE_URL>/rest/v1/rpc/reit_research_list_issuers_v1
    apikey: <new sb_secret key>
    content-type: application/json
    body: {}
    ```
-   **Expect HTTP 200 with a JSON array.** Send the key by reading it from the protected
-   file — never inline it as a shell argument.
-   **Prohibited:** `Authorization: Bearer <sb_secret key>`. Do not add that header to this
-   probe; it is the failure mode this contract exists to avoid.
-3. **Install** the new value in the deployment env and recreate the consumers. The key
-   lives in `core-heartbeat/.env`, which **both** `backend` and `frontend` load — recreate
-   both together. Runtime-only: **no image rebuild required**.
-4. **Verify both paths independently:**
-   - *backend* — ask the assistant to list covered REITs; the issuer list must render.
+   **Expect HTTP 200 with a JSON array** — this is what proves an opaque key resolves
+   `service_role` without a Bearer header. Read the key from the protected file; never
+   inline it as a shell argument.
+   **Prohibited:** `Authorization: Bearer <sb_secret key>` on this probe.
+5. **Replace** `REITS_SUPABASE_SERVICE_ROLE_KEY` in `core-heartbeat/.env`.
+6. **Recreate `backend` and `frontend` together** — both load that env file, so a partial
+   recreate leaves one consumer on the old value. Runtime-only: **no image rebuild
+   required at this step** (the images already shipped in step 1).
+7. **Verify both paths independently:**
+   - *backend* — ask the assistant to list covered REITs; the issuer list must render with
+     populated rows, not merely return HTTP 200.
    - *Core Chat* — load `/reits`, then open a report (exercises
-     `reit_research_get_report_v1` through the SDK, which sends the Bearer header).
+     `reit_research_get_report_v1` through the SDK path, where the wrapper strips
+     `Authorization`).
    - `docker compose logs --since 5m backend frontend` — grep for `401`, `403`, `PGRST`,
      `JWT`. Never grep for key values.
-5. **Revoke** the legacy service-role key **only after both paths pass**, then re-run
-   step 4 to prove nothing was still relying on the old key.
+8. **Revoke** the legacy service-role key **only after both paths pass**.
+9. **Re-run both canaries** from step 7 to prove nothing was still relying on the old key.
 
 **Stop conditions:** the probe returns anything other than 200; any REITS RPC returns
 `401`, `403`, or a `PGRST` role error; the issuer list or report fetch returns empty where
 it previously returned rows; any key value appears in output or logs. On any of these,
 halt and keep the legacy key active — do not revoke.
 
-**Rollback:** the legacy key remains valid until explicitly revoked, so restoring the
-previous env value and recreating both containers is a complete rollback. Once revoked it
-cannot be restored — never revoke before step 4 passes.
+**Rollback (before revocation):** restore the previous env value and recreate `backend`
+and `frontend` together. The dual-format code still supports the legacy key, so no image
+rollback is needed — that is the point of deploying compatibility first. The legacy key
+remains valid until explicitly revoked; once revoked it cannot be restored, so never
+revoke before step 7 passes.
 
 ## How a future REIT appears
 

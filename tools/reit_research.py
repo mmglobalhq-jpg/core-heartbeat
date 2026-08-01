@@ -38,6 +38,15 @@ REITS_SERVICE_ROLE_ENV = "REITS_SUPABASE_SERVICE_ROLE_KEY"
 REITS_STORAGE_BUCKET_ENV = "REITS_SUPABASE_STORAGE_BUCKET"
 REITS_REPORT_MAX_CHARS_ENV = "REITS_REPORT_MAX_CHARS"
 
+# Supabase server keys come in two generations and need DIFFERENT auth headers:
+#   * legacy JWT service-role key — PostgREST resolves the role from the Bearer JWT,
+#     so `apikey` alone is admitted but downgraded to `anon` (verified: 401
+#     "permission denied for function"). Both headers are required.
+#   * `sb_secret_*` — opaque, not a JWT; `apikey` alone resolves the role, and
+#     putting it in Authorization risks rejection as an invalid JWT.
+# Detection is a prefix check only: the key is never decoded or validated.
+SECRET_KEY_PREFIX = "sb_secret_"
+
 REQUEST_TIMEOUT_S = 20.0
 DEFAULT_REPORT_MAX_CHARS = 50_000
 DEFAULT_LIST_LIMIT = 50
@@ -178,26 +187,46 @@ def _sb_url() -> str:
     return url.rstrip("/")
 
 
+def _key_kind(key: str) -> str:
+    """Non-secret label for the configured key generation.
+
+    Returns ``"secret-key"`` or ``"legacy"``. Safe to log — it describes the format,
+    never the value, and is derived from a prefix check with no decoding.
+    """
+    return "secret-key" if key.startswith(SECRET_KEY_PREFIX) else "legacy"
+
+
 def _sb_headers() -> dict[str, str]:
-    """Headers for a REITS reader-contract RPC call.
+    """Headers for a REITS reader-contract RPC call — format-aware.
 
-    The configured server key is sent ONLY in ``apikey``. It is deliberately NOT
-    duplicated into ``Authorization: Bearer`` — the current Supabase secret keys
-    (``sb_secret_*``) are opaque, not JWTs, and a raw request that puts one in
-    ``Authorization`` may be rejected as an invalid JWT. ``apikey`` alone resolves
-    the role for both the legacy JWT service-role key and a new secret key, so this
-    form works before, during, and after rotation.
+    The two Supabase server-key generations need different auth headers, so this
+    branches on the key's *format* (prefix only — never decoded or validated):
 
-    The key is never logged; it exists only in the returned mapping.
+    * ``sb_secret_*`` (opaque): ``apikey`` only. These are not JWTs, so putting one
+      in ``Authorization`` risks rejection as an invalid JWT.
+    * legacy JWT service-role key: ``apikey`` **and** ``Authorization: Bearer``.
+      PostgREST resolves the role from the Bearer JWT; with ``apikey`` alone the
+      request is admitted but runs as ``anon``, which holds no EXECUTE grant on the
+      reader RPCs (verified in production: 401 "permission denied for function").
+
+    Anything without the ``sb_secret_`` prefix keeps the legacy behavior, which is
+    the safe default: an unknown-format value is treated exactly as it was before.
+
+    Because both generations are handled, this code can be deployed **while the
+    legacy key is still active** and keeps working after rotation — there is no
+    flag day. The key is never logged; it exists only in the returned mapping.
     """
     key = os.environ.get(REITS_SERVICE_ROLE_ENV)
     if not key:
         raise ReitError(f"{REITS_SERVICE_ROLE_ENV} is not set")
-    return {
+    headers = {
         "apikey": key,
         "Accept": "application/json",
         "Content-Type": "application/json",
     }
+    if _key_kind(key) == "legacy":
+        headers["Authorization"] = f"Bearer {key}"
+    return headers
 
 
 def _http() -> httpx.Client:
