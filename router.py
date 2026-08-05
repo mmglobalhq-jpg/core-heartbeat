@@ -296,3 +296,23 @@ def health() -> HealthStatus:
     HEAD for GET routes).
     """
     return HealthStatus()
+
+
+@router.get("/health/fund-pollers")
+async def fund_poller_health_endpoint() -> JSONResponse:
+    """Report JP and Allspring fund-poller health separately.
+
+    Distinct from ``/health``: that one answers "is the gateway up?", which says
+    nothing about whether the pollers are still producing data. Both pollers are
+    one-shot systemd units — they fail by going quiet, so this checks the
+    evidence they leave behind (data freshness, last success, consecutive
+    failures, unresolved failures, revisions awaiting review).
+
+    Always returns HTTP 200 with a body describing the state, including when a
+    poller is unhealthy. Monitoring reads the ``healthy`` field; a non-200 would
+    make an unreachable gateway and an unhealthy poller indistinguishable.
+    """
+    from services.fund_pollers import fund_poller_health
+
+    report = await asyncio.to_thread(fund_poller_health)
+    return JSONResponse(status_code=200, content=report)

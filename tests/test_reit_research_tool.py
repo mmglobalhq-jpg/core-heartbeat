@@ -278,3 +278,134 @@ def test_service_role_key_never_appears_in_errors(monkeypatch):
     out = reit.run_reit_tool("list_reit_issuers", "u1", {})
     assert out.startswith("error:")
     assert "TOP-SECRET-KEY" not in out
+
+
+# --- auth header contract (dual key-generation support) ----------------------
+# The two Supabase server-key generations need DIFFERENT auth headers:
+#   * legacy JWT service-role key — PostgREST resolves the role from the Bearer
+#     JWT. With `apikey` alone the request is admitted but runs as `anon`, which
+#     has no EXECUTE grant on the reader RPCs (verified in production: 401
+#     "permission denied for function"). Both headers are required.
+#   * sb_secret_* — opaque, not a JWT. `apikey` alone resolves the role, and
+#     putting it in Authorization risks rejection as an invalid JWT.
+# Handling both is what lets the code deploy BEFORE rotation (no flag day).
+
+_SECRET_KEY = "sb_secret_test_value"  # opaque + synthetic; never a real key
+# JWT-SHAPED but synthetic: header {"alg":"HS256"}, payload {"r":"svc"}, literal
+# signature. Never a real token — only its three-part shape matters here.
+_LEGACY_KEY = "eyJhbGciOiJIUzI1NiJ9.eyJyIjoic3ZjIn0.sig"
+
+
+def _capture_headers(monkeypatch, *, secret=_SECRET_KEY):
+    """Run each approved RPC and return the captured request headers/paths."""
+    seen: list[httpx.Headers] = []
+    paths: list[str] = []
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request.headers)
+        paths.append(request.url.path)
+        return _rpc_handler(request)
+
+    _install(monkeypatch, _handler, secret=secret)
+    return seen, paths
+
+
+def test_apikey_header_is_sent_for_both_key_generations(monkeypatch):
+    for key in (_SECRET_KEY, _LEGACY_KEY):
+        seen, _ = _capture_headers(monkeypatch, secret=key)
+        reit.run_reit_tool("list_reit_issuers", "u1", {})
+        assert seen, "expected at least one request"
+        assert seen[0].get("apikey") == key
+
+
+def test_secret_key_omits_authorization(monkeypatch):
+    seen, _ = _capture_headers(monkeypatch, secret=_SECRET_KEY)
+    reit.run_reit_tool("list_reit_issuers", "u1", {})
+    assert "authorization" not in seen[0]  # httpx.Headers is case-insensitive
+
+
+def test_legacy_key_sends_both_headers(monkeypatch):
+    # Regression guard: removing Authorization for a legacy key breaks production
+    # with 401 "permission denied for function".
+    seen, _ = _capture_headers(monkeypatch, secret=_LEGACY_KEY)
+    reit.run_reit_tool("list_reit_issuers", "u1", {})
+    assert seen[0].get("apikey") == _LEGACY_KEY
+    assert seen[0].get("authorization") == f"Bearer {_LEGACY_KEY}"
+
+
+@pytest.mark.parametrize(
+    "key",
+    [
+        "some-opaque-non-prefixed-value",  # unknown format
+        "service_role_key_without_prefix",
+        "sb_publishable_not_secret",  # different Supabase prefix
+        "SB_SECRET_UPPERCASE",  # prefix match is case-sensitive
+    ],
+)
+def test_unknown_formats_keep_legacy_safe_behavior(monkeypatch, key):
+    # Anything without the exact sb_secret_ prefix must behave exactly as before.
+    seen, _ = _capture_headers(monkeypatch, secret=key)
+    reit.run_reit_tool("list_reit_issuers", "u1", {})
+    assert seen[0].get("apikey") == key
+    assert seen[0].get("authorization") == f"Bearer {key}"
+
+
+def test_key_kind_labels_are_non_secret(monkeypatch):
+    # The only thing derived from the key is a format label safe to log.
+    assert reit._key_kind(_SECRET_KEY) == "secret-key"
+    assert reit._key_kind(_LEGACY_KEY) == "legacy"
+    assert reit._key_kind("anything-else") == "legacy"
+
+
+def test_keys_are_passed_through_unparsed(monkeypatch):
+    # Never decoded, split, or validated: both shapes reach the wire byte-for-byte.
+    for key in (_SECRET_KEY, _LEGACY_KEY):
+        seen, _ = _capture_headers(monkeypatch, secret=key)
+        out = reit.run_reit_tool("list_reit_issuers", "u1", {})
+        assert not out.startswith("error:")
+        assert seen[0]["apikey"] == key
+
+
+@pytest.mark.parametrize("key", [_SECRET_KEY, _LEGACY_KEY])
+@pytest.mark.parametrize(
+    ("tool", "args", "rpc_path"),
+    [
+        ("list_reit_issuers", {}, "/rest/v1/rpc/reit_research_list_issuers_v1"),
+        ("list_reit_reports", {"reit_symbol": "ARR"}, "/rest/v1/rpc/reit_research_list_reports_v1"),
+        ("get_reit_report", {"report_id": ARR_A}, "/rest/v1/rpc/reit_research_get_report_v1"),
+    ],
+)
+def test_all_approved_rpcs_keep_the_same_request_contract(monkeypatch, key, tool, args, rpc_path):
+    expect_auth = not key.startswith("sb_secret_")
+    seen, paths = _capture_headers(monkeypatch, secret=key)
+    out = reit.run_reit_tool(tool, "u1", args)
+    assert not out.startswith("error:")
+    assert rpc_path in paths
+    for h in seen:
+        assert h.get("apikey") == key
+        assert ("authorization" in h) is expect_auth
+        assert h.get("content-type") == "application/json"
+        assert h.get("accept") == "application/json"
+
+
+@pytest.mark.parametrize("key", [_SECRET_KEY, _LEGACY_KEY])
+def test_keys_never_leak_from_a_failing_rpc(monkeypatch, key):
+    def _boom(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(500, json={"message": "internal"})
+
+    _install(monkeypatch, _boom, secret=key)
+    out = reit.run_reit_tool("list_reit_issuers", "u1", {})
+    assert out.startswith("error:")
+    assert key not in out
+
+
+def test_credentials_come_only_from_the_process_environment(monkeypatch):
+    # No test may reach a real env file. Credentials resolve from os.environ only,
+    # so clearing them must fail closed even though env files exist on disk beside
+    # the repo — proving there is no filesystem fallback for a fixture to hit.
+    monkeypatch.delenv("REITS_SUPABASE_URL", raising=False)
+    monkeypatch.delenv("REITS_SUPABASE_SERVICE_ROLE_KEY", raising=False)
+    monkeypatch.setattr(reit, "_transport", httpx.MockTransport(_rpc_handler))
+    out = reit.run_reit_tool("list_reit_issuers", "u1", {})
+    assert out.startswith("error:")
+    assert not hasattr(reit, "load_dotenv")
