@@ -752,6 +752,34 @@ def build_ollama_client() -> httpx.AsyncClient:
     return _ollama_client
 
 
+# What the PLATFORM can do — injected into the answering prompt.
+#
+# WHY THIS EXISTS: this model composes the reply but has no tools bound; the
+# Supervisor is the component that calls them. Without this block the composer
+# reasons only about its own abilities and denies things the platform can plainly
+# do — observed verbatim: "I cannot directly add events to your calendar", said
+# while four working calendar tools were registered. That is a false statement
+# about the product, not a harmless hedge.
+#
+# It must NOT claim the composer can act, because it cannot. The correct behaviour
+# is to OFFER; the user's confirmation becomes the next turn, which the Supervisor
+# routes to the real tool. That also gives writes a natural confirm step.
+CAPABILITIES_BLOCK = (
+    "\nWhat this assistant can do (via its tools, on the user's confirmation):\n"
+    "  - Google Calendar: view, create, update and delete the user's events.\n"
+    "  - Knowledge base: search the user's curated documents.\n"
+    "  - REIT research: list issuers and read ARMOUR/Orchid research reports.\n"
+    "  - Notes: read, search and write the user's personal notes.\n"
+    "  - Attachments: read documents and SEE images the user attaches.\n"
+    "NEVER tell the user you are unable to do one of the things listed above, and "
+    "never tell them to do it manually. You do not execute tools yourself in this "
+    "step, so do not claim an action is already done. Instead, offer concretely and "
+    "ask them to confirm — e.g. \"I can add these 12 games to your calendar. Want me "
+    "to go ahead?\" — then the next turn performs it. If a request needs details you "
+    "do not have, ask for exactly those.\n\n"
+)
+
+
 def _build_local_prompt(state: GraphState) -> str:
     """Deterministic inference prompt from the intent + message history.
 
@@ -779,6 +807,7 @@ def _build_local_prompt(state: GraphState) -> str:
         f"Intent: {intent.intent}\n"
         f"Raw input: {intent.raw_input}\n"
         f"Conversation so far:\n{history or '(none)'}\n"
+        f"{CAPABILITIES_BLOCK}"
         "Answer the user's request above directly, and stay strictly on its "
         "specific subject — do NOT drift onto related-but-different topics or list "
         "things the user didn't ask about. If retrieved knowledge-base or tool "
