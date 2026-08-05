@@ -65,6 +65,16 @@ RECURSION_LIMIT = 25   # hard LangGraph catch
 HISTORY_LIMIT = 10     # max prior turns seeded from IntentPayload.history (token/latency bound)
 DOC_CHAR_BUDGET = 12000  # max chars of attached-document text injected (local model window is small)
 MAX_DOCS_PER_TURN = 10   # cap attached docs per message
+
+# --- attached IMAGES (vision) ------------------------------------------------
+# Images are sent to the model IN ADDITION to their docling-extracted text, not
+# instead of it: for receipts and dense tables the OCR text is frequently more
+# accurate than vision alone, and if the image path fails for any reason the turn
+# degrades to exactly the pre-vision behaviour.
+IMAGE_MEDIA_TYPES = frozenset({"image/png", "image/jpeg"})
+MAX_IMAGES_PER_TURN = 3      # token/cost bound; images are ~1-2k tokens each
+MAX_IMAGE_EDGE_PX = 1568     # Anthropic's recommended long-edge cap; larger is downscaled
+MAX_IMAGE_BYTES = 4_000_000  # skip anything still over this AFTER downscaling
 MODEL_NAME = "gemini-2.5-flash"
 GEMINI_API_KEY_ENV = "GEMINI_API_KEY"
 REQUEST_TIMEOUT_MS = 10_000  # bound each model call (FR-006); milliseconds
@@ -219,6 +229,11 @@ class GraphState(TypedDict):
     # Extracted text of the message's attached documents (budget-capped), injected
     # into the answering prompt so the model can read them. Set-once, no reducer.
     documents: str
+    # Attached IMAGE documents for this turn, already downscaled and base64-encoded:
+    # [{"media_type": "image/png", "data": "<b64>", "filename": "..."}]. Kept SEPARATE
+    # from `documents` so the text path is untouched — an image-free turn behaves
+    # byte-identically to before vision existed. Set-once, no reducer.
+    document_images: list[dict]
     # Source-document titles from the most recent knowledge_base retrieval, so the
     # streamed answer can cite them at the end. Last-write-wins (set by tool_execution).
     kb_sources: list[str]
@@ -629,11 +644,14 @@ def _decide_anthropic(
         "description": "Return the single next node for the orchestration graph.",
         "input_schema": ROUTING_JSON_SCHEMA,
     }
+    # Attach any images on the first step so the Supervisor can SEE a screenshot when
+    # deciding what to do with it. No images -> plain string, exactly as before.
+    content = _as_content_parts(prompt, _turn_images(state), "anthropic")
     try:
         response = client.messages.create(
             model=api_model,
             max_tokens=64,
-            messages=[{"role": "user", "content": prompt}],
+            messages=[{"role": "user", "content": content}],
             tools=[tool],
             tool_choice={"type": "tool", "name": "route"},
         )
@@ -796,6 +814,18 @@ async def generate_local(
     (text, failure) non-None plus a TokenUsage. Bounded by the client's timeout
     (FR-007). See contracts/local_worker.md.
     """
+    # The local model (qwen2.5:7b) has no vision. If images are attached, say so
+    # explicitly rather than answering from the docling OCR text as though we had
+    # looked at the picture — a confident answer about an image nobody saw is worse
+    # than an honest failure. Swap in a vision model (llava/qwen2-vl) to lift this.
+    if state.get("document_images"):
+        return (
+            "I can read the text extracted from your image, but the local model "
+            "can't see images. The cloud model is unavailable right now — please "
+            "try again shortly.",
+            None,
+            TokenUsage(),
+        )
     payload = {
         "model": _ollama_model(),
         "prompt": _build_local_prompt(state),
@@ -1208,9 +1238,12 @@ async def generate_cloud(
         )
     except Exception:  # SDK without ThinkingConfig -> no override
         config = None
+    # Attach images so the composed ANSWER can describe what is in the screenshot,
+    # not just the text docling pulled out of it. No images -> plain string.
+    contents = _as_content_parts(prompt, _turn_images(state), "gemini")
     try:
         stream = await client.aio.models.generate_content_stream(
-            model=api_model, contents=prompt, config=config
+            model=api_model, contents=contents, config=config
         )
         async for chunk in stream:
             piece = getattr(chunk, "text", None)
@@ -1657,6 +1690,7 @@ def _initial_state(payload: IntentPayload, user_id: str) -> GraphState:
         "messages": [],
         "prior_context": _seed_messages(payload),
         "documents": "",  # populated by _load_documents in the async prelude
+        "document_images": [],  # populated by _load_document_images in the async prelude
         "kb_sources": [],
         "usage": TokenUsage(),
         "visited": [],
@@ -1693,6 +1727,137 @@ async def _load_documents(user_id: str, document_ids: list[str]) -> str:
     return "\n\n---\n\n".join(parts)
 
 
+def _downscale_image(data: bytes) -> tuple[bytes, str] | None:
+    """Return ``(bytes, media_type)`` for a model-ready image, or None if unusable.
+
+    Downscales so the long edge is at most MAX_IMAGE_EDGE_PX — a full-resolution
+    screenshot costs far more tokens without helping the model read it. Blocking
+    (Pillow); callers offload with ``asyncio.to_thread``.
+    """
+    from io import BytesIO
+
+    from PIL import Image
+
+    try:
+        with Image.open(BytesIO(data)) as im:
+            fmt = (im.format or "").upper()
+            if fmt not in ("PNG", "JPEG"):
+                return None
+            im.load()
+            longest = max(im.size)
+            if longest > MAX_IMAGE_EDGE_PX:
+                scale = MAX_IMAGE_EDGE_PX / longest
+                im = im.resize(
+                    (max(1, int(im.width * scale)), max(1, int(im.height * scale))),
+                    Image.LANCZOS,
+                )
+            buf = BytesIO()
+            if fmt == "PNG":
+                im.save(buf, format="PNG", optimize=True)
+                media = "image/png"
+            else:
+                # JPEG cannot carry alpha; convert so a PNG-ish RGBA JPEG can't fail here.
+                if im.mode not in ("RGB", "L"):
+                    im = im.convert("RGB")
+                im.save(buf, format="JPEG", quality=85, optimize=True)
+                media = "image/jpeg"
+            out = buf.getvalue()
+    except Exception:
+        return None
+    if not out or len(out) > MAX_IMAGE_BYTES:
+        return None
+    return out, media
+
+
+async def _load_document_images(user_id: str, document_ids: list[str]) -> list[dict]:
+    """Fetch + downscale + base64 the message's attached IMAGES.
+
+    Returns [] when nothing is attached, nothing is an image, or anything at all
+    goes wrong — an attachment problem must never break a chat turn, it should just
+    degrade to the text-only path. Best-effort per document.
+    """
+    if not document_ids:
+        return []
+    import base64
+
+    from services import documents as docstore
+
+    try:
+        types = await asyncio.to_thread(
+            docstore.fetch_content_types, user_id, document_ids[:MAX_DOCS_PER_TURN]
+        )
+    except Exception:
+        return []
+
+    images: list[dict] = []
+    for doc_id in document_ids[:MAX_DOCS_PER_TURN]:
+        if len(images) >= MAX_IMAGES_PER_TURN:
+            break
+        if (types.get(doc_id) or "").split(";")[0].strip().lower() not in IMAGE_MEDIA_TYPES:
+            continue
+        try:
+            raw = await asyncio.to_thread(docstore.fetch_original, user_id, doc_id)
+        except Exception:
+            continue
+        prepared = await asyncio.to_thread(_downscale_image, raw)
+        if prepared is None:
+            continue
+        data, media = prepared
+        images.append(
+            {
+                "media_type": media,
+                "data": base64.b64encode(data).decode("ascii"),
+                "doc_id": doc_id,
+            }
+        )
+    return images
+
+
+def _as_content_parts(prompt: str, images: list[dict], provider: str):
+    """Shape a prompt (+ optional images) for a provider's content field.
+
+    With NO images this returns the bare ``prompt`` string, so every existing call
+    path, test and behaviour is unchanged on the overwhelming majority of turns.
+    That is the main guard against regressing the hot path.
+    """
+    if not images:
+        return prompt
+    if provider == "anthropic":
+        parts: list[dict] = [{"type": "text", "text": prompt}]
+        for img in images:
+            parts.append(
+                {
+                    "type": "image",
+                    "source": {
+                        "type": "base64",
+                        "media_type": img["media_type"],
+                        "data": img["data"],
+                    },
+                }
+            )
+        return parts
+    if provider == "gemini":
+        parts = [{"text": prompt}]
+        for img in images:
+            parts.append(
+                {"inline_data": {"mime_type": img["media_type"], "data": img["data"]}}
+            )
+        return [{"role": "user", "parts": parts}]
+    return prompt  # unknown provider -> text only, never fail the turn
+
+
+def _turn_images(state: GraphState) -> list[dict]:
+    """Images to attach for THIS model call.
+
+    Only on the first step. The Supervisor runs on every routing decision (up to
+    MAX_STEPS), so re-sending a screenshot each time would multiply token cost with
+    no benefit — by step 1 the conversation already carries what the model read.
+    """
+    if state.get("step", 0) != 0:
+        return []
+    return state.get("document_images") or []
+
+
 async def _prepare_vault(user_id: str) -> None:
     """Localize the caller's Markdown vault before the graph runs. Best-effort — a
     sync failure must not break the run. Held under the per-user lock so it can't
@@ -1723,6 +1888,7 @@ async def run(
     initial = _initial_state(payload, user_id)
     await _prepare_vault(user_id)  # C-3: parity with astream_run (was missing here)
     initial["documents"] = await _load_documents(user_id, payload.document_ids)
+    initial["document_images"] = await _load_document_images(user_id, payload.document_ids)
     try:
         final = await graph.ainvoke(initial, config={"recursion_limit": RECURSION_LIMIT})
     except (GraphRecursionError, Exception) as exc:  # noqa: B014 - defensive catch-all
@@ -1781,6 +1947,7 @@ async def astream_run(
     # _prepare_vault). Sandbox resolves to a local mock folder (offline).
     await _prepare_vault(user_id)
     initial["documents"] = await _load_documents(user_id, payload.document_ids)
+    initial["document_images"] = await _load_document_images(user_id, payload.document_ids)
 
     try:
         async for event in graph.astream_events(
