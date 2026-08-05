@@ -21,7 +21,7 @@ from datetime import datetime
 from zoneinfo import ZoneInfo
 from collections import defaultdict
 from collections.abc import AsyncIterator, Awaitable, Callable
-from typing import Annotated
+from typing import Annotated, Literal, get_args, get_origin
 
 from typing_extensions import TypedDict
 
@@ -53,6 +53,7 @@ from models import (
     RoutingDecision,
     RoutingFailure,
     TokenUsage,
+    ToolArgs,
     WorkerFailure,
 )
 
@@ -107,36 +108,66 @@ MODEL_REGISTRY: dict[str, tuple[str, str]] = {
 # Feature 007: when next_node == "tool_execution" the model also emits tool_name +
 # tool_args (the vault tool call). tool_args is a fixed, typed object so it maps
 # onto every provider's structured output; only the field the tool needs is set.
-ROUTING_JSON_SCHEMA: dict = {
-    "type": "object",
-    "properties": {
-        "next_node": {"type": "string", "enum": ["local_llm", "tool_execution", "finish"]},
-        "tool_name": {
-            "type": ["string", "null"],
-            "enum": [
-                "read_user_note", "search_user_vault", "write_user_note",
-                "query_knowledge_base",
-                "list_reit_issuers", "list_reit_reports",
-                "get_reit_report", "get_latest_reit_report",
-                None,
-            ],
-        },
-        "tool_args": {
-            "type": "object",
-            "properties": {
-                "filename": {"type": ["string", "null"]},
-                "query": {"type": ["string", "null"]},
-                "content": {"type": ["string", "null"]},
-                "reit_symbol": {"type": ["string", "null"]},
-                "report_id": {"type": ["string", "null"]},
-                "limit": {"type": ["integer", "null"]},
+#
+# DERIVED from the Pydantic models rather than hand-written. It used to be a literal
+# dict, and it silently went stale: the four Google Calendar tools were added to
+# `RoutingDecision.tool_name` and to the Supervisor's prompt, but nobody updated the
+# copy here. The result was invisible on the default Gemini path (which validates
+# against `RoutingDecision` directly) and severe elsewhere — OpenAI's `strict: true`
+# hard-enforces the enum, so the model literally could not name a calendar tool, and
+# `additionalProperties: False` rejected every calendar argument.
+#
+# Deriving from the same object the response is validated against means the wire
+# schema and the validator cannot disagree. Registry drift is caught by
+# tests/test_routing_vocabulary.py, which asserts these match what's dispatchable.
+
+
+def _literal_values(annotation: object) -> list:
+    """Every ``Literal`` value in a possibly-Optional/Union annotation, in order."""
+    out: list = []
+    if get_origin(annotation) is Literal:
+        out.extend(get_args(annotation))
+    else:
+        for arg in get_args(annotation):
+            out.extend(_literal_values(arg))
+    seen: set = set()
+    return [v for v in out if not (v in seen or seen.add(v))]
+
+
+def _compact_type(prop: dict) -> dict:
+    """Pydantic's ``anyOf`` nullable form -> the compact ``{"type": [...]}`` shape
+    that OpenAI's json_schema and Anthropic's input_schema both accept."""
+    types = [s["type"] for s in prop.get("anyOf", [prop]) if "type" in s]
+    return {"type": types[0] if len(types) == 1 else types}
+
+
+def _build_routing_json_schema() -> dict:
+    names = _literal_values(RoutingDecision.model_fields["tool_name"].annotation)
+    args_props = ToolArgs.model_json_schema()["properties"]
+    return {
+        "type": "object",
+        "properties": {
+            "next_node": {
+                "type": "string",
+                "enum": _literal_values(RoutingDecision.model_fields["next_node"].annotation),
             },
-            "additionalProperties": False,
+            "tool_name": {
+                "type": ["string", "null"],
+                # None stays last so the "no tool" choice reads the same as before.
+                "enum": [*(n for n in names if n is not None), None],
+            },
+            "tool_args": {
+                "type": "object",
+                "properties": {k: _compact_type(v) for k, v in args_props.items()},
+                "additionalProperties": False,
+            },
         },
-    },
-    "required": ["next_node"],
-    "additionalProperties": False,
-}
+        "required": ["next_node"],
+        "additionalProperties": False,
+    }
+
+
+ROUTING_JSON_SCHEMA: dict = _build_routing_json_schema()
 
 # Memory extractor (feature 008). Shared JSON Schema for the silent profile
 # builder's structured output, reused as OpenAI's json_schema and Anthropic's tool
