@@ -32,6 +32,15 @@ DEFAULT_TOP_K = int(os.environ.get("KB_TOP_K", "4"))       # chunks retrieved (w
 MAX_CHUNKS = int(os.environ.get("KB_MAX_CHUNKS", "4"))     # chunks kept in the prompt (was 8)
 MAX_CHARS = int(os.environ.get("KB_MAX_CHARS", "600"))     # per-chunk char cap (was 900)
 
+# Relevance floor for reranked chunks. The retriever ALWAYS returns its top_k nearest
+# neighbours, however semantically distant they are — so without a floor an unrelated
+# question ("can you see this schedule?") still comes back with the closest documents
+# and they get cited as the answer's source. Measured cross-encoder scores on this
+# corpus separate cleanly: genuinely relevant queries top out at +1.8 to +5.0, while
+# unrelated ones sit at -9 to -11. 0.0 is the cross-encoder relevance boundary and
+# lands in the middle of that ~10-point gap.
+KB_MIN_SCORE = float(os.environ.get("KB_MIN_SCORE", "0.0"))
+
 # Test seam: unit tests set this to an ``httpx.MockTransport`` to exercise the tool
 # without a live service. None -> real network.
 _transport: httpx.BaseTransport | None = None
@@ -97,9 +106,24 @@ def _post(path: str, user_id: str, json_body: dict) -> httpx.Response:
     raise last_exc  # pragma: no cover - loop always returns or raises above
 
 
+def relevant_chunks(payload: dict) -> list[dict]:
+    """Chunks that clear KB_MIN_SCORE, so an unrelated question doesn't get answered
+    (or cited) from whatever happened to be nearest in vector space.
+
+    Fail-open by design: if NO chunk carries a ``score`` the floor cannot be applied,
+    so every chunk is kept. That keeps this working against a KB service that doesn't
+    return scores rather than silently returning nothing. Pure.
+    """
+    chunks = payload.get("chunks") or []
+    scored = [c for c in chunks if isinstance(c.get("score"), (int, float))]
+    if not scored:
+        return list(chunks)
+    return [c for c in chunks if float(c.get("score", 0.0)) >= KB_MIN_SCORE]
+
+
 def format_context(payload: dict) -> str:
     """Turn the retrieve-only response into a compact, title-cited context block. Pure."""
-    chunks = payload.get("chunks") or []
+    chunks = relevant_chunks(payload)
     if not chunks:
         return "No relevant information found in the knowledge base."
     lines: list[str] = []
@@ -113,11 +137,31 @@ def format_context(payload: dict) -> str:
 
 
 def source_titles(payload: dict) -> list[str]:
-    """Distinct source-document titles that fed the context (for the answer's citation)."""
-    seen: set[str] = set()
-    out: list[str] = []
-    for s in payload.get("sources") or []:
-        title = (s.get("title") or "").strip()
+    """Distinct source-document titles that fed the context (for the answer's citation).
+
+    Derived from the chunks that SURVIVED the relevance floor, not from the raw
+    ``sources`` list, so the citation reflects what the model was actually shown. The
+    retriever returns its nearest neighbours regardless of distance, so citing the raw
+    list attaches an authoritative-looking source to an answer that never used it.
+
+    Falls back to ``sources`` when the payload carries no chunks (older service shape,
+    and what the unit tests exercise).
+    """
+    chunks = relevant_chunks(payload)
+    if not chunks and not (payload.get("chunks") or []):
+        seen: set[str] = set()
+        out: list[str] = []
+        for s in payload.get("sources") or []:
+            title = (s.get("title") or "").strip()
+            if title and title not in seen:
+                seen.add(title)
+                out.append(title)
+        return out
+
+    seen = set()
+    out = []
+    for c in chunks[:MAX_CHUNKS]:
+        title = (c.get("title") or "").strip()
         if title and title not in seen:
             seen.add(title)
             out.append(title)

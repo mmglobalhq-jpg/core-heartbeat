@@ -1133,6 +1133,14 @@ def supervisor(state: GraphState) -> dict:
         # (the prompt steers the model to a REIT tool; this is the deterministic
         # backstop for the case where it routed straight to local_llm).
         and not looks_like_reit_reference(raw)
+        # A question ABOUT AN ATTACHMENT is self-contained — the answer comes from the
+        # document/image the user just supplied, not from the curated KB. Forcing a
+        # retrieval here searched the KB for things like "can you see this schedule?",
+        # which returns whatever is nearest in vector space and then gets cited as the
+        # source of an answer that came entirely from the attachment. It also spent an
+        # embed+search+rerank on every attachment turn for nothing.
+        and not state.get("documents")
+        and not state.get("document_images")
     ):
         if raw:
             forced_kb_query = raw
