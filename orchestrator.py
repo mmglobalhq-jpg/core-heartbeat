@@ -1708,7 +1708,19 @@ def _finish_routing(
         confirming=_confirmation_given(state),
         store_keys=_plan_keys(),
     )
-    if _confirmation_given(state):
+    # The Supervisor runs once per STEP, not once per turn, and raw_input stays "yes"
+    # for the whole turn. So after the approved batch runs, the next step re-entered
+    # this branch, found the plan correctly consumed, and reported "I don't have the
+    # details" — an apology emitted immediately AFTER the writes succeeded. The user
+    # saw only the apology, retried, and accumulated duplicate events.
+    #
+    # Once tool_execution has run this turn the confirmation is already honoured;
+    # there is nothing left to release and nothing to apologise for.
+    tools_ran = "tool_execution" in (state.get("visited") or [])
+    if tools_ran and _confirmation_given(state):
+        _trace("gate.already_honoured", key=user_id[:8], nxt=nxt)
+
+    if _confirmation_given(state) and not tools_ran:
         approved = _take_pending_plan(user_id)
         if approved:
             # Run exactly what was shown and agreed to. Not what the model would

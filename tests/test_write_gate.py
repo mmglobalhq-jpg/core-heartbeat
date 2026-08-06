@@ -276,3 +276,35 @@ def test_every_calendar_write_is_covered_by_the_gate():
     for name in ("create_calendar_event", "update_calendar_event", "delete_calendar_event"):
         assert name in WRITE_TOOLS, f"{name} would bypass confirmation entirely"
     assert "list_calendar_events" not in WRITE_TOOLS
+
+
+def test_a_second_supervisor_step_does_not_apologise_after_success():
+    """The Supervisor runs once per STEP, not once per turn, and raw_input stays
+    "yes" the whole turn.
+
+    Observed in production: step 0 released the plan and wrote 9 calendar events;
+    step 1 re-entered the confirmation branch, found the plan correctly consumed,
+    and answered "I don't have the details of what you approved" — an apology
+    emitted straight after the writes succeeded. The user saw only the apology,
+    retried, and ended up with duplicate events.
+    """
+    _route(_calls(9), raw="add my schedule")
+    released = _route([], raw="yes", prior=_assistant_turn())
+    assert len(released["tool_calls"]) == 9
+
+    # Same turn, next step: tool_execution has now run.
+    state = {
+        "intent": IntentPayload(intent="calendar_add", confidence=0.9, source="t",
+                                raw_input="yes"),
+        "messages": [], "prior_context": _assistant_turn(), "user_id": "u1",
+        "documents": "", "document_images": [], "visited": ["tool_execution"], "step": 1,
+    }
+    decision = RoutingDecision(next_node="local_llm", tool_name=None, tool_args=ToolArgs())
+    out = orchestrator._finish_routing(state, 1, decision, TokenUsage(), [])
+    assert out["plan_note"] is None, "must not apologise for work that just succeeded"
+
+
+def test_a_genuine_repeat_yes_still_reports_honestly():
+    """The fix must not silence the real case: a NEW turn where nothing is held."""
+    out = _route([], raw="yes", prior=_assistant_turn())
+    assert out["plan_note"] is not None
