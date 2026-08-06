@@ -460,6 +460,15 @@ def _build_prompt(state: GraphState) -> str:
     """
     intent = state["intent"]
     messages = state.get("messages", [])
+    # Deliberately THIS RUN's messages only — prior turns are withheld here.
+    #
+    # This looks like the bug fixed in the native router (which does receive prior
+    # turns, so "add those" has an antecedent), but this prompt can choose `finish`
+    # and the native one cannot. Measured with prior turns visible here: "what did I
+    # just tell you my name was?" routes straight to finish and the user gets no
+    # answer at all. The explicit "Answers composed so far: 0" line is not enough to
+    # stop it — seeing a prior assistant reply is enough to look answered.
+    # See tests/test_orchestrator.py::test_prior_context_reaches_answer_prompt_not_supervisor.
     history = _render_history(messages)
     # Count only ANSWERS (local_llm), not tool runs. A tool_execution result is raw
     # data, not a reply that satisfies the intent; counting it here made the model
@@ -653,8 +662,13 @@ def _build_native_prompt(state: GraphState) -> str:
     duplication that let the calendar tools go stale.
     """
     intent = state["intent"]
-    messages = state.get("messages", [])
-    history = _render_history(messages)
+    # Prior turns FIRST, then this run's messages. Without the prior turns this
+    # prompt showed "Conversation so far: (none)" on every turn, so a request like
+    # "now add those to my calendar" arrived as a pronoun with no antecedent and the
+    # model — correctly — called nothing. The composer had the history and could only
+    # ask a question back, so the user restated, and the loop repeated.
+    convo = list(state.get("prior_context", [])) + list(state.get("messages", []))
+    history = _render_history(convo)
     profile_block = _user_profile_block(state.get("user_id", SANDBOX_USER_ID))
     docs = state.get("documents", "")
     docs_block = (

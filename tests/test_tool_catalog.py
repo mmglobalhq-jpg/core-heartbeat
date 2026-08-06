@@ -336,3 +336,31 @@ def test_native_api_error_is_converted_to_a_failure(monkeypatch):
     monkeypatch.setattr(orchestrator, "_native_chat_model", lambda p: Boom())
     nxt, calls, failure, _ = orchestrator._decide_native(_native_state(), "gemini-2.5-flash")
     assert nxt is None and calls == [] and failure is not None
+
+
+def test_native_router_sees_prior_conversation_but_the_structured_one_does_not():
+    """The asymmetry is deliberate, and both halves are load-bearing.
+
+    NATIVE: prior_context used to be rendered only in the composer prompt, so this
+    router saw "Conversation so far: (none)" every turn. "now add those to my
+    calendar" arrived as a pronoun with no antecedent and it called nothing, while
+    the composer — which did have the history — could only ask what "those" meant.
+
+    STRUCTURED: this prompt can choose `finish`, and the native one cannot. Measured
+    with prior turns visible here, "what did I just tell you my name was?" routes
+    straight to finish and the user gets no answer. The explicit "Answers composed so
+    far: 0" line does not prevent it.
+    """
+    from models import IntentPayload
+    prior = [
+        Message(source="user", content="list the start time for each game", step=0),
+        Message(source="assistant", content="Monday, August 17: Christian Brothers at 5:30 PM", step=0),
+    ]
+    state = {
+        "intent": IntentPayload(intent="calendar_add", confidence=0.9, source="t",
+                                raw_input="now add those to my calendar"),
+        "messages": [], "prior_context": prior, "user_id": "u1",
+        "documents": "", "document_images": [], "visited": [], "step": 0,
+    }
+    assert "Christian Brothers" in orchestrator._build_native_prompt(state)
+    assert "Christian Brothers" not in orchestrator._build_prompt(state)
