@@ -1,0 +1,53 @@
+#!/usr/bin/env bash
+# Block a commit that adds a tool or an environment variable the source of truth
+# doesn't mention.
+#
+# This exists because instructions do not hold. `core-chat/CLAUDE.md` spent weeks
+# telling every session the app had no backend and pointing at a deleted module,
+# and the audit repo recorded "core-chat has 0 tests" long after 22 test files
+# existed. What actually caught drift in this codebase was a check that failed —
+# test_routing_vocabulary.py forced four vocabularies and the prose catalogue to be
+# updated the moment two web tools were added.
+#
+# Enabled with:  git config core.hooksPath .githooks
+# Bypassed with: git commit --no-verify   (fine for a WIP commit; the check still
+#                                          runs on the next one)
+set -uo pipefail
+
+CHECK="$(git rev-parse --show-toplevel)/../system-source-of-truth/scripts/check-doc-drift.py"
+
+# The source of truth is a separate repo. If it isn't checked out next to this one
+# the hook must not block work — a missing sibling repo is not a code defect.
+if [ ! -f "$CHECK" ]; then
+  echo "pre-commit: source-of-truth repo not found beside this one; skipping drift check" >&2
+  exit 0
+fi
+
+if ! command -v python3 >/dev/null 2>&1; then
+  echo "pre-commit: python3 not found; skipping drift check" >&2
+  exit 0
+fi
+
+if python3 "$CHECK" --quiet; then
+  exit 0
+fi
+
+cat >&2 <<'MSG'
+
+────────────────────────────────────────────────────────────────────────
+Commit blocked: the code has grown something the documentation lacks.
+
+Document it, then commit again:
+  tools    -> system-source-of-truth/docs/29-agent-tooling.md
+  env vars -> system-source-of-truth/docs/08-configuration-matrix.md
+              (credentials belong in 09-credential-register.md)
+
+Re-check with:
+  python3 ../system-source-of-truth/scripts/check-doc-drift.py
+
+If the variable genuinely isn't configuration, add it to ENV_IGNORE in that
+script with a reason. Use `git commit --no-verify` only for a WIP commit —
+the check runs again on the next one.
+────────────────────────────────────────────────────────────────────────
+MSG
+exit 1
