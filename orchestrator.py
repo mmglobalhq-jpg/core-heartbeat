@@ -332,6 +332,11 @@ class GraphState(TypedDict):
     # user approved something we no longer hold). Keeps the composer from narrating
     # actions that were never dispatched.
     plan_note: str | None
+    # Set when the turn hit MAX_STEPS and is composing from partial results. Tells
+    # local_llm to answer from what it has AND say it didn't finish — a partial
+    # answer presented as complete is the failure mode this whole area keeps
+    # producing.
+    truncated: bool
 
 
 # --- model client (feature 004; multi-provider in feature 006) --------------
@@ -1066,6 +1071,25 @@ def _pending_plan_block(state: GraphState) -> str:
     )
 
 
+def _truncation_block(state: GraphState) -> str:
+    """Warn the composer that this turn ran out of steps.
+
+    Without it the model writes a confident, complete-sounding answer from partial
+    results, which is worse than the bare warning it replaces: the user cannot tell
+    that anything is missing.
+    """
+    if not state.get("truncated"):
+        return ""
+    return (
+        "\nNOTE: this turn reached its internal step limit, so the information above "
+        "may be incomplete and some requested actions may not have run. Answer with "
+        "what you actually have, then say plainly that you were not able to finish "
+        "and suggest the user rephrase or narrow the request. Do NOT present this as "
+        "a complete answer, and do NOT claim any action succeeded unless a tool "
+        "result above says so.\n\n"
+    )
+
+
 def _build_local_prompt(state: GraphState) -> str:
     """Deterministic inference prompt from the intent + message history.
 
@@ -1094,6 +1118,7 @@ def _build_local_prompt(state: GraphState) -> str:
         f"Raw input: {intent.raw_input}\n"
         f"Conversation so far:\n{history or '(none)'}\n"
         f"{_pending_plan_block(state)}"
+        f"{_truncation_block(state)}"
         f"{CAPABILITIES_BLOCK}"
         "Answer the user's request above directly, and stay strictly on its "
         "specific subject — do NOT drift onto related-but-different topics or list "
@@ -1324,8 +1349,38 @@ def supervisor(state: GraphState) -> dict:
     """Model-driven routing hub. Falls back to a safe finish on any failure."""
     step = state["step"]
 
-    # Layer-2 termination + cost guard: never call the model past the bound.
+    # Layer-2 termination + cost guard: never call the ROUTING model past the bound.
+    #
+    # Hitting the bound used to finish immediately, which meant the turn ended with
+    # nothing composed and the user saw only "No reply produced (status:
+    # halted_step_bound)" — work had happened, tools had run, and none of it reached
+    # them. Observed for real: "what football games are on my calendar?" looped on
+    # list_calendar_events until the bound and returned nothing at all.
+    #
+    # So spend one final step composing from whatever WAS gathered. The
+    # `local_llm not in visited` check is load-bearing: without it local_llm returns
+    # here at step+1, the bound is still exceeded, and it routes to local_llm forever
+    # until RECURSION_LIMIT (25) kills the run — turning a bad turn into a worse one.
+    # MAX_STEPS is 8, so one extra node visit has ample headroom.
     if step >= MAX_STEPS:
+        if "local_llm" not in state.get("visited", []):
+            return {
+                "next": "local_llm",
+                "status": "halted_step_bound",
+                "step": 1,
+                "truncated": True,
+                "tool_request": None,
+                "tool_calls": None,
+                "pending_plan": None,
+                "plan_note": None,
+                "messages": [
+                    Message(
+                        source="supervisor",
+                        content="route -> local_llm (step bound: compose what we have)",
+                        step=step,
+                    )
+                ],
+            }
         return {
             "next": "finish",
             "status": "halted_step_bound",
@@ -2379,6 +2434,7 @@ def _initial_state(payload: IntentPayload, user_id: str) -> GraphState:
         "tool_calls": None,
         "pending_plan": None,
         "plan_note": None,
+        "truncated": False,
     }
 
 
@@ -2698,7 +2754,7 @@ async def astream_run(
         return
     # Cite the KB source document(s) at the end of a completed, KB-grounded answer —
     # deterministic (doesn't rely on the small local model to remember to cite).
-    if kb_sources and last_local_reply and final_status == "completed":
+    if kb_sources and last_local_reply and final_status in ("completed", "halted_step_bound"):
         src_line = "\n\nSource: " + ", ".join(kb_sources)
         yield {"token": src_line}
         last_local_reply += src_line

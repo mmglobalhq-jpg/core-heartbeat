@@ -374,3 +374,72 @@ def test_repeats_are_dropped_without_losing_the_rest_of_the_batch():
     ]
     out = _route_with_history(mixed, [sig])
     assert [c["name"] for c in out["tool_calls"]] == ["get_latest_reit_report"]
+
+
+# --- step-bound: answer with something rather than nothing -------------------
+
+
+def _sup(step, visited):
+    return {
+        "intent": IntentPayload(intent="calendar", confidence=0.9, source="t",
+                                raw_input="what football games are on my calendar?"),
+        "messages": [], "prior_context": [], "user_id": "u1",
+        "documents": "", "document_images": [], "visited": visited, "step": step,
+    }
+
+
+def test_step_bound_composes_instead_of_returning_nothing():
+    """Observed: a read that found nothing looped until MAX_STEPS and the turn ended
+    with "No reply produced (status: halted_step_bound)". Work had happened, tools
+    had run, and none of it reached the user."""
+    out = orchestrator.supervisor(_sup(orchestrator.MAX_STEPS, []))
+    assert out["next"] == "local_llm", "must spend a final step composing"
+    assert out["truncated"] is True
+    assert out["status"] == "halted_step_bound", "the halt stays visible for triage"
+
+
+def test_step_bound_does_not_loop_once_it_has_composed():
+    """The load-bearing half. Without the visited check, local_llm returns at
+    step+1, the bound is still exceeded, and it routes to local_llm until
+    RECURSION_LIMIT kills the run — a bad turn made worse."""
+    out = orchestrator.supervisor(_sup(orchestrator.MAX_STEPS + 1, ["local_llm"]))
+    assert out["next"] == "finish"
+    assert out["status"] == "halted_step_bound"
+
+
+def test_step_bound_has_headroom_under_the_hard_limit():
+    """One extra node visit must not approach LangGraph's recursion catch."""
+    assert orchestrator.MAX_STEPS + 2 < orchestrator.RECURSION_LIMIT
+
+
+def test_step_bound_clears_pending_tool_state():
+    """A batch left on the channel must not ride along into the composing step."""
+    out = orchestrator.supervisor(_sup(orchestrator.MAX_STEPS, []))
+    assert out["tool_calls"] is None
+    assert out["tool_request"] is None
+    assert out["pending_plan"] is None
+
+
+def test_truncation_note_forbids_claiming_completeness():
+    """A partial answer presented as complete is worse than the bare warning it
+    replaces — the user cannot tell anything is missing."""
+    block = orchestrator._truncation_block({"truncated": True})
+    assert "step limit" in block
+    assert "not able to finish" in block
+    assert "do NOT claim any action succeeded" in block.replace("Do NOT", "do NOT")
+
+
+def test_no_truncation_note_on_an_ordinary_turn():
+    """Normal turns must be byte-identical to before."""
+    assert orchestrator._truncation_block({}) == ""
+    assert orchestrator._truncation_block({"truncated": False}) == ""
+
+
+def test_truncation_note_reaches_the_compose_prompt():
+    state = {
+        "intent": IntentPayload(intent="calendar", confidence=0.9, source="t",
+                                raw_input="what games do I have?"),
+        "messages": [], "prior_context": [], "user_id": "u1",
+        "documents": "", "truncated": True,
+    }
+    assert "step limit" in orchestrator._build_local_prompt(state)

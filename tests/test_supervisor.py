@@ -163,14 +163,37 @@ def test_supervisor_degrades_on_failure(monkeypatch):
 
 
 def test_supervisor_step_bound_no_model_call(monkeypatch):
-    # at the bound, the supervisor must not call the model
+    # At the bound the supervisor must not call the ROUTING model — that is the cost
+    # guard this test exists for, and it still holds.
+    #
+    # It no longer finishes outright, though. Finishing here ended the turn with
+    # nothing composed, so the user saw only "No reply produced (status:
+    # halted_step_bound)" after tools had already run. The bound now spends one final
+    # step composing from whatever was gathered; routing to local_llm costs no
+    # routing round-trip.
     def _boom():
-        raise AssertionError("model should not be called at the step bound")
+        raise AssertionError("routing model should not be called at the step bound")
     monkeypatch.setattr(orchestrator, "get_client", lambda *a, **k: FakeClient(_boom))
     s = state()
     s["step"] = orchestrator.MAX_STEPS
     update = supervisor(s)
-    assert update["next"] == "finish" and update["status"] == "halted_step_bound"
+    assert update["next"] == "local_llm"
+    assert update["status"] == "halted_step_bound"  # the halt stays visible for triage
+    assert update["truncated"] is True
+
+
+def test_supervisor_step_bound_finishes_once_it_has_composed(monkeypatch):
+    # The other half: after local_llm has run, the bound must finish rather than
+    # route again. Without this the graph loops to RECURSION_LIMIT.
+    def _boom(*a, **k):
+        raise AssertionError("routing model should not be called at the step bound")
+    monkeypatch.setattr(orchestrator, "get_client", _boom)
+    s = state()
+    s["step"] = orchestrator.MAX_STEPS + 1
+    s["visited"] = ["local_llm"]
+    update = supervisor(s)
+    assert update["next"] == "finish"
+    assert update["status"] == "halted_step_bound"
 
 
 def test_supervisor_finish_fastpath_skips_model_call(monkeypatch):
