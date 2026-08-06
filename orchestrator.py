@@ -989,10 +989,12 @@ def _describe_call(call: dict) -> str:
         when = args.get("start", "?")
         return f"Add \"{args.get('summary', 'Untitled')}\" — {when}"
     if name == "update_calendar_event":
-        changed = ", ".join(k for k in args if k != "event_id") or "no fields"
-        return f"Change event {args.get('event_id', '?')} ({changed})"
+        # Show the new VALUES, not just which fields move. "start" tells the user
+        # nothing about whether the change is right.
+        changes = ", ".join(f"{k} -> {v}" for k, v in args.items() if k != "event_id")
+        return f"Change event [id: {args.get('event_id', '?')}] ({changes or 'no fields'})"
     if name == "delete_calendar_event":
-        return f"Delete event {args.get('event_id', '?')}"
+        return f"Delete event [id: {args.get('event_id', '?')}]"
     if name == "write_user_note":
         return f"Write note {args.get('filename', '?')}"
     return f"{name} {args}"
@@ -1018,7 +1020,13 @@ def _pending_plan_block(state: GraphState) -> str:
         "List these back to the user clearly, then ask them to confirm before you "
         "carry them out. Do NOT say the actions are done, scheduled, or added — "
         "nothing has happened yet. If any detail looks wrong or ambiguous, point it "
-        "out and ask.\n\n"
+        "out and ask.\n"
+        "Where an action shows [id: ...], that is an internal calendar id and means "
+        "nothing to the user — find that id in the calendar listing above and name "
+        "the event by its title, date and time instead. NEVER ask someone to approve "
+        "deleting or changing a bare id: they cannot check it, and a delete cannot be "
+        "undone. If an id does not appear in any listing above, say you cannot "
+        "identify that event and ask rather than guessing.\n\n"
     )
 
 

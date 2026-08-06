@@ -243,3 +243,36 @@ def test_delete_is_described_legibly():
         {"name": "delete_calendar_event", "args": {"event_id": "evt123"}}
     )
     assert "Delete" in line and "evt123" in line
+
+
+# --- confirmations must be checkable ----------------------------------------
+
+
+def test_update_shows_new_values_not_just_field_names():
+    """"start" tells the user nothing about whether the change is correct."""
+    line = orchestrator._describe_call(
+        {"name": "update_calendar_event",
+         "args": {"event_id": "e1", "start": "2026-09-02T10:00:00"}}
+    )
+    assert "2026-09-02T10:00:00" in line
+
+
+def test_destructive_actions_are_not_approved_by_bare_id():
+    """A raw Google event id is unverifiable. The listing that produced it is in the
+    same turn's context, so the model is told to resolve it to a title and time —
+    otherwise the user is approving a delete they cannot check."""
+    block = orchestrator._pending_plan_block({"pending_plan": [
+        {"name": "delete_calendar_event", "args": {"event_id": "7f3k9d2m"}},
+    ]})
+    assert "[id: 7f3k9d2m]" in block
+    assert "name the event by its title, date and time" in block
+    assert "NEVER ask someone to approve deleting or changing a bare id" in block
+    assert "cannot identify that event" in block
+
+
+def test_every_calendar_write_is_covered_by_the_gate():
+    """Adding, editing and removing must all be gated; searching must not be."""
+    from tools.catalog import WRITE_TOOLS
+    for name in ("create_calendar_event", "update_calendar_event", "delete_calendar_event"):
+        assert name in WRITE_TOOLS, f"{name} would bypass confirmation entirely"
+    assert "list_calendar_events" not in WRITE_TOOLS
