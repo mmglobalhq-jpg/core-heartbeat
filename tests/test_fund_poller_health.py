@@ -16,7 +16,16 @@ from services import fund_pollers
 
 
 class FakeApi:
-    """Stands in for PostgREST. Keyed by (table, fund_id) where it matters."""
+    """Stands in for PostgREST, for both query shapes the report issues.
+
+    Health data is now fetched two ways: snapshot/unresolved/needs-review counts in
+    one batched request each (``fund_id=in.(...)``, every row carrying its own
+    ``fund_id``), and last-success/recent-attempts still per fund
+    (``fund_id=eq.X``), because "latest row per fund" has no single-request form.
+    This models both faithfully — batched responses carry ``fund_id`` and come back
+    ordered, exactly as PostgREST would return them — so the assertions below still
+    exercise real grouping logic rather than passing by construction.
+    """
 
     def __init__(self, funds, snapshots=None, successes=None, unresolved=None, recent=None):
         self.funds = funds
@@ -26,23 +35,52 @@ class FakeApi:
         self.recent = recent or {}
         self.calls: list[str] = []
 
+    @staticmethod
+    def _batched_ids(params):
+        """Fund ids from a ``fund_id=in.(a,b,c)`` filter, or None if not batched."""
+        raw = params.get("fund_id", "")
+        if not raw.startswith("in.("):
+            return None
+        return [i for i in raw[4:].rstrip(")").split(",") if i]
+
     def __call__(self, path, **params):
         self.calls.append(path)
         if path == "funds":
             return self.funds
-        fund_id = params.get("fund_id", "").removeprefix("eq.")
+
+        ids = self._batched_ids(params)
+
         if path == "fund_snapshots":
-            value = self.snapshots.get(fund_id)
-            return [{"as_of_date": value}] if value else []
+            if ids is None:  # legacy per-fund shape
+                value = self.snapshots.get(params.get("fund_id", "").removeprefix("eq."))
+                return [{"as_of_date": value}] if value else []
+            rows = [
+                {"fund_id": fid, "as_of_date": self.snapshots[fid]}
+                for fid in ids
+                if self.snapshots.get(fid)
+            ]
+            # PostgREST honours order=as_of_date.desc; the report takes the first
+            # row seen per fund, so returning these unordered would be a lie.
+            return sorted(rows, key=lambda r: r["as_of_date"], reverse=True)
+
         if path == "poll_attempts":
             if params.get("status", "").startswith("in.(success"):
-                value = self.successes.get(fund_id)
+                value = self.successes.get(params.get("fund_id", "").removeprefix("eq."))
                 return [{"attempt_time": value}] if value else []
             if params.get("status") == "eq.material_revision_applied":
                 return []
             if params.get("is_resolved") == "is.false":
-                return [{"id": str(n)} for n in range(self.unresolved.get(fund_id, 0))]
-            return [{"status": s} for s in self.recent.get(fund_id, [])]
+                if ids is None:
+                    fid = params.get("fund_id", "").removeprefix("eq.")
+                    return [{"id": str(n)} for n in range(self.unresolved.get(fid, 0))]
+                return [
+                    {"fund_id": fid}
+                    for fid in ids
+                    for _ in range(self.unresolved.get(fid, 0))
+                ]
+            fid = params.get("fund_id", "").removeprefix("eq.")
+            return [{"status": s} for s in self.recent.get(fid, [])]
+
         raise AssertionError(f"unexpected table {path}")
 
 
@@ -220,3 +258,68 @@ def test_report_records_that_no_outbound_channel_exists(monkeypatch):
         lambda **kw: {"poller": kw["poller"], "healthy": True},
     )
     assert fund_pollers.fund_poller_health(today=TODAY)["outbound_alerting"] == "none"
+
+
+# --------------------------------------------------------------------------- #
+# Request count — the reason this endpoint was rewritten
+# --------------------------------------------------------------------------- #
+def test_request_count_does_not_grow_five_per_fund(patch_api):
+    """The endpoint issued five sequential requests PER FUND — ~75 round-trips for
+    15 funds, measured at 21-30s, long enough to trip a monitoring timeout on a
+    health check.
+
+    Snapshots, unresolved failures and needs-review counts are now one batched
+    request each regardless of fund count; only the two top-N-per-fund lookups
+    remain per fund, and those run concurrently. So the growth rate is 2 per fund
+    plus a constant, not 5 per fund.
+    """
+    funds = [{"id": f"f{n}", "ticker": f"TICK{n}", "is_active": True} for n in range(15)]
+    fake = patch_api(FakeApi(
+        funds=funds,
+        snapshots={f"f{n}": "2026-08-03" for n in range(15)},
+        successes={f"f{n}": "2026-08-03T06:00:00+00:00" for n in range(15)},
+        recent={f"f{n}": ["success"] for n in range(15)},
+    ))
+    report = fund_pollers._poller_report(
+        poller="jp", tickers=[f"TICK{n}" for n in range(15)],
+        stale_after_days=4, today=TODAY,
+    )
+    assert report["funds_total"] == 15
+
+    # 1 funds + 3 batched + (2 x 15 per-fund) = 34, vs 1 + 75 = 76 before.
+    assert len(fake.calls) == 34
+    assert fake.calls.count("fund_snapshots") == 1, "snapshots must be one batched call"
+
+
+def test_batched_counts_are_attributed_to_the_right_fund(patch_api):
+    """The batched queries return every fund's rows in one response, so grouping by
+    fund_id is now this module's job. Mis-grouping would report one fund's failures
+    against another — worse than being slow."""
+    patch_api(FakeApi(
+        funds=[{"id": "f1", "ticker": "AAA", "is_active": True},
+               {"id": "f2", "ticker": "BBB", "is_active": True}],
+        snapshots={"f1": "2026-08-03", "f2": "2026-08-03"},
+        successes={"f1": "2026-08-03T06:00:00+00:00", "f2": "2026-08-03T06:00:00+00:00"},
+        recent={"f1": ["success"], "f2": ["success"]},
+        unresolved={"f2": 3},
+    ))
+    report = fund_pollers._poller_report(
+        poller="jp", tickers=["AAA", "BBB"], stale_after_days=4, today=TODAY,
+    )
+    by_ticker = {f["ticker"]: f for f in report["funds"]}
+    assert by_ticker["AAA"]["unresolved_failures"] == 0
+    assert by_ticker["BBB"]["unresolved_failures"] == 3
+    assert by_ticker["AAA"]["healthy"] is True
+    assert by_ticker["BBB"]["healthy"] is False
+
+
+def test_no_matching_funds_reports_unhealthy_not_a_crash(patch_api):
+    """An empty id list would produce a malformed in.() filter, so this returns
+    early. Unhealthy, matching the previous `bool(entries) and all(...)`."""
+    patch_api(FakeApi(funds=[]))
+    report = fund_pollers._poller_report(
+        poller="jp", tickers=["NOPE"], stale_after_days=4, today=TODAY,
+    )
+    assert report["funds_total"] == 0
+    assert report["healthy"] is False
+    assert report["funds"] == []

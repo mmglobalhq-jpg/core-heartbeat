@@ -40,7 +40,7 @@ from services.storage_sync import sync_user_vault, upload_user_file
 from tools.user_vault import USER_VAULT_TOOLS, read_note, run_vault_tool, write_note
 from tools.graphrag import GRAPHRAG_TOOL_REGISTRY, kb_configured, run_graphrag_tool
 from tools.google_calendar import CALENDAR_TOOL_REGISTRY, run_calendar_tool
-from tools.catalog import ALL_TOOLS
+from tools.catalog import ALL_TOOLS, WRITE_TOOLS
 from tools.reit_research import (
     REIT_TOOL_REGISTRY,
     looks_like_reit_reference,
@@ -307,6 +307,11 @@ class GraphState(TypedDict):
     # style rather than overloading one, so the structured-output path keeps its
     # exact shape and behaviour while both are supported.
     tool_calls: list[dict] | None
+    # Writes proposed but NOT executed, awaiting the user's go-ahead. Set by the
+    # write gate; local_llm renders it as the proposal. Same LastValue semantics as
+    # the two channels above — written fresh every routing turn so a declined plan
+    # is never replayed.
+    pending_plan: list[dict] | None
 
 
 # --- model client (feature 004; multi-provider in feature 006) --------------
@@ -962,6 +967,48 @@ CAPABILITIES_BLOCK = (
 )
 
 
+def _describe_call(call: dict) -> str:
+    """One human-readable line for a proposed tool call.
+
+    The user is being asked to approve these, so the line has to carry what they'd
+    need to spot a mistake — the summary and the date for an event, the path for a
+    note — not the raw tool name and a JSON blob.
+    """
+    name, args = call.get("name", "?"), call.get("args") or {}
+    if name == "create_calendar_event":
+        when = args.get("start", "?")
+        return f"Add \"{args.get('summary', 'Untitled')}\" — {when}"
+    if name == "update_calendar_event":
+        changed = ", ".join(k for k in args if k != "event_id") or "no fields"
+        return f"Change event {args.get('event_id', '?')} ({changed})"
+    if name == "delete_calendar_event":
+        return f"Delete event {args.get('event_id', '?')}"
+    if name == "write_user_note":
+        return f"Write note {args.get('filename', '?')}"
+    return f"{name} {args}"
+
+
+def _pending_plan_block(state: GraphState) -> str:
+    """Render writes awaiting approval, with instructions to ask rather than claim.
+
+    Nothing here has run. The wording matters: if the model says "done" the user
+    will believe events exist that don't, which is worse than not offering at all.
+    """
+    plan = state.get("pending_plan")
+    if not plan:
+        return ""
+    lines = "\n".join(f"  {i}. {_describe_call(c)}" for i, c in enumerate(plan, 1))
+    return (
+        f"\nYou have PROPOSED the following {len(plan)} action(s). They have NOT been "
+        "performed yet and are waiting on the user:\n"
+        f"{lines}\n"
+        "List these back to the user clearly, then ask them to confirm before you "
+        "carry them out. Do NOT say the actions are done, scheduled, or added — "
+        "nothing has happened yet. If any detail looks wrong or ambiguous, point it "
+        "out and ask.\n\n"
+    )
+
+
 def _build_local_prompt(state: GraphState) -> str:
     """Deterministic inference prompt from the intent + message history.
 
@@ -989,6 +1036,7 @@ def _build_local_prompt(state: GraphState) -> str:
         f"Intent: {intent.intent}\n"
         f"Raw input: {intent.raw_input}\n"
         f"Conversation so far:\n{history or '(none)'}\n"
+        f"{_pending_plan_block(state)}"
         f"{CAPABILITIES_BLOCK}"
         "Answer the user's request above directly, and stay strictly on its "
         "specific subject — do NOT drift onto related-but-different topics or list "
@@ -1242,6 +1290,7 @@ def supervisor(state: GraphState) -> dict:
             "usage": TokenUsage(),
             "tool_request": None,
             "tool_calls": None,
+            "pending_plan": None,
             "messages": [Message(source="supervisor", content="route -> finish (fast-path: answered)", step=step)],
         }
 
@@ -1262,6 +1311,7 @@ def supervisor(state: GraphState) -> dict:
             "usage": TokenUsage(),
             "tool_request": None,
             "tool_calls": None,
+            "pending_plan": None,
             "messages": [Message(source="supervisor", content="route -> local_llm (fast-path: compose KB)", step=step)],
         }
 
@@ -1326,6 +1376,56 @@ def supervisor(state: GraphState) -> dict:
         return _degraded(step, failure, usage)
 
     return _finish_routing(state, step, decision, usage, [])
+
+
+# Write batches at or above this size are proposed before they run. One or two
+# wrong events are trivial to delete by hand; a dozen is a mess, and
+# create_calendar_event has no undo. Deletes are always confirmed regardless of
+# count. Tunable without a rebuild.
+WRITE_CONFIRM_THRESHOLD = int(os.environ.get("WRITE_CONFIRM_THRESHOLD", "3"))
+ALWAYS_CONFIRM_TOOLS = frozenset({"delete_calendar_event"})
+
+# Short, unambiguous go-aheads. Deliberately narrow: a miss re-proposes (mildly
+# annoying), while a false positive runs writes the user didn't authorize. When in
+# doubt this must fail toward asking again.
+_AFFIRMATIONS = frozenset({
+    "y", "ya", "yes", "yes please", "yep", "yeah", "yup", "sure", "ok", "okay",
+    "do it", "go ahead", "go for it", "please do", "confirm", "confirmed",
+    "add them", "add them all", "add it", "create them", "sounds good",
+    "yes do it", "yes go ahead", "yes add them", "proceed", "approved",
+})
+
+
+def _is_affirmation(raw: str) -> bool:
+    """Is this message a bare go-ahead rather than a new instruction?
+
+    Length-capped on purpose: "yes, but move the first one to Friday" is a revision,
+    not a confirmation, and must go back through planning rather than releasing the
+    batch that was proposed before the change.
+    """
+    cleaned = re.sub(r"[^a-z ]", "", (raw or "").strip().lower()).strip()
+    cleaned = re.sub(r"\s+", " ", cleaned)
+    return bool(cleaned) and len(cleaned.split()) <= 4 and cleaned in _AFFIRMATIONS
+
+
+def _needs_confirmation(calls: list[dict]) -> bool:
+    """Should this batch be shown to the user before it runs?"""
+    if any(c["name"] in ALWAYS_CONFIRM_TOOLS for c in calls):
+        return True
+    writes = [c for c in calls if c["name"] in WRITE_TOOLS]
+    return len(writes) >= WRITE_CONFIRM_THRESHOLD
+
+
+def _confirmation_given(state: GraphState) -> bool:
+    """Did the user just approve a plan we proposed on the previous turn?
+
+    Requires BOTH a bare affirmation now and an assistant turn before it — so an
+    opening "yes" in a fresh conversation cannot release a batch of writes.
+    """
+    raw = (getattr(state["intent"], "raw_input", "") or "").strip()
+    if not _is_affirmation(raw):
+        return False
+    return any(m.source == "assistant" for m in state.get("prior_context", []))
 
 
 def _finish_routing(
@@ -1418,6 +1518,7 @@ def _finish_routing(
             "usage": usage,
             "tool_request": None,
             "tool_calls": None,
+            "pending_plan": None,
             "messages": [
                 Message(
                     source="supervisor",
@@ -1453,8 +1554,22 @@ def _finish_routing(
         if kb_consulted:
             calls = [c for c in calls if c["name"] not in GRAPHRAG_TOOL_REGISTRY] or None
 
+    # Write gate. Native tool calling can emit a dozen create_calendar_event calls
+    # from one sentence, and there is no undo beyond deleting each event by hand —
+    # so a batch of writes is PROPOSED, not run. The plan goes to local_llm, which
+    # presents it and asks; the user's "yes" is the next turn, and _confirmation_given
+    # releases it there. Reads are never gated.
+    pending_plan: list[dict] | None = None
+    if calls and _needs_confirmation(calls) and not _confirmation_given(state):
+        pending_plan = calls
+        calls = None
+        tool_request = None
+        nxt = "local_llm"
+
     label = f"route -> {nxt}"
-    if calls:
+    if pending_plan:
+        label = f"route -> {nxt} (proposing {len(pending_plan)} writes for confirmation)"
+    elif calls:
         label = f"route -> {nxt} ({len(calls)} calls: {', '.join(c['name'] for c in calls)})"
     elif tool_request is not None:
         label = f"route -> {nxt} ({tool_request['name']})"
@@ -1465,6 +1580,7 @@ def _finish_routing(
         "usage": usage,
         "tool_request": tool_request,
         "tool_calls": calls,
+        "pending_plan": pending_plan,
         "messages": [Message(source="supervisor", content=label, step=step)],
     }
     if nxt == "finish":
@@ -2023,6 +2139,7 @@ def _initial_state(payload: IntentPayload, user_id: str) -> GraphState:
         "status": "",
         "tool_request": None,
         "tool_calls": None,
+        "pending_plan": None,
     }
 
 

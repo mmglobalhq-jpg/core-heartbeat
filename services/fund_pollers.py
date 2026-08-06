@@ -24,7 +24,13 @@ import logging
 import os
 import urllib.parse
 import urllib.request
+from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any
+
+# Fan-out for the two lookups that cannot be batched. Bounded so a health check
+# never becomes the heaviest client Supabase has.
+_HEALTH_CONCURRENCY = int(os.environ.get("FUND_HEALTH_CONCURRENCY", "8"))
 
 logger = logging.getLogger(__name__)
 
@@ -121,6 +127,27 @@ def _consecutive_failures(statuses: list[str]) -> int:
     return streak
 
 
+def _empty_report(poller: str) -> dict[str, Any]:
+    """Report for a poller whose tickers matched no funds.
+
+    ``healthy`` is False, matching the previous ``bool(entries) and all(...)`` — no
+    funds means nothing proved healthy, and the batched queries below cannot run
+    against an empty id list anyway.
+    """
+    return {
+        "poller": poller,
+        "funds_total": 0,
+        "funds_healthy": 0,
+        "funds_stale": 0,
+        "unresolved_failures": 0,
+        "needs_review_revisions": 0,
+        "max_consecutive_failures": 0,
+        "stale_data": False,
+        "healthy": False,
+        "funds": [],
+    }
+
+
 def _poller_report(
     *,
     poller: str,
@@ -130,20 +157,61 @@ def _poller_report(
 ) -> dict[str, Any]:
     funds = _get("funds", select="id,ticker,is_active", ticker=f"in.({','.join(tickers)})")
     by_id = {f["id"]: f["ticker"] for f in funds}
-    entries: list[dict[str, Any]] = []
+    if not by_id:
+        return _empty_report(poller)
+    ids = ",".join(str(i) for i in by_id)
 
-    for fund_id, ticker in sorted(by_id.items(), key=lambda kv: kv[1]):
-        snapshots = _get(
-            "fund_snapshots",
-            select="as_of_date",
-            fund_id=f"eq.{fund_id}",
-            is_current="is.true",
-            snapshot_status="eq.accepted",
-            order="as_of_date.desc",
-            limit="1",
-        )
-        last_as_of = _parse_date(snapshots[0]["as_of_date"]) if snapshots else None
+    # Three of the five per-fund queries are plain filters, so they collapse into one
+    # request each across every fund. The endpoint used to issue five requests PER
+    # FUND — ~75 sequential round-trips to Supabase for 15 funds, measured at 21-30s,
+    # which is long enough to trip a monitoring timeout on a health check.
+    #
+    # The other two are "latest row per fund" and "last 50 rows per fund", which
+    # PostgREST cannot express in one request without a time window — and narrowing
+    # the window on a health endpoint risks reporting a fund healthy because its
+    # failures fell outside it. Those stay per-fund and run concurrently instead, so
+    # the semantics are byte-identical to before and only the latency changes.
+    snapshot_rows = _get(
+        "fund_snapshots",
+        select="fund_id,as_of_date",
+        fund_id=f"in.({ids})",
+        is_current="is.true",
+        snapshot_status="eq.accepted",
+        order="as_of_date.desc",
+        limit=str(50 * len(by_id)),
+    )
+    latest_as_of: dict[Any, dt.date] = {}
+    for row in snapshot_rows:  # ordered desc, so first seen per fund wins
+        parsed = _parse_date(row.get("as_of_date"))
+        if parsed and row.get("fund_id") not in latest_as_of:
+            latest_as_of[row.get("fund_id")] = parsed
 
+    unresolved_rows = _get(
+        "poll_attempts",
+        select="fund_id",
+        fund_id=f"in.({ids})",
+        is_resolved="is.false",
+        status=f"in.({','.join(_FAILURE_STATUSES)})",
+        limit=str(500 * len(by_id)),
+    )
+    unresolved_by_fund: dict[Any, int] = defaultdict(int)
+    for row in unresolved_rows:
+        unresolved_by_fund[row.get("fund_id")] += 1
+
+    review_rows = _get(
+        "poll_attempts",
+        select="fund_id",
+        fund_id=f"in.({ids})",
+        status="eq.material_revision_applied",
+        is_resolved="is.false",
+        limit=str(200 * len(by_id)),
+    )
+    review_by_fund: dict[Any, int] = defaultdict(int)
+    for row in review_rows:
+        review_by_fund[row.get("fund_id")] += 1
+
+    def _per_fund(fund_id: Any) -> tuple[dt.datetime | None, int]:
+        """The two top-N-per-fund lookups that can't be batched."""
         successes = _get(
             "poll_attempts",
             select="attempt_time",
@@ -152,16 +220,6 @@ def _poller_report(
             order="attempt_time.desc",
             limit="1",
         )
-        last_success = _parse_ts(successes[0]["attempt_time"]) if successes else None
-
-        unresolved = _get(
-            "poll_attempts",
-            select="id",
-            fund_id=f"eq.{fund_id}",
-            is_resolved="is.false",
-            status=f"in.({','.join(_FAILURE_STATUSES)})",
-            limit="500",
-        )
         recent = _get(
             "poll_attempts",
             select="status",
@@ -169,18 +227,19 @@ def _poller_report(
             order="attempt_time.desc",
             limit="50",
         )
-        needs_review = _get(
-            "poll_attempts",
-            select="id",
-            fund_id=f"eq.{fund_id}",
-            status="eq.material_revision_applied",
-            is_resolved="is.false",
-            limit="200",
-        )
+        last_success = _parse_ts(successes[0]["attempt_time"]) if successes else None
+        return last_success, _consecutive_failures([r["status"] for r in recent])
 
+    ordered = sorted(by_id.items(), key=lambda kv: kv[1])
+    with ThreadPoolExecutor(max_workers=min(_HEALTH_CONCURRENCY, len(ordered))) as pool:
+        per_fund = list(pool.map(lambda kv: _per_fund(kv[0]), ordered))
+
+    entries: list[dict[str, Any]] = []
+    for (fund_id, ticker), (last_success, streak) in zip(ordered, per_fund):
+        last_as_of = latest_as_of.get(fund_id)
+        unresolved_count = unresolved_by_fund.get(fund_id, 0)
         age_days = (today - last_as_of).days if last_as_of else None
         stale = age_days is None or age_days > stale_after_days
-        streak = _consecutive_failures([r["status"] for r in recent])
         entries.append(
             {
                 "ticker": ticker,
@@ -189,9 +248,9 @@ def _poller_report(
                 "stale_data": stale,
                 "last_successful_run": last_success.isoformat() if last_success else None,
                 "consecutive_failures": streak,
-                "unresolved_failures": len(unresolved),
-                "needs_review_revisions": len(needs_review),
-                "healthy": not stale and not unresolved,
+                "unresolved_failures": unresolved_count,
+                "needs_review_revisions": review_by_fund.get(fund_id, 0),
+                "healthy": not stale and not unresolved_count,
             }
         )
 
