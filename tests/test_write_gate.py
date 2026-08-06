@@ -308,3 +308,61 @@ def test_a_genuine_repeat_yes_still_reports_honestly():
     """The fix must not silence the real case: a NEW turn where nothing is held."""
     out = _route([], raw="yes", prior=_assistant_turn())
     assert out["plan_note"] is not None
+
+
+# --- repeat-call guard ------------------------------------------------------
+
+
+def _route_with_history(calls, executed, raw="what football games are on my calendar?"):
+    state = {
+        "intent": IntentPayload(intent="calendar", confidence=0.9, source="t", raw_input=raw),
+        "messages": [], "prior_context": [], "user_id": "u1",
+        "documents": "", "document_images": [], "visited": ["tool_execution"],
+        "step": 1, "executed_calls": executed,
+    }
+    first = calls[0] if calls else None
+    decision = RoutingDecision(
+        next_node="tool_execution" if calls else "local_llm",
+        tool_name=first["name"] if first else None,
+        tool_args=ToolArgs(**(first["args"] if first else {})),
+    )
+    return orchestrator._finish_routing(state, 1, decision, TokenUsage(), calls)
+
+
+def test_an_identical_repeat_call_is_dropped():
+    """Observed: asking about football games on a calendar with none produced
+    list_calendar_events four times, exhausted MAX_STEPS, and returned "No reply
+    produced (status: halted_step_bound)". An empty result is the answer."""
+    call = [{"name": "list_calendar_events", "args": {}}]
+    sig = orchestrator._call_signature("list_calendar_events", {})
+    out = _route_with_history(call, [sig])
+    assert out["next"] == "local_llm", "must compose, not search again"
+    assert out["tool_calls"] is None
+
+
+def test_same_tool_with_different_args_gets_a_bounded_retry():
+    """Narrowing a date range is legitimate; looping on it is not."""
+    sig = orchestrator._call_signature("list_calendar_events", {})
+    wider = [{"name": "list_calendar_events", "args": {"time_min": "2026-01-01T00:00:00"}}]
+    out = _route_with_history(wider, [sig])
+    assert out["next"] == "tool_execution", "a genuine retry with new args is allowed"
+
+    out2 = _route_with_history(wider, [sig, sig])  # already at the cap
+    assert out2["next"] == "local_llm", "but not without bound"
+
+
+def test_a_fresh_call_is_unaffected():
+    call = [{"name": "list_calendar_events", "args": {}}]
+    out = _route_with_history(call, [])
+    assert out["next"] == "tool_execution"
+    assert len(out["tool_calls"]) == 1
+
+
+def test_repeats_are_dropped_without_losing_the_rest_of_the_batch():
+    sig = orchestrator._call_signature("list_calendar_events", {})
+    mixed = [
+        {"name": "list_calendar_events", "args": {}},
+        {"name": "get_latest_reit_report", "args": {"reit_symbol": "ARR"}},
+    ]
+    out = _route_with_history(mixed, [sig])
+    assert [c["name"] for c in out["tool_calls"]] == ["get_latest_reit_report"]

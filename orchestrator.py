@@ -73,6 +73,11 @@ MAX_STEPS = 8          # graceful step bound (Supervisor finishes at/after this)
 # every call in one response; this bounds how many actually run at once, because
 # "add my season" against Google Calendar is a burst of writes to one API.
 MAX_PARALLEL_TOOL_CALLS = int(os.environ.get("MAX_PARALLEL_TOOL_CALLS", "4"))
+# How many times one tool may run in a single turn. Enough for a genuine retry with
+# different arguments (a wider date range, different search terms); far below
+# MAX_STEPS, so a loop is cut short by this rather than by the step bound, which
+# ends the turn with no reply at all.
+MAX_SAME_TOOL_CALLS = int(os.environ.get("MAX_SAME_TOOL_CALLS", "2"))
 # Native tool calling: schemas generated from tools/catalog.py and several calls
 # per response. Off by default — this is the hot path for every chat turn, so the
 # switch is an env var and rollback needs no redeploy.
@@ -315,6 +320,13 @@ class GraphState(TypedDict):
     # the two channels above — written fresh every routing turn so a declined plan
     # is never replayed.
     pending_plan: list[dict] | None
+    # Signatures of tool calls already executed THIS TURN, appended by
+    # tool_execution. The native router re-emits a call whenever the result doesn't
+    # answer the question — asking "what football games are on my calendar?" with no
+    # football games on it produced list_calendar_events four times until MAX_STEPS
+    # halted the turn and the user got no reply at all. An empty result IS the
+    # answer; this is what lets the graph notice the call already happened.
+    executed_calls: Annotated[list[str], operator.add]
     # A short instruction for local_llm about the state of a proposed plan (e.g. the
     # user approved something we no longer hold). Keeps the composer from narrating
     # actions that were never dispatched.
@@ -692,8 +704,10 @@ def _build_native_prompt(state: GraphState) -> str:
         "- If the request covers SEVERAL items (a schedule with many games, a list of "
         "notes), emit ONE tool call PER ITEM in this single response. Do not do one "
         "and stop, and do not ask which to start with.\n"
-        "- If a tool result already appears above and answers the request, call "
-        "nothing.\n"
+        "- If a tool result already appears above, do NOT run the same tool again. "
+        "An empty or \"no matching events\" result IS an answer — it means there are "
+        "none, and the next step will say so. Re-running the search will not change "
+        "it.\n"
         "- If no tool applies — general knowledge, chit-chat, or a question about an "
         "attachment — call nothing.\n"
         "- Never invent ids or dates. Ambiguous ones get resolved against the current "
@@ -1688,6 +1702,37 @@ def _finish_routing(
         if kb_consulted:
             calls = [c for c in calls if c["name"] not in GRAPHRAG_TOOL_REGISTRY] or None
 
+    # Repeat-call guard. The model re-emits a call when the result doesn't answer the
+    # question, but "no matching events" IS the answer — it just doesn't look like one.
+    # Observed: "what football games are on my calendar?" against a calendar with none
+    # produced list_calendar_events four times, exhausted MAX_STEPS, and returned
+    # "No reply produced (status: halted_step_bound)" — the user got nothing at all.
+    #
+    # Identical calls are dropped outright. Same tool with DIFFERENT args is allowed
+    # a bounded number of tries, because narrowing a date range or re-searching with
+    # other terms is legitimate; looping on it is not.
+    if calls:
+        already = list(state.get("executed_calls") or [])
+        ran_names = [sig.split(":", 1)[0] for sig in already]
+        fresh = [
+            c for c in calls
+            if _call_signature(c["name"], c["args"]) not in already
+            and ran_names.count(c["name"]) < MAX_SAME_TOOL_CALLS
+        ]
+        if len(fresh) != len(calls):
+            _trace("gate.repeat_dropped", dropped=len(calls) - len(fresh),
+                   kept=len(fresh), already=len(already))
+        calls = fresh
+        if not calls:
+            # Everything requested has already run. Compose from those results
+            # rather than asking for them again.
+            _trace("gate.all_repeats", nxt="local_llm", already=len(already))
+            nxt = "local_llm"
+            tool_request = None
+            # None, not [] — the channel means "no request", and an empty list
+            # reads as one in some checks while being falsy in others.
+            calls = None
+
     # Write gate. Native tool calling can emit a dozen create_calendar_event calls
     # from one sentence, and there is no undo beyond deleting each event by hand —
     # so a batch of writes is PROPOSED, not run, and the user's next message releases
@@ -1903,6 +1948,14 @@ async def local_llm(state: GraphState) -> dict:
     }
 
 
+def _call_signature(name: str, args: dict) -> str:
+    """Stable identity for a tool call, so a repeat is recognisable."""
+    try:
+        return f"{name}:{json.dumps(args or {}, sort_keys=True, default=str)}"
+    except Exception:
+        return f"{name}:{args!r}"
+
+
 def _dispatch_tool(name: str, args: dict, user_id: str) -> tuple[str, list[str] | None]:
     """Run one tool. Returns ``(result_text, kb_source_titles_or_None)``.
 
@@ -2022,6 +2075,7 @@ def tool_execution(state: GraphState) -> dict:
         "usage": TOOL_USAGE,
         "visited": ["tool_execution"],
         "step": 1,
+        "executed_calls": [_call_signature(c["name"], c["args"]) for c in calls],
     }
     # Record the KB source titles (only when a KB tool ran) so astream_run can cite
     # them at the end of the composed answer. Last-write-wins on the channel.
