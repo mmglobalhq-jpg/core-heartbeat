@@ -29,7 +29,7 @@ GOOGLE_TOKEN_URL = "https://oauth2.googleapis.com/token"
 CAL_BASE = "https://www.googleapis.com/calendar/v3"
 REQUEST_TIMEOUT_S = 30.0
 EXPIRY_BUFFER_S = 60          # refresh a little before actual expiry
-MAX_RESULTS_CAP = 25
+MAX_RESULTS_CAP = 50
 DEFAULT_WINDOW_DAYS = 7      # "what's coming up" (no search term)
 SEARCH_WINDOW_DAYS = 180     # widen when searching by name/keyword
 
@@ -200,10 +200,14 @@ def list_events(user_id: str, args: dict) -> str:
     window_days = SEARCH_WINDOW_DAYS if args.get("query") else DEFAULT_WINDOW_DAYS
     time_min = _to_rfc3339(args.get("time_min"), _rfc3339(_now()), _tz)
     time_max = _to_rfc3339(args.get("time_max"), _rfc3339(_now() + timedelta(days=window_days)), _tz)
+    # A season of games is 10-15 events, so a default of 10 silently truncated the
+    # answer: asking "what football games are on my calendar?" returned a partial
+    # list that read as complete. The window is already bounded above, so the cost
+    # of a larger default is a slightly longer prompt, not a runaway result set.
     try:
-        max_results = int(args.get("max_results") or 10)
+        max_results = int(args.get("max_results") or 25)
     except (TypeError, ValueError):
-        max_results = 10
+        max_results = 25
     params = {
         "timeMin": time_min, "timeMax": time_max,
         "singleEvents": "true", "orderBy": "startTime",

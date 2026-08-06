@@ -2018,7 +2018,10 @@ def tool_execution(state: GraphState) -> dict:
     calls = _requested_tool_calls(state)
     user_id = state.get("user_id", SANDBOX_USER_ID)
     _trace("tools.execute", pid=os.getpid(), n=len(calls),
-           names=",".join(c["name"] for c in calls) or "-")
+           names=",".join(c["name"] for c in calls) or "-",
+           # Args matter for diagnosis: a read that returns too little is usually a
+           # too-narrow window or an over-specific search term, invisible without them.
+           args=[c["args"] for c in calls][:3])
 
     if not calls:
         return {

@@ -124,6 +124,17 @@ def list_calendar_events(
     (e.g. "2026-08-21T19:00:00"). Each returned event ends with [id: <event_id>] —
     that id is what update_calendar_event and delete_calendar_event need, so list
     first when changing or removing something.
+
+    `query` is a LITERAL text match against the title, description and location —
+    not a concept search. "game" matches only events with the word "game" in them
+    and silently misses "MUS JV/9th Football vs ECS". For a question like "do I have
+    any football games?", either omit `query` and pass an explicit wide time_min /
+    time_max, or search on a distinctive word that appears in EVERY event you want
+    (here, "football"). A too-specific term returns a short list that looks complete
+    and is not.
+
+    Passing any `query` widens the default window to ~6 months. If you need a
+    different span, set time_min/time_max explicitly rather than relying on defaults.
     """
     args = {
         k: v
