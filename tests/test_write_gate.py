@@ -443,3 +443,44 @@ def test_truncation_note_reaches_the_compose_prompt():
         "documents": "", "truncated": True,
     }
     assert "step limit" in orchestrator._build_local_prompt(state)
+
+
+# --- closed-world capabilities ----------------------------------------------
+
+
+def test_capabilities_block_states_the_list_is_exhaustive():
+    """Without this the composer offered things that do not exist — "I can help you
+    compose the email to your boss", and later "Would you like me to try searching
+    the web?" before any web tool existed. Nothing told it the list was complete, so
+    anything assistant-shaped seemed plausible."""
+    block = orchestrator.CAPABILITIES_BLOCK
+    assert "That list is COMPLETE" in block
+    for absent in ("send email", "text messages", "make calls", "place orders"):
+        assert absent.split()[0] in block.lower(), f"{absent} not ruled out"
+
+
+def test_capabilities_block_requires_naming_the_boundary():
+    """Offering an adjacent capability is fine; blurring it is not. "I can help you
+    with that email" reads as though it will arrive."""
+    block = orchestrator.CAPABILITIES_BLOCK
+    assert "name the boundary" in block
+    assert "can't send it myself" in block
+
+
+def test_capabilities_block_still_lists_what_is_real():
+    """The closed-world statement must not cost the in-scope offers — refusing a
+    calendar add would be a worse regression than over-offering."""
+    block = orchestrator.CAPABILITIES_BLOCK
+    for capability in ("Google Calendar", "Knowledge base", "Notes", "live internet"):
+        assert capability in block
+    assert "NEVER tell the user you are unable to do one of the things listed above" in block
+
+
+def test_every_listed_capability_maps_to_a_real_tool():
+    """A capability claimed here with no tool behind it is the original bug in a new
+    costume."""
+    from tools.catalog import CATALOG_TOOL_NAMES
+    assert {"search_web", "fetch_url"} <= CATALOG_TOOL_NAMES      # live internet
+    assert {"create_calendar_event", "list_calendar_events"} <= CATALOG_TOOL_NAMES
+    assert "query_knowledge_base" in CATALOG_TOOL_NAMES
+    assert {"read_user_note", "write_user_note"} <= CATALOG_TOOL_NAMES
