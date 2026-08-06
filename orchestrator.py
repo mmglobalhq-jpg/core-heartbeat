@@ -750,7 +750,7 @@ def _decide_native(
         ), TokenUsage()
 
     prompt = _build_native_prompt(state)
-    content = _as_content_parts(prompt, _turn_images(state), "anthropic")
+    content = _as_content_parts(prompt, _turn_images(state), "langchain")
     try:
         response = bound.invoke([{"role": "user", "content": content}])
     except Exception as exc:  # never crash the graph
@@ -2390,6 +2390,26 @@ def _as_content_parts(prompt: str, images: list[dict], provider: str):
                 {"inline_data": {"mime_type": img["media_type"], "data": img["data"]}}
             )
         return [{"role": "user", "parts": parts}]
+    if provider == "langchain":
+        # LangChain chat models take OpenAI-style parts and reject the Anthropic
+        # shape outright: "ValueError: Unrecognized message part type: image."
+        #
+        # The native router was passing provider="anthropic" here, so EVERY turn
+        # with an attached image raised, fell back to the structured router, and
+        # ended up composing an offer instead of proposing a plan. The user then
+        # confirmed a plan that had never been stored. A text-only turn worked
+        # fine, which is what made this look like a context-loss bug.
+        parts = [{"type": "text", "text": prompt}]
+        for img in images:
+            parts.append(
+                {
+                    "type": "image_url",
+                    "image_url": {
+                        "url": f"data:{img['media_type']};base64,{img['data']}"
+                    },
+                }
+            )
+        return parts
     return prompt  # unknown provider -> text only, never fail the turn
 
 

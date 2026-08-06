@@ -364,3 +364,28 @@ def test_native_router_sees_prior_conversation_but_the_structured_one_does_not()
     }
     assert "Christian Brothers" in orchestrator._build_native_prompt(state)
     assert "Christian Brothers" not in orchestrator._build_prompt(state)
+
+
+def test_native_router_builds_langchain_image_parts_not_anthropic_ones():
+    """The native router passes content to a LangChain chat model, which rejects
+    Anthropic-shaped image blocks with "Unrecognized message part type: image."
+
+    It was using the anthropic shape, so EVERY turn with an attachment raised,
+    fell back to the structured router, and composed an offer instead of proposing
+    a plan — leaving the user to confirm a plan that had never been stored. Text-only
+    turns were unaffected, which is what made it look like context loss.
+    """
+    img = [{"media_type": "image/jpeg", "data": "QUJD", "filename": "s.jpg"}]
+    parts = orchestrator._as_content_parts("hello", img, "langchain")
+    assert parts[0] == {"type": "text", "text": "hello"}
+    assert parts[1]["type"] == "image_url"
+    assert parts[1]["image_url"]["url"].startswith("data:image/jpeg;base64,")
+    # The shape that fails:
+    assert all(p.get("type") != "image" for p in parts)
+
+
+def test_no_images_still_returns_a_bare_string_for_every_provider():
+    """The guard that keeps image support off the hot path: an attachment-free turn
+    must produce exactly what it always did."""
+    for provider in ("langchain", "anthropic", "gemini", "unknown"):
+        assert orchestrator._as_content_parts("hi", [], provider) == "hi"
