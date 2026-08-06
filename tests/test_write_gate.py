@@ -19,16 +19,24 @@ authorized. Everything here is built to fail toward asking again.
 import pytest
 
 import orchestrator
+from services import pending_plans
 from models import IntentPayload, Message, RoutingDecision, TokenUsage, ToolArgs
 
 
 @pytest.fixture(autouse=True)
-def _no_leaked_plans():
-    """Pending plans live in a module-level dict keyed by user, so without this a
-    proposal from one test would release inside the next."""
-    orchestrator._pending_plans.clear()
+def _no_leaked_plans(monkeypatch):
+    """Isolate the plan store between tests.
+
+    Plans persist to Supabase (migration 0007) with an in-memory fallback. Tests
+    must exercise the fallback rather than a live project, so the Supabase config is
+    unset here — `services.pending_plans` treats that as "no backend" and uses
+    memory, which is the same code path a deploy hits before the migration lands.
+    """
+    monkeypatch.delenv("SUPABASE_URL", raising=False)
+    monkeypatch.delenv("SUPABASE_SERVICE_ROLE_KEY", raising=False)
+    pending_plans._memory.clear()
     yield
-    orchestrator._pending_plans.clear()
+    pending_plans._memory.clear()
 
 
 def _calls(n, name="create_calendar_event"):

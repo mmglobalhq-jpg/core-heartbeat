@@ -72,6 +72,11 @@ class IntentPayload(BaseModel):
     history: list[HistoryTurn] = Field(default_factory=list)
     document_ids: list[str] = Field(default_factory=list)
     timezone: str | None = None  # caller's IANA tz (e.g. "America/Chicago"), for date grounding
+    # Which conversation this turn belongs to. Needed because the propose/confirm
+    # handshake spans two requests: without it a pending plan can only be keyed by
+    # user, so two chats share one slot and approving in one releases the other's
+    # writes. Optional so an older client (or a direct API call) still works.
+    chat_id: str | None = None
 
 
 # ---------------------------------------------------------------------------

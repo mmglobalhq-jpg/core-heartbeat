@@ -39,6 +39,7 @@ from langgraph.errors import GraphRecursionError
 from langgraph.graph import END, StateGraph
 
 from auth import SANDBOX_USER_ID
+from services import pending_plans
 from services.storage_sync import sync_user_vault, upload_user_file
 from tools.user_vault import USER_VAULT_TOOLS, read_note, run_vault_tool, write_note
 from tools.graphrag import GRAPHRAG_TOOL_REGISTRY, kb_configured, run_graphrag_tool
@@ -1480,10 +1481,6 @@ def _is_affirmation(raw: str) -> bool:
 # confirmation lives for seconds that is unlikely, but it is the reason to add a chat
 # id here rather than leave this as-is. In-memory, so a restart drops pending plans —
 # which fails safe: nothing runs and the user re-asks.
-_PENDING_PLAN_TTL_S = 1800
-_pending_plans: dict[str, tuple[float, list[dict]]] = {}
-_pending_plans_lock = threading.Lock()
-
 # --- plan tracing -----------------------------------------------------------
 #
 # The propose/confirm handshake spans two HTTP requests and four components
@@ -1523,36 +1520,27 @@ def _trace(event: str, **fields) -> None:
         pass
 
 
-def _plan_keys() -> list[str]:
-    with _pending_plans_lock:
-        return [k[:8] for k in _pending_plans]
+def _store_pending_plan(user_id: str, chat_id: str | None, calls: list[dict]) -> None:
+    where = pending_plans.save(user_id, chat_id, calls)
+    _trace("store.save", pid=os.getpid(), key=user_id[:8],
+           chat=(chat_id or "-")[:8], n=len(calls), backend=where)
 
 
-def _store_pending_plan(user_id: str, calls: list[dict]) -> None:
-    with _pending_plans_lock:
-        _pending_plans[user_id] = (time.monotonic() + _PENDING_PLAN_TTL_S, list(calls))
-    _trace("store.save", pid=os.getpid(), key=user_id[:8], n=len(calls), keys=_plan_keys())
-
-
-def _take_pending_plan(user_id: str) -> list[dict] | None:
+def _take_pending_plan(user_id: str, chat_id: str | None) -> list[dict] | None:
     """Pop the plan awaiting approval, if one is still valid. Single-use."""
-    with _pending_plans_lock:
-        entry = _pending_plans.pop(user_id, None)
-    if entry is None:
-        _trace("store.take.MISS", pid=os.getpid(), key=user_id[:8], keys_present=_plan_keys())
+    calls, source = pending_plans.take(user_id, chat_id)
+    if not calls:
+        _trace("store.take.MISS", pid=os.getpid(), key=user_id[:8],
+               chat=(chat_id or "-")[:8], source=source)
         return None
-    expires_at, calls = entry
-    expired = time.monotonic() >= expires_at
-    _trace("store.take.HIT", pid=os.getpid(), key=user_id[:8], n=len(calls), expired=expired)
-    return None if expired else calls
+    _trace("store.take.HIT", pid=os.getpid(), key=user_id[:8],
+           chat=(chat_id or "-")[:8], n=len(calls), source=source)
+    return calls
 
 
-def _clear_pending_plan(user_id: str) -> None:
+def _clear_pending_plan(user_id: str, chat_id: str | None) -> None:
     """Drop any proposal — the user asked for something else instead."""
-    with _pending_plans_lock:
-        existed = _pending_plans.pop(user_id, None) is not None
-    if existed:
-        _trace("store.CLEARED", pid=os.getpid(), key=user_id[:8])
+    pending_plans.clear(user_id, chat_id)
 
 
 def _needs_confirmation(calls: list[dict]) -> bool:
@@ -1738,6 +1726,7 @@ def _finish_routing(
     # so a batch of writes is PROPOSED, not run, and the user's next message releases
     # it. Reads are never gated.
     user_id = state.get("user_id", SANDBOX_USER_ID)
+    chat_id = getattr(state["intent"], "chat_id", None)
     pending_plan: list[dict] | None = None
     plan_note: str | None = None
 
@@ -1751,7 +1740,7 @@ def _finish_routing(
         prior_turns=len(prior),
         prior_assistant=sum(1 for m in prior if m.source == "assistant"),
         confirming=_confirmation_given(state),
-        store_keys=_plan_keys(),
+        chat=(chat_id or "-")[:8],
     )
     # The Supervisor runs once per STEP, not once per turn, and raw_input stays "yes"
     # for the whole turn. So after the approved batch runs, the next step re-entered
@@ -1766,7 +1755,7 @@ def _finish_routing(
         _trace("gate.already_honoured", key=user_id[:8], nxt=nxt)
 
     if _confirmation_given(state) and not tools_ran:
-        approved = _take_pending_plan(user_id)
+        approved = _take_pending_plan(user_id, chat_id)
         if approved:
             # Run exactly what was shown and agreed to. Not what the model would
             # regenerate now — the user approved a specific list.
@@ -1778,7 +1767,7 @@ def _finish_routing(
             # process restarted, or it was already used. Say so. Answering a "yes"
             # with narration like "proceeding to add them" while dispatching nothing
             # is precisely the failure this gate exists to prevent.
-            _trace("gate.CONFIRM_NO_PLAN", key=user_id[:8], store_keys=_plan_keys())
+            _trace("gate.CONFIRM_NO_PLAN", key=user_id[:8], chat=(chat_id or "-")[:8])
             plan_note = (
                 "The user just approved something, but no pending plan is on record "
                 "(it may have expired or already run). Tell them plainly that you do "
@@ -1790,7 +1779,7 @@ def _finish_routing(
         pending_plan = calls
         _trace("gate.PROPOSE", n=len(calls),
                names=",".join(sorted({c["name"] for c in calls})))
-        _store_pending_plan(user_id, calls)
+        _store_pending_plan(user_id, chat_id, calls)
         calls = None
         tool_request = None
         nxt = "local_llm"
@@ -1798,7 +1787,7 @@ def _finish_routing(
         # Any other turn means they moved on; a stale proposal must not linger and
         # fire against a later, unrelated "yes".
         _trace("gate.passthrough", n_calls=len(calls or []), nxt=nxt)
-        _clear_pending_plan(user_id)
+        _clear_pending_plan(user_id, chat_id)
 
     label = f"route -> {nxt}"
     if pending_plan:
