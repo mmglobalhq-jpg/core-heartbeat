@@ -38,6 +38,7 @@ from tools.google_calendar import run_calendar_tool
 from tools.graphrag import run_graphrag_tool
 from tools.reit_research import run_reit_tool
 from tools.user_vault import run_vault_tool
+from tools.web_tools import run_web_tool
 
 SANDBOX_FALLBACK = "00000000-0000-0000-0000-000000000000"
 
@@ -264,6 +265,40 @@ def get_latest_reit_report(
     return run_reit_tool("get_latest_reit_report", _uid(state), {"reit_symbol": reit_symbol})
 
 
+# --- web --------------------------------------------------------------------
+
+
+@tool
+def search_web(query: str, state: Annotated[dict, InjectedState]) -> str:
+    """Search the live internet and get an answer grounded in current results.
+
+    Use this whenever the answer depends on information that is current, local,
+    niche, or simply not in the knowledge base — sports rosters, prices, news,
+    opening hours, "who won", anything after your training cutoff. If a
+    query_knowledge_base result above says nothing relevant was found and the
+    question is about the outside world, search rather than answering from memory
+    or telling the user you don't know.
+
+    Pass a natural-language question. Returns an answer plus its source URLs; cite
+    them in your reply.
+    """
+    return run_web_tool("search_web", _uid(state), {"query": query})
+
+
+@tool
+def fetch_url(url: str, state: Annotated[dict, InjectedState]) -> str:
+    """Read one specific web page and return its text.
+
+    Use when the user gives a URL, or when a search result needs reading in full.
+    For open questions use search_web instead — this fetches exactly one page and
+    does not find pages.
+
+    Only public http/https pages work. Private, local and internal addresses are
+    refused by design.
+    """
+    return run_web_tool("fetch_url", _uid(state), {"url": url})
+
+
 # --- the catalog ------------------------------------------------------------
 
 ALL_TOOLS = [
@@ -279,6 +314,8 @@ ALL_TOOLS = [
     list_reit_reports,
     get_reit_report,
     get_latest_reit_report,
+    search_web,
+    fetch_url,
 ]
 
 TOOLS_BY_NAME = {t.name: t for t in ALL_TOOLS}

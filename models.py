@@ -140,6 +140,8 @@ class ToolArgs(BaseModel):
     time_max: str | None = None
     max_results: int | None = None
     # REIT research tools (read-only):
+    # web tools
+    url: str | None = None
     reit_symbol: str | None = None    # issuer symbol/alias, e.g. "ARR" / "ARMOUR"
     report_id: str | None = None      # a specific report's id (from list_reit_reports)
     limit: int | None = None          # bounded result count for list_reit_reports
@@ -167,6 +169,8 @@ class RoutingDecision(BaseModel):
         # google calendar (per-user)
         "list_calendar_events", "create_calendar_event",
         "update_calendar_event", "delete_calendar_event",
+        # web (public internet)
+        "search_web", "fetch_url",
         # REIT research reports (read-only, global)
         "list_reit_issuers", "list_reit_reports",
         "get_reit_report", "get_latest_reit_report",

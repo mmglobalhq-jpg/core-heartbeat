@@ -27,6 +27,7 @@ from tools.google_calendar import CALENDAR_TOOL_REGISTRY
 from tools.graphrag import GRAPHRAG_TOOL_REGISTRY
 from tools.reit_research import REIT_TOOL_REGISTRY
 from tools.user_vault import USER_VAULT_TOOLS
+from tools.web_tools import WEB_TOOL_REGISTRY
 
 
 def dispatchable_tools() -> set[str]:
@@ -36,6 +37,7 @@ def dispatchable_tools() -> set[str]:
         | set(GRAPHRAG_TOOL_REGISTRY)
         | set(CALENDAR_TOOL_REGISTRY)
         | set(REIT_TOOL_REGISTRY)
+        | set(WEB_TOOL_REGISTRY)
     )
 
 

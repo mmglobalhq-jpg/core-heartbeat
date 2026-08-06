@@ -42,6 +42,7 @@ from auth import SANDBOX_USER_ID
 from services import pending_plans
 from services.storage_sync import sync_user_vault, upload_user_file
 from tools.user_vault import USER_VAULT_TOOLS, read_note, run_vault_tool, write_note
+from tools.web_tools import WEB_TOOL_REGISTRY, run_web_tool
 from tools.graphrag import GRAPHRAG_TOOL_REGISTRY, kb_configured, run_graphrag_tool
 from tools.google_calendar import CALENDAR_TOOL_REGISTRY, run_calendar_tool
 from tools.catalog import ALL_TOOLS, WRITE_TOOLS
@@ -244,6 +245,7 @@ DISPATCHABLE_TOOLS = frozenset(
     | set(GRAPHRAG_TOOL_REGISTRY)
     | set(CALENDAR_TOOL_REGISTRY)
     | set(REIT_TOOL_REGISTRY)
+    | set(WEB_TOOL_REGISTRY)
 )
 
 # Name of the LangGraph custom event the local_llm node dispatches per generated
@@ -572,6 +574,17 @@ def _build_prompt(state: GraphState) -> str:
         "tool_args: {\"report_id\": <id from list_reit_reports>}.\n"
         "    Do NOT claim a report exists unless a tool returned it, and never generate "
         "or alter a report — these tools only read.\n"
+        "  The live internet:\n"
+        "    * search_web — search the web and get an answer grounded in current "
+        "results, with sources. tool_args: {\"query\": <natural-language question>}. "
+        "Use for anything current, local, niche, or outside the knowledge base — "
+        "sports rosters, prices, news, opening hours, recent events. If a "
+        "query_knowledge_base result already said nothing relevant was found and the "
+        "question is about the outside world, search instead of answering from "
+        "memory or saying you don't know.\n"
+        "    * fetch_url — read ONE specific public page. tool_args: {\"url\": <http(s) "
+        "URL>}. Use when the user supplies a URL. It does not find pages; use "
+        "search_web for that. Private/local addresses are refused.\n"
         "- A tool result is raw DATA, not an answer. After a tool result appears in "
         "the history you MUST either issue another tool call or route to local_llm "
         "to compose the answer from it — NEVER choose finish directly after a "
@@ -1005,6 +1018,8 @@ CAPABILITIES_BLOCK = (
     "  - REIT research: list issuers and read ARMOUR/Orchid research reports.\n"
     "  - Notes: read, search and write the user's personal notes.\n"
     "  - Attachments: read documents and SEE images the user attaches.\n"
+    "  - The live internet: search the web for current information, and read a\n"
+    "    specific page when given its URL.\n"
     "NEVER tell the user you are unable to do one of the things listed above, and "
     "never tell them to do it manually. Instead, offer concretely and ask them to "
     "confirm — e.g. \"I can add these 12 games to your calendar. Want me to go "
@@ -2021,6 +2036,10 @@ def _dispatch_tool(name: str, args: dict, user_id: str) -> tuple[str, list[str] 
         return run_reit_tool(name, user_id, args), None
     if name in TOOL_REGISTRY:
         return run_vault_tool(name, user_id, args), None
+    if name in WEB_TOOL_REGISTRY:
+        # Not per-user: the public web is the same for everyone. user_id is threaded
+        # only to keep one dispatch signature.
+        return run_web_tool(name, user_id, args), None
     return f"error: unknown tool {name!r}", None
 
 
