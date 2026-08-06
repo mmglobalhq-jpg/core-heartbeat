@@ -16,8 +16,19 @@ re-proposes, which is mildly annoying; a false confirmation performs writes nobo
 authorized. Everything here is built to fail toward asking again.
 """
 
+import pytest
+
 import orchestrator
 from models import IntentPayload, Message, RoutingDecision, TokenUsage, ToolArgs
+
+
+@pytest.fixture(autouse=True)
+def _no_leaked_plans():
+    """Pending plans live in a module-level dict keyed by user, so without this a
+    proposal from one test would release inside the next."""
+    orchestrator._pending_plans.clear()
+    yield
+    orchestrator._pending_plans.clear()
 
 
 def _calls(n, name="create_calendar_event"):
@@ -97,16 +108,70 @@ def test_reads_mixed_with_a_big_write_batch_are_held_too():
 # --- releasing the plan -----------------------------------------------------
 
 
-def test_affirmation_after_a_proposal_releases_the_batch():
-    out = _route(_calls(12), raw="yes", prior=_assistant_turn())
-    assert out["next"] == "tool_execution"
-    assert len(out["tool_calls"]) == 12
-    assert out["pending_plan"] is None
+def test_propose_then_confirm_actually_runs_the_batch():
+    """The full two-turn flow, which is the only way confirmation works.
+
+    This is the bug that shipped: `pending_plan` is per-run state, so on the
+    confirmation turn the router saw a bare "yes" and would have had to rebuild
+    twelve tool calls from its own earlier prose. It didn't — it asked "Shall I
+    proceed?" again, and NOTHING was ever dispatched. Verified against the real
+    calendar afterwards: zero events created.
+    """
+    proposal = _route(_calls(12), raw="add my schedule")
+    assert proposal["next"] == "local_llm" and len(proposal["pending_plan"]) == 12
+
+    confirm = _route([], raw="yes", prior=_assistant_turn())
+    assert confirm["next"] == "tool_execution"
+    assert len(confirm["tool_calls"]) == 12, "the approved plan must actually run"
+
+
+def test_confirmation_replays_the_approved_calls_not_a_fresh_batch():
+    """The user approved a specific list; that list is what must run, rather than
+    whatever the model would regenerate on the confirmation turn."""
+    original = _calls(4)
+    original[0]["args"]["summary"] = "Approved game"
+    _route(original, raw="add them")
+
+    confirm = _route([{"name": "create_calendar_event", "args": {"summary": "Something else"}}],
+                     raw="yes", prior=_assistant_turn())
+    assert [c["args"]["summary"] for c in confirm["tool_calls"]][0] == "Approved game"
+    assert len(confirm["tool_calls"]) == 4
+
+
+def test_a_plan_is_single_use():
+    """A second "yes" must not run the same writes twice."""
+    _route(_calls(5), raw="add them")
+    first = _route([], raw="yes", prior=_assistant_turn())
+    assert len(first["tool_calls"]) == 5
+
+    second = _route([], raw="yes", prior=_assistant_turn())
+    assert second["tool_calls"] is None
+    assert second["plan_note"], "a repeat yes must be answered honestly, not silently"
+
+
+def test_confirmation_with_no_stored_plan_admits_it():
+    """Answering "yes" with "proceeding to add them" while dispatching nothing is
+    exactly the false-completion this gate exists to prevent."""
+    out = _route([], raw="yes", prior=_assistant_turn())
+    assert out["next"] == "local_llm"
+    assert out["tool_calls"] is None
+    assert "do not have it any more" in out["plan_note"]
+    assert "NOT claim anything is being added" in out["plan_note"]
+
+
+def test_moving_on_discards_the_proposal():
+    """A stale plan must not fire against a later, unrelated "yes"."""
+    _route(_calls(6), raw="add my schedule")
+    _route([{"name": "list_calendar_events", "args": {}}], raw="what's on friday?")
+
+    out = _route([], raw="yes", prior=_assistant_turn())
+    assert out["tool_calls"] is None, "an abandoned plan must not run later"
 
 
 def test_affirmation_without_any_prior_assistant_turn_does_not_release():
     """An opening "yes" in a fresh conversation must not authorize writes."""
-    out = _route(_calls(12), raw="yes", prior=[])
+    _route(_calls(12), raw="add my schedule")
+    out = _route([], raw="yes", prior=[])
     assert out["next"] == "local_llm"
     assert out["tool_calls"] is None
 

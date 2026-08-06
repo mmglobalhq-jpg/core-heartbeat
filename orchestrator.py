@@ -16,6 +16,8 @@ import json
 import logging
 import operator
 import os
+import threading
+import time
 import re
 from datetime import datetime
 from zoneinfo import ZoneInfo
@@ -312,6 +314,10 @@ class GraphState(TypedDict):
     # the two channels above — written fresh every routing turn so a declined plan
     # is never replayed.
     pending_plan: list[dict] | None
+    # A short instruction for local_llm about the state of a proposed plan (e.g. the
+    # user approved something we no longer hold). Keeps the composer from narrating
+    # actions that were never dispatched.
+    plan_note: str | None
 
 
 # --- model client (feature 004; multi-provider in feature 006) --------------
@@ -959,11 +965,15 @@ CAPABILITIES_BLOCK = (
     "  - Notes: read, search and write the user's personal notes.\n"
     "  - Attachments: read documents and SEE images the user attaches.\n"
     "NEVER tell the user you are unable to do one of the things listed above, and "
-    "never tell them to do it manually. You do not execute tools yourself in this "
-    "step, so do not claim an action is already done. Instead, offer concretely and "
-    "ask them to confirm — e.g. \"I can add these 12 games to your calendar. Want me "
-    "to go ahead?\" — then the next turn performs it. If a request needs details you "
-    "do not have, ask for exactly those.\n\n"
+    "never tell them to do it manually. Instead, offer concretely and ask them to "
+    "confirm — e.g. \"I can add these 12 games to your calendar. Want me to go "
+    "ahead?\" — then the next turn performs it. If a request needs details you do not "
+    "have, ask for exactly those.\n"
+    "You do NOT run tools in this step. Unless a tool result appears above, never "
+    "state or imply that an action happened or is happening — no \"proceeding to "
+    "add\", \"I'm adding\", \"adding now\", \"done\", \"added\", \"scheduled\". Said "
+    "of work that was never dispatched, those are false, and the user stops checking. "
+    "Either ask for confirmation, or report what a tool result above actually says.\n\n"
 )
 
 
@@ -994,6 +1004,9 @@ def _pending_plan_block(state: GraphState) -> str:
     Nothing here has run. The wording matters: if the model says "done" the user
     will believe events exist that don't, which is worse than not offering at all.
     """
+    note = state.get("plan_note")
+    if note:
+        return f"\n{note}\n\n"
     plan = state.get("pending_plan")
     if not plan:
         return ""
@@ -1291,6 +1304,7 @@ def supervisor(state: GraphState) -> dict:
             "tool_request": None,
             "tool_calls": None,
             "pending_plan": None,
+            "plan_note": None,
             "messages": [Message(source="supervisor", content="route -> finish (fast-path: answered)", step=step)],
         }
 
@@ -1312,6 +1326,7 @@ def supervisor(state: GraphState) -> dict:
             "tool_request": None,
             "tool_calls": None,
             "pending_plan": None,
+            "plan_note": None,
             "messages": [Message(source="supervisor", content="route -> local_llm (fast-path: compose KB)", step=step)],
         }
 
@@ -1406,6 +1421,46 @@ def _is_affirmation(raw: str) -> bool:
     cleaned = re.sub(r"[^a-z ]", "", (raw or "").strip().lower()).strip()
     cleaned = re.sub(r"\s+", " ", cleaned)
     return bool(cleaned) and len(cleaned.split()) <= 4 and cleaned in _AFFIRMATIONS
+
+
+# Plans proposed on one turn and approved on the next. `pending_plan` is per-run
+# state and dies with the turn, so without this the confirmation turn reaches the
+# router as a bare "yes" and the model has to reconstruct twelve tool calls from the
+# prose it wrote earlier. Observed: it doesn't. It replies "Shall I proceed?" and
+# nothing is ever dispatched — the user says yes twice and no events are created.
+#
+# Replaying the STORED calls also means what runs is exactly what the user was shown
+# and approved, rather than a re-derivation that might drift from the list they read.
+#
+# Keyed by user_id because IntentPayload carries no chat id, so two conversations by
+# the same user share one slot: approving in one would run the other's plan. Given a
+# confirmation lives for seconds that is unlikely, but it is the reason to add a chat
+# id here rather than leave this as-is. In-memory, so a restart drops pending plans —
+# which fails safe: nothing runs and the user re-asks.
+_PENDING_PLAN_TTL_S = 1800
+_pending_plans: dict[str, tuple[float, list[dict]]] = {}
+_pending_plans_lock = threading.Lock()
+
+
+def _store_pending_plan(user_id: str, calls: list[dict]) -> None:
+    with _pending_plans_lock:
+        _pending_plans[user_id] = (time.monotonic() + _PENDING_PLAN_TTL_S, list(calls))
+
+
+def _take_pending_plan(user_id: str) -> list[dict] | None:
+    """Pop the plan awaiting approval, if one is still valid. Single-use."""
+    with _pending_plans_lock:
+        entry = _pending_plans.pop(user_id, None)
+    if entry is None:
+        return None
+    expires_at, calls = entry
+    return calls if time.monotonic() < expires_at else None
+
+
+def _clear_pending_plan(user_id: str) -> None:
+    """Drop any proposal — the user asked for something else instead."""
+    with _pending_plans_lock:
+        _pending_plans.pop(user_id, None)
 
 
 def _needs_confirmation(calls: list[dict]) -> bool:
@@ -1519,6 +1574,7 @@ def _finish_routing(
             "tool_request": None,
             "tool_calls": None,
             "pending_plan": None,
+            "plan_note": None,
             "messages": [
                 Message(
                     source="supervisor",
@@ -1556,15 +1612,40 @@ def _finish_routing(
 
     # Write gate. Native tool calling can emit a dozen create_calendar_event calls
     # from one sentence, and there is no undo beyond deleting each event by hand —
-    # so a batch of writes is PROPOSED, not run. The plan goes to local_llm, which
-    # presents it and asks; the user's "yes" is the next turn, and _confirmation_given
-    # releases it there. Reads are never gated.
+    # so a batch of writes is PROPOSED, not run, and the user's next message releases
+    # it. Reads are never gated.
+    user_id = state.get("user_id", SANDBOX_USER_ID)
     pending_plan: list[dict] | None = None
-    if calls and _needs_confirmation(calls) and not _confirmation_given(state):
+    plan_note: str | None = None
+
+    if _confirmation_given(state):
+        approved = _take_pending_plan(user_id)
+        if approved:
+            # Run exactly what was shown and agreed to. Not what the model would
+            # regenerate now — the user approved a specific list.
+            calls, tool_request, nxt = approved, None, "tool_execution"
+        elif not calls:
+            # They said yes, but there is nothing to run: the proposal expired, the
+            # process restarted, or it was already used. Say so. Answering a "yes"
+            # with narration like "proceeding to add them" while dispatching nothing
+            # is precisely the failure this gate exists to prevent.
+            plan_note = (
+                "The user just approved something, but no pending plan is on record "
+                "(it may have expired or already run). Tell them plainly that you do "
+                "not have it any more and ask them to restate what they want done. Do "
+                "NOT claim anything is being added or has been added."
+            )
+            nxt = "local_llm"
+    elif calls and _needs_confirmation(calls):
         pending_plan = calls
+        _store_pending_plan(user_id, calls)
         calls = None
         tool_request = None
         nxt = "local_llm"
+    else:
+        # Any other turn means they moved on; a stale proposal must not linger and
+        # fire against a later, unrelated "yes".
+        _clear_pending_plan(user_id)
 
     label = f"route -> {nxt}"
     if pending_plan:
@@ -1581,6 +1662,7 @@ def _finish_routing(
         "tool_request": tool_request,
         "tool_calls": calls,
         "pending_plan": pending_plan,
+        "plan_note": plan_note,
         "messages": [Message(source="supervisor", content=label, step=step)],
     }
     if nxt == "finish":
@@ -2140,6 +2222,7 @@ def _initial_state(payload: IntentPayload, user_id: str) -> GraphState:
         "tool_request": None,
         "tool_calls": None,
         "pending_plan": None,
+        "plan_note": None,
     }
 
 
