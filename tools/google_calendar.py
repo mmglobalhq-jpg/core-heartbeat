@@ -13,12 +13,15 @@ dispatch, and a ``run_calendar_tool`` entrypoint that degrades to a friendly str
 """
 from __future__ import annotations
 
+import logging
 import os
 import re
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 import httpx
+
+logger = logging.getLogger(__name__)
 
 SUPABASE_URL_ENV = "SUPABASE_URL"
 SERVICE_ROLE_ENV = "SUPABASE_SERVICE_ROLE_KEY"
@@ -86,13 +89,27 @@ def _load_credentials(user_id: str) -> dict | None:
 
 
 def _save_access_token(user_id: str, access_token: str, expiry: datetime) -> None:
+    """Persist a freshly refreshed access token.
+
+    Deliberately does NOT raise: the refresh already succeeded, so failing here
+    would break a call that was about to work. But it must not be silent either —
+    an unpersisted token means every subsequent request refreshes again, burning
+    Google's refresh quota until it starts failing, with nothing in the logs to say
+    why. The response was previously not checked at all.
+    """
     with _http() as c:
-        c.patch(
+        r = c.patch(
             f"{_sb_url()}/rest/v1/google_credentials",
             params={"user_id": f"eq.{user_id}"},
             headers={**_sb_headers(), "Prefer": "return=minimal"},
             json={"access_token": access_token, "expiry": _rfc3339(expiry),
                   "updated_at": _rfc3339(_now())},
+        )
+    if r.status_code >= 400:
+        logger.warning(
+            "google access token NOT persisted for user %s: HTTP %d %s — every "
+            "later request will refresh again",
+            user_id[:8], r.status_code, (r.text or "")[:200],
         )
 
 
@@ -132,6 +149,76 @@ def _access_token(user_id: str) -> str:
 
 # --- Calendar API v3 --------------------------------------------------------
 
+def _google_error(resp: httpx.Response) -> tuple[str, str]:
+    """Pull ``(reason, message)`` out of a Google API error body.
+
+    Google explains itself in the response body — a machine-readable ``reason`` and
+    a human ``message``. This client used to discard both and report only
+    "Google Calendar returned 403", which is the same text whether the connection
+    lacks calendar scope, the user isn't the event's organiser, or the API is
+    rate-limiting. Those need three different actions from the user.
+    """
+    try:
+        err = (resp.json() or {}).get("error") or {}
+    except Exception:
+        return "", ""
+    if isinstance(err, str):          # OAuth-style {"error": "invalid_grant"}
+        return err, ""
+    errors = err.get("errors") or []
+    reason = (errors[0].get("reason") if errors and isinstance(errors[0], dict) else "") or ""
+    return reason, (err.get("message") or "").strip()
+
+
+# Actionable text per 403 reason. The point is to say what the USER can do; a bare
+# status code leaves them with nothing but "try again", which for a scope problem
+# never works.
+_FORBIDDEN_GUIDANCE = {
+    "insufficientPermissions": (
+        "Google Calendar refused the request because the connection doesn't grant "
+        "calendar access. Open Settings → Integrations, disconnect Google Calendar, "
+        "then connect it again and accept the calendar permission."
+    ),
+    "forbiddenForNonOrganizer": (
+        "Google Calendar won't allow that change because you aren't the event's "
+        "organiser. Ask the organiser to change it, or add your own copy instead."
+    ),
+    "requiredAccessLevel": (
+        "That calendar is shared with you read-only, so it can't be changed here."
+    ),
+    "rateLimitExceeded": "Google Calendar is rate-limiting requests. Try again shortly.",
+    "userRateLimitExceeded": "Google Calendar is rate-limiting requests. Try again shortly.",
+    "dailyLimitExceeded": (
+        "The Google Calendar daily quota for this app is used up. It resets at "
+        "midnight Pacific time."
+    ),
+    "quotaExceeded": (
+        "The Google Calendar quota for this app is used up. Try again later."
+    ),
+}
+
+
+def _explain_status(resp: httpx.Response) -> str:
+    """A message worth showing the user for a failed Calendar call."""
+    reason, message = _google_error(resp)
+    code = resp.status_code
+    if code == 403:
+        guidance = _FORBIDDEN_GUIDANCE.get(reason)
+        if guidance:
+            return guidance
+        detail = f" ({message})" if message else ""
+        return f"Google Calendar denied the request{detail}."
+    if code in (404, 410):
+        return ("That calendar event no longer exists — it may already have been "
+                "deleted or changed. Try listing your events again to get the "
+                "current ones.")
+    if code == 409:
+        return "That calendar event conflicts with an existing one."
+    if code >= 500:
+        return "Google Calendar is having trouble right now. Try again shortly."
+    detail = f": {message}" if message else ""
+    return f"Google Calendar returned {code}{detail}"
+
+
 def _cal(method: str, path: str, token: str, *, params=None, json_body=None) -> httpx.Response:
     with _http() as c:
         r = c.request(method, f"{CAL_BASE}{path}",
@@ -139,7 +226,16 @@ def _cal(method: str, path: str, token: str, *, params=None, json_body=None) -> 
                       headers={"Authorization": f"Bearer {token}", "Accept": "application/json"})
     if r.status_code == 401:
         raise NotConnected()  # token rejected -> prompt reconnect
-    r.raise_for_status()
+    if r.status_code >= 400:
+        # Log the machine-readable reason for triage, return the human one to the
+        # user. Previously the body was dropped entirely, so a scope problem and a
+        # rate limit were indistinguishable in both places.
+        reason, message = _google_error(r)
+        logger.warning(
+            "calendar %s %s -> %d reason=%s message=%s",
+            method, path, r.status_code, reason or "-", message or "-",
+        )
+        raise CalendarError(_explain_status(r))
     return r
 
 

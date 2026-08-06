@@ -159,3 +159,81 @@ def test_to_rfc3339_normalizes_naive_and_passes_through():
     assert _to_rfc3339("2026-07-20T00:00:00Z", "d", lambda: "UTC") == "2026-07-20T00:00:00Z"
     assert _to_rfc3339("2026-07-20T00:00:00-05:00", "d", lambda: "UTC") == "2026-07-20T00:00:00-05:00"
     assert _to_rfc3339("", "DEFAULT", lambda: "UTC") == "DEFAULT"
+
+
+# --- error explanation ------------------------------------------------------
+#
+# A 403 previously became "error: Google Calendar returned 403" — the same text
+# whether the connection lacks calendar scope, the user isn't the event's
+# organiser, or the API is throttling. Those need three different actions, and the
+# user hit exactly this: a 403 they could only resolve by guessing (disconnect and
+# reconnect, which happened to be right).
+
+import httpx as _httpx
+
+from tools.google_calendar import _explain_status, _google_error
+
+
+def _resp(status, body):
+    return _httpx.Response(status, json=body,
+                           request=_httpx.Request("GET", "https://example.test"))
+
+
+def _google_403(reason, message="Insufficient Permission"):
+    return _resp(403, {"error": {"code": 403, "message": message,
+                                 "errors": [{"reason": reason, "message": message}]}})
+
+
+def test_missing_scope_tells_the_user_to_reconnect():
+    """The case actually hit in production. "Try again" never fixes it."""
+    text = _explain_status(_google_403("insufficientPermissions"))
+    assert "Settings" in text and "connect it again" in text
+    assert "403" not in text
+
+
+def test_non_organiser_is_distinguished_from_a_scope_problem():
+    text = _explain_status(_google_403("forbiddenForNonOrganizer"))
+    assert "organiser" in text
+    assert "Settings" not in text, "reconnecting would not help here"
+
+
+def test_rate_limiting_says_to_wait_rather_than_reconnect():
+    for reason in ("rateLimitExceeded", "userRateLimitExceeded"):
+        text = _explain_status(_google_403(reason))
+        assert "rate-limiting" in text and "shortly" in text
+        assert "Settings" not in text
+
+
+def test_quota_exhaustion_is_its_own_message():
+    assert "midnight Pacific" in _explain_status(_google_403("dailyLimitExceeded"))
+
+
+def test_an_unknown_403_reason_still_surfaces_googles_message():
+    """Better to relay Google's own words than to drop them."""
+    text = _explain_status(_google_403("somethingNew", "Calendar usage limits exceeded."))
+    assert "Calendar usage limits exceeded." in text
+
+
+def test_a_missing_event_explains_itself():
+    """update/delete need an id from a listing, which goes stale."""
+    for code in (404, 410):
+        text = _explain_status(_resp(code, {"error": {"code": code, "message": "Not Found"}}))
+        assert "no longer exists" in text and "listing your events again" in text
+
+
+def test_server_errors_are_not_blamed_on_the_user():
+    assert "Google Calendar is having trouble" in _explain_status(
+        _resp(503, {"error": {"code": 503, "message": "Backend Error"}})
+    )
+
+
+def test_an_unparsable_body_does_not_crash_the_explanation():
+    r = _httpx.Response(403, content=b"<html>nope</html>",
+                        request=_httpx.Request("GET", "https://example.test"))
+    assert _google_error(r) == ("", "")
+    assert "denied the request" in _explain_status(r)
+
+
+def test_oauth_style_string_error_is_handled():
+    r = _resp(400, {"error": "invalid_grant"})
+    assert _google_error(r) == ("invalid_grant", "")
