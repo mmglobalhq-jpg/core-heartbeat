@@ -19,6 +19,7 @@ import os
 import threading
 import time
 import re
+import sys
 from datetime import datetime
 from zoneinfo import ZoneInfo
 from collections import defaultdict
@@ -754,6 +755,7 @@ def _decide_native(
     try:
         response = bound.invoke([{"role": "user", "content": content}])
     except Exception as exc:  # never crash the graph
+        _trace("router.native.FAILED", err=f"{type(exc).__name__}: {exc}")
         return None, [], RoutingFailure(
             category=_categorize_api_error(exc), detail=_detail(exc)
         ), TokenUsage()
@@ -771,6 +773,11 @@ def _decide_native(
             args = call.get("args")
             calls.append({"name": name, "args": args if isinstance(args, dict) else {}})
 
+    _trace("router.native", pid=os.getpid(), n_calls=len(calls),
+           names=",".join(c["name"] for c in calls) or "-",
+           has_docs=bool(state.get("documents")),
+           n_images=len(state.get("document_images") or []),
+           prior_turns=len(state.get("prior_context") or []))
     if not calls:
         return "local_llm", [], None, usage
     return "tool_execution", calls, None, usage
@@ -1463,10 +1470,54 @@ _PENDING_PLAN_TTL_S = 1800
 _pending_plans: dict[str, tuple[float, list[dict]]] = {}
 _pending_plans_lock = threading.Lock()
 
+# --- plan tracing -----------------------------------------------------------
+#
+# The propose/confirm handshake spans two HTTP requests and four components
+# (router -> gate -> store -> composer). When it fails the user sees only the last
+# line — "I don't have the details" — which is the same symptom whether the router
+# never emitted calls, the gate never stored them, the store was cleared, or the
+# process restarted in between. This makes each step observable so a failure can be
+# located instead of guessed at.
+#
+# Own handler at INFO with propagate=False, so the trace appears regardless of how
+# the app's root logger is configured. PLAN_TRACE=0 disables it.
+PLAN_TRACE = (os.environ.get("PLAN_TRACE", "1").strip().lower()
+              not in ("0", "false", "no", "off"))
+_trace_log = logging.getLogger("plan_trace")
+if PLAN_TRACE and not _trace_log.handlers:
+    _h = logging.StreamHandler(sys.stdout)
+    _h.setFormatter(logging.Formatter("%(asctime)s [plan-trace] %(message)s"))
+    _trace_log.addHandler(_h)
+    _trace_log.setLevel(logging.INFO)
+    _trace_log.propagate = False
+
+
+def _short(value: object, limit: int = 60) -> str:
+    text = str(value).replace("\n", " ")
+    return text if len(text) <= limit else text[:limit] + "…"
+
+
+def _trace(event: str, **fields) -> None:
+    """One structured line per decision point. Never raises, never logs content
+    that isn't needed to diagnose the handshake (no event bodies, no secrets)."""
+    if not PLAN_TRACE:
+        return
+    try:
+        rendered = " ".join(f"{k}={_short(v)}" for k, v in fields.items())
+        _trace_log.info("%-22s %s", event, rendered)
+    except Exception:
+        pass
+
+
+def _plan_keys() -> list[str]:
+    with _pending_plans_lock:
+        return [k[:8] for k in _pending_plans]
+
 
 def _store_pending_plan(user_id: str, calls: list[dict]) -> None:
     with _pending_plans_lock:
         _pending_plans[user_id] = (time.monotonic() + _PENDING_PLAN_TTL_S, list(calls))
+    _trace("store.save", pid=os.getpid(), key=user_id[:8], n=len(calls), keys=_plan_keys())
 
 
 def _take_pending_plan(user_id: str) -> list[dict] | None:
@@ -1474,15 +1525,20 @@ def _take_pending_plan(user_id: str) -> list[dict] | None:
     with _pending_plans_lock:
         entry = _pending_plans.pop(user_id, None)
     if entry is None:
+        _trace("store.take.MISS", pid=os.getpid(), key=user_id[:8], keys_present=_plan_keys())
         return None
     expires_at, calls = entry
-    return calls if time.monotonic() < expires_at else None
+    expired = time.monotonic() >= expires_at
+    _trace("store.take.HIT", pid=os.getpid(), key=user_id[:8], n=len(calls), expired=expired)
+    return None if expired else calls
 
 
 def _clear_pending_plan(user_id: str) -> None:
     """Drop any proposal — the user asked for something else instead."""
     with _pending_plans_lock:
-        _pending_plans.pop(user_id, None)
+        existed = _pending_plans.pop(user_id, None) is not None
+    if existed:
+        _trace("store.CLEARED", pid=os.getpid(), key=user_id[:8])
 
 
 def _needs_confirmation(calls: list[dict]) -> bool:
@@ -1640,17 +1696,32 @@ def _finish_routing(
     pending_plan: list[dict] | None = None
     plan_note: str | None = None
 
+    raw_in = (getattr(state["intent"], "raw_input", "") or "").strip()
+    prior = state.get("prior_context", []) or []
+    _trace(
+        "gate.enter",
+        pid=os.getpid(), key=user_id[:8], raw=raw_in, nxt=nxt,
+        n_calls=len(calls or []),
+        affirmation=_is_affirmation(raw_in),
+        prior_turns=len(prior),
+        prior_assistant=sum(1 for m in prior if m.source == "assistant"),
+        confirming=_confirmation_given(state),
+        store_keys=_plan_keys(),
+    )
     if _confirmation_given(state):
         approved = _take_pending_plan(user_id)
         if approved:
             # Run exactly what was shown and agreed to. Not what the model would
             # regenerate now — the user approved a specific list.
             calls, tool_request, nxt = approved, None, "tool_execution"
+            _trace("gate.CONFIRMED", n=len(approved),
+                   names=",".join(sorted({c["name"] for c in approved})))
         elif not calls:
             # They said yes, but there is nothing to run: the proposal expired, the
             # process restarted, or it was already used. Say so. Answering a "yes"
             # with narration like "proceeding to add them" while dispatching nothing
             # is precisely the failure this gate exists to prevent.
+            _trace("gate.CONFIRM_NO_PLAN", key=user_id[:8], store_keys=_plan_keys())
             plan_note = (
                 "The user just approved something, but no pending plan is on record "
                 "(it may have expired or already run). Tell them plainly that you do "
@@ -1660,6 +1731,8 @@ def _finish_routing(
             nxt = "local_llm"
     elif calls and _needs_confirmation(calls):
         pending_plan = calls
+        _trace("gate.PROPOSE", n=len(calls),
+               names=",".join(sorted({c["name"] for c in calls})))
         _store_pending_plan(user_id, calls)
         calls = None
         tool_request = None
@@ -1667,6 +1740,7 @@ def _finish_routing(
     else:
         # Any other turn means they moved on; a stale proposal must not linger and
         # fire against a later, unrelated "yes".
+        _trace("gate.passthrough", n_calls=len(calls or []), nxt=nxt)
         _clear_pending_plan(user_id)
 
     label = f"route -> {nxt}"
@@ -1878,6 +1952,8 @@ def tool_execution(state: GraphState) -> dict:
     """
     calls = _requested_tool_calls(state)
     user_id = state.get("user_id", SANDBOX_USER_ID)
+    _trace("tools.execute", pid=os.getpid(), n=len(calls),
+           names=",".join(c["name"] for c in calls) or "-")
 
     if not calls:
         return {
