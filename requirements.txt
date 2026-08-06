@@ -29,8 +29,15 @@ idna==3.18
 jmespath==1.1.0
 jsonpatch==1.33
 jsonpointer==3.1.1
-langchain-core==1.4.8
+langchain-core==1.5.3
 langchain-protocol==0.0.18
+# Provider integrations for native tool calling (NATIVE_TOOL_CALLING=1). They pull
+# langchain-core up from 1.4.8 to 1.5.3; langgraph 1.2.7 is compatible (pip check
+# clean, full suite green). Only the ROUTING call uses these — compose still streams
+# through the raw google-genai SDK, so token streaming is untouched.
+langchain-anthropic==1.5.4
+langchain-google-genai==4.3.2
+langchain-openai==1.4.1
 langgraph==1.2.7
 langgraph-checkpoint==4.1.1
 langgraph-prebuilt==1.1.0

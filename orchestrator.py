@@ -21,6 +21,7 @@ from datetime import datetime
 from zoneinfo import ZoneInfo
 from collections import defaultdict
 from collections.abc import AsyncIterator, Awaitable, Callable
+from concurrent.futures import ThreadPoolExecutor
 from typing import Annotated, Literal, get_args, get_origin
 
 from typing_extensions import TypedDict
@@ -39,6 +40,7 @@ from services.storage_sync import sync_user_vault, upload_user_file
 from tools.user_vault import USER_VAULT_TOOLS, read_note, run_vault_tool, write_note
 from tools.graphrag import GRAPHRAG_TOOL_REGISTRY, kb_configured, run_graphrag_tool
 from tools.google_calendar import CALENDAR_TOOL_REGISTRY, run_calendar_tool
+from tools.catalog import ALL_TOOLS
 from tools.reit_research import (
     REIT_TOOL_REGISTRY,
     looks_like_reit_reference,
@@ -62,6 +64,16 @@ logger = logging.getLogger(__name__)
 # --- constants --------------------------------------------------------------
 
 MAX_STEPS = 8          # graceful step bound (Supervisor finishes at/after this)
+# Concurrency for a multi-call turn. The structured-output router emits exactly one
+# tool call per round-trip, so adding a schedule meant one supervisor hop per event
+# and MAX_STEPS ran out around the 7th game. Native tool calling lets the model emit
+# every call in one response; this bounds how many actually run at once, because
+# "add my season" against Google Calendar is a burst of writes to one API.
+MAX_PARALLEL_TOOL_CALLS = int(os.environ.get("MAX_PARALLEL_TOOL_CALLS", "4"))
+# Native tool calling: schemas generated from tools/catalog.py and several calls
+# per response. Off by default — this is the hot path for every chat turn, so the
+# switch is an env var and rollback needs no redeploy.
+NATIVE_TOOL_CALLING = os.environ.get("NATIVE_TOOL_CALLING", "").strip().lower() in ("1", "true", "yes")
 RECURSION_LIMIT = 25   # hard LangGraph catch
 HISTORY_LIMIT = 10     # max prior turns seeded from IntentPayload.history (token/latency bound)
 DOC_CHAR_BUDGET = 12000  # max chars of attached-document text injected (local model window is small)
@@ -214,6 +226,17 @@ WORKER_NODES = ["local_llm", "tool_execution"]
 # the active user's /tmp/vaults/<user_id>/ boundary. See tools/user_vault.py.
 TOOL_REGISTRY = {t.name: t for t in USER_VAULT_TOOLS}
 
+# Every tool name tool_execution can actually run. The single gate a requested call
+# must pass before reaching a backend, so a hallucinated or stale name is dropped
+# rather than dispatched. tests/test_routing_vocabulary.py asserts the Supervisor's
+# advertised vocabulary equals this set.
+DISPATCHABLE_TOOLS = frozenset(
+    set(TOOL_REGISTRY)
+    | set(GRAPHRAG_TOOL_REGISTRY)
+    | set(CALENDAR_TOOL_REGISTRY)
+    | set(REIT_TOOL_REGISTRY)
+)
+
 # Name of the LangGraph custom event the local_llm node dispatches per generated
 # token; astream_run surfaces it (as on_custom_event) into the SSE stream.
 LOCAL_TOKEN_EVENT = "local_llm_token"
@@ -278,6 +301,12 @@ class GraphState(TypedDict):
     # LastValue channel — the Supervisor writes it fresh (dict or None) on every
     # routing turn so tool_execution never replays a stale request. Feature 007.
     tool_request: dict | None
+    # Set-once-per-turn by the Supervisor when the model emits native tool calls:
+    # a list of {"name", "args"}, possibly several. Same LastValue semantics as
+    # `tool_request`, which it supersedes when present — one channel per routing
+    # style rather than overloading one, so the structured-output path keeps its
+    # exact shape and behaviour while both are supported.
+    tool_calls: list[dict] | None
 
 
 # --- model client (feature 004; multi-provider in feature 006) --------------
@@ -598,6 +627,128 @@ def request_routing_decision(
     if provider == "anthropic":
         return _decide_anthropic(state, client, api_model)
     return _decide_gemini(state, client, api_model)
+
+
+def _build_native_prompt(state: GraphState) -> str:
+    """Prompt for the native tool-calling router.
+
+    Deliberately NOT ``_build_prompt``. That one instructs the model to emit
+    next_node/tool_name/tool_args, which actively suppresses native tool calling —
+    told to describe a route, the model describes a route instead of calling
+    anything, and every turn lands on local_llm with zero tool calls (measured).
+
+    It also omits the prose tool catalogue: with bind_tools the descriptions come
+    from tools/catalog.py, and repeating them here would reintroduce exactly the
+    duplication that let the calendar tools go stale.
+    """
+    intent = state["intent"]
+    messages = state.get("messages", [])
+    history = _render_history(messages)
+    profile_block = _user_profile_block(state.get("user_id", SANDBOX_USER_ID))
+    docs = state.get("documents", "")
+    docs_block = (
+        f"The user attached document(s):\n--- ATTACHED DOCUMENTS ---\n{docs}\n"
+        f"--- END DOCUMENTS ---\n\n"
+        if docs
+        else ""
+    )
+    return (
+        "You are the assistant's planning step. Decide which tools, if any, to call "
+        "to serve the user's request.\n\n"
+        f"{profile_block}"
+        f"{docs_block}"
+        f"{_now_context(intent)}"
+        f"User request: {intent.raw_input}\n"
+        f"Conversation so far:\n{history or '(none)'}\n\n"
+        "Rules:\n"
+        "- Call a tool whenever one can answer or act on the request. Do NOT write a "
+        "reply — a separate step composes the wording. Your prose is discarded.\n"
+        "- If the request covers SEVERAL items (a schedule with many games, a list of "
+        "notes), emit ONE tool call PER ITEM in this single response. Do not do one "
+        "and stop, and do not ask which to start with.\n"
+        "- If a tool result already appears above and answers the request, call "
+        "nothing.\n"
+        "- If no tool applies — general knowledge, chit-chat, or a question about an "
+        "attachment — call nothing.\n"
+        "- Never invent ids or dates. Ambiguous ones get resolved against the current "
+        "date above; if genuinely unclear, call nothing so the next step can ask.\n"
+    )
+
+
+def _native_chat_model(model_pref: str):
+    """A tool-bound LangChain chat model for the routing call, or None.
+
+    Imports are lazy and per-provider so a missing integration package degrades to
+    the structured-output path instead of breaking startup — same contract the raw
+    SDK clients already have.
+    """
+    provider, api_model = _resolve_model(model_pref)
+    key_env, _ = _PROVIDERS[provider]
+    api_key = (os.environ.get(key_env) or "").strip()
+    if not api_key:
+        return None
+    try:
+        if provider == "anthropic":
+            from langchain_anthropic import ChatAnthropic
+            model = ChatAnthropic(model=api_model, api_key=api_key, max_tokens=1024)
+        elif provider == "openai":
+            from langchain_openai import ChatOpenAI
+            model = ChatOpenAI(model=api_model, api_key=api_key)
+        else:
+            from langchain_google_genai import ChatGoogleGenerativeAI
+            model = ChatGoogleGenerativeAI(model=api_model, google_api_key=api_key)
+    except Exception as exc:  # missing package / bad config -> fall back
+        logger.warning("native tool calling unavailable for %s: %s", provider, exc)
+        return None
+    # Schemas are generated from tools/catalog.py. Nothing is hand-written, so the
+    # advertised vocabulary cannot drift from what tool_execution can run.
+    return model.bind_tools(ALL_TOOLS)
+
+
+def _decide_native(
+    state: GraphState, model_pref: str
+) -> tuple[str | None, list[dict], RoutingFailure | None, TokenUsage]:
+    """Route by native tool calling. Returns ``(next_node, tool_calls, failure, usage)``.
+
+    The model either emits tool calls — possibly SEVERAL in one response, which is
+    the whole point, since a 12-game schedule used to need 12 supervisor round-trips
+    against a bound of 8 — or emits none, which means no tool is needed and the turn
+    goes to local_llm to compose. The model's own prose is deliberately discarded:
+    composing is local_llm's job with the cheaper streaming model, and that split is
+    what keeps this from collapsing into a single-model ReAct agent.
+    """
+    bound = _native_chat_model(model_pref)
+    if bound is None:
+        return None, [], RoutingFailure(
+            category="missing_credential",
+            detail=f"no native tool-calling client for {model_pref!r}",
+        ), TokenUsage()
+
+    prompt = _build_native_prompt(state)
+    content = _as_content_parts(prompt, _turn_images(state), "anthropic")
+    try:
+        response = bound.invoke([{"role": "user", "content": content}])
+    except Exception as exc:  # never crash the graph
+        return None, [], RoutingFailure(
+            category=_categorize_api_error(exc), detail=_detail(exc)
+        ), TokenUsage()
+
+    meta = getattr(response, "usage_metadata", None) or {}
+    usage = TokenUsage(
+        input_tokens=int(meta.get("input_tokens", 0) or 0),
+        output_tokens=int(meta.get("output_tokens", 0) or 0),
+    )
+
+    calls: list[dict] = []
+    for call in getattr(response, "tool_calls", None) or []:
+        name = call.get("name")
+        if isinstance(name, str) and name in DISPATCHABLE_TOOLS:
+            args = call.get("args")
+            calls.append({"name": name, "args": args if isinstance(args, dict) else {}})
+
+    if not calls:
+        return "local_llm", [], None, usage
+    return "tool_execution", calls, None, usage
 
 
 def _decide_gemini(
@@ -1090,6 +1241,7 @@ def supervisor(state: GraphState) -> dict:
             "step": 1,
             "usage": TokenUsage(),
             "tool_request": None,
+            "tool_calls": None,
             "messages": [Message(source="supervisor", content="route -> finish (fast-path: answered)", step=step)],
         }
 
@@ -1109,6 +1261,7 @@ def supervisor(state: GraphState) -> dict:
             "step": 1,
             "usage": TokenUsage(),
             "tool_request": None,
+            "tool_calls": None,
             "messages": [Message(source="supervisor", content="route -> local_llm (fast-path: compose KB)", step=step)],
         }
 
@@ -1123,6 +1276,31 @@ def supervisor(state: GraphState) -> dict:
                 category="missing_credential",
                 detail=f"no client for model_preference={model_pref!r} (provider={provider})",
             ),
+        )
+
+    # Native tool calling (NATIVE_TOOL_CALLING=1). The model may emit SEVERAL calls
+    # in one response, which is what makes "add my whole schedule" possible inside
+    # the step bound. It is normalized into a RoutingDecision so every deterministic
+    # guard below — KB retrieve-once, retrieve-first, the anti-reloop rules — keeps
+    # working unchanged; the full list rides alongside on `native_calls`.
+    #
+    # A failure here falls through to the structured-output path rather than
+    # degrading the turn, so enabling this can lose latency but not availability.
+    native_calls: list[dict] = []
+    if NATIVE_TOOL_CALLING:
+        nxt_native, calls, native_failure, native_usage = _decide_native(state, model_pref)
+        if native_failure is None:
+            native_calls = calls
+            first = calls[0] if calls else None
+            decision = RoutingDecision(
+                next_node=nxt_native,
+                tool_name=first["name"] if first else None,
+                tool_args=ToolArgs(**(first["args"] if first else {})),
+            )
+            return _finish_routing(state, step, decision, native_usage, native_calls)
+        logger.warning(
+            "native tool calling failed (%s: %s); falling back to structured output",
+            native_failure.category, native_failure.detail,
         )
 
     # Bounded retry: a transient timeout/network/invalid_output can succeed on a
@@ -1147,6 +1325,22 @@ def supervisor(state: GraphState) -> dict:
     if failure is not None:
         return _degraded(step, failure, usage)
 
+    return _finish_routing(state, step, decision, usage, [])
+
+
+def _finish_routing(
+    state: GraphState,
+    step: int,
+    decision: RoutingDecision,
+    usage: TokenUsage,
+    native_calls: list[dict],
+) -> dict:
+    """Apply the deterministic routing guards and build the supervisor's state update.
+
+    Shared by both routing paths so the guards exist once. The native path normalizes
+    its (possibly multi-call) result into `decision` before calling this and passes
+    the full list as `native_calls`; the structured-output path passes an empty list.
+    """
     nxt = decision.next_node
 
     # Has the KB already been consulted THIS turn? (a query_knowledge_base result in
@@ -1223,6 +1417,7 @@ def supervisor(state: GraphState) -> dict:
             "step": 1,
             "usage": usage,
             "tool_request": None,
+            "tool_calls": None,
             "messages": [
                 Message(
                     source="supervisor",
@@ -1245,8 +1440,23 @@ def supervisor(state: GraphState) -> dict:
             "args": decision.tool_args.model_dump(exclude_none=True),
         }
 
+    # The multi-call list only survives when the guards left us on tool_execution and
+    # didn't synthesize their own call. A guard that redirected to local_llm, or the
+    # retrieve-first guard that replaced the model's choice with a KB query, must not
+    # be overridden by a stale batch — so drop it in those cases and let the single
+    # `tool_request` stand.
+    calls = native_calls if (native_calls and nxt == "tool_execution" and forced_kb_query is None) else None
+    if calls:
+        # The KB is consult-once-per-turn; strip a repeat from the batch rather than
+        # discarding the whole batch, so "check my notes AND add these games" keeps
+        # its calendar writes.
+        if kb_consulted:
+            calls = [c for c in calls if c["name"] not in GRAPHRAG_TOOL_REGISTRY] or None
+
     label = f"route -> {nxt}"
-    if tool_request is not None:
+    if calls:
+        label = f"route -> {nxt} ({len(calls)} calls: {', '.join(c['name'] for c in calls)})"
+    elif tool_request is not None:
         label = f"route -> {nxt} ({tool_request['name']})"
 
     update: dict = {
@@ -1254,6 +1464,7 @@ def supervisor(state: GraphState) -> dict:
         "step": 1,
         "usage": usage,
         "tool_request": tool_request,
+        "tool_calls": calls,
         "messages": [Message(source="supervisor", content=label, step=step)],
     }
     if nxt == "finish":
@@ -1386,6 +1597,54 @@ async def local_llm(state: GraphState) -> dict:
     }
 
 
+def _dispatch_tool(name: str, args: dict, user_id: str) -> tuple[str, list[str] | None]:
+    """Run one tool. Returns ``(result_text, kb_source_titles_or_None)``.
+
+    ``user_id`` comes from graph state in every branch — never from a model-supplied
+    argument — so no emitted tool call can reach another user's vault, calendar or
+    knowledge base. Each ``run_*_tool`` converts its own failures into an
+    ``error: ...`` string rather than raising, which is what makes it safe to fan
+    these out across a thread pool.
+    """
+    if name in GRAPHRAG_TOOL_REGISTRY:
+        # Per-user (own + global docs); user_id is sent as X-User-Id to the service.
+        result, sources = run_graphrag_tool(name, user_id, args)
+        return result, sources
+    if name in CALENDAR_TOOL_REGISTRY:
+        # Per-user: user_id selects whose OAuth tokens are loaded.
+        return run_calendar_tool(name, user_id, args), None
+    if name in REIT_TOOL_REGISTRY:
+        # Read-only and global; user_id threaded only for a uniform signature.
+        return run_reit_tool(name, user_id, args), None
+    if name in TOOL_REGISTRY:
+        return run_vault_tool(name, user_id, args), None
+    return f"error: unknown tool {name!r}", None
+
+
+def _requested_tool_calls(state: GraphState) -> list[dict]:
+    """Normalize the run's tool request(s) to a list of ``{"name", "args"}``.
+
+    Accepts both shapes so the two routing paths can coexist: ``tool_request`` (one
+    call, the structured-output router) and ``tool_calls`` (possibly many, the
+    native tool-calling router). Unknown names are dropped here rather than passed
+    to dispatch, so a hallucinated name can never reach a backend.
+    """
+    raw = state.get("tool_calls")
+    if not raw:
+        single = state.get("tool_request")
+        raw = [single] if isinstance(single, dict) else []
+    calls: list[dict] = []
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        name = item.get("name")
+        if not isinstance(name, str) or name not in DISPATCHABLE_TOOLS:
+            continue
+        args = item.get("args")
+        calls.append({"name": name, "args": args if isinstance(args, dict) else {}})
+    return calls
+
+
 def tool_execution(state: GraphState) -> dict:
     """External tool/action node, wired to the user-isolated vault tools.
 
@@ -1397,64 +1656,61 @@ def tool_execution(state: GraphState) -> dict:
     behavior. Either way it emits a message, fixed usage, and returns control to
     the Supervisor.
     """
-    request = state.get("tool_request")
-    name = request.get("name") if isinstance(request, dict) else None
-    args = (request.get("args") or {}) if isinstance(request, dict) else {}
-    kb_sources: list[str] | None = None  # set by the KB tool, for the answer's citation
-    if name in GRAPHRAG_TOOL_REGISTRY:
-        # KB tools are per-user (own + global): thread the state-resolved user_id
-        # (sent as X-User-Id to the KB service), never a model-supplied argument.
-        user_id = state.get("user_id", SANDBOX_USER_ID)
-        result, kb_sources = run_graphrag_tool(name, user_id, args)
-        content = f"[tool:{name}] {result}"
-        try:
-            dispatch_custom_event(
-                TOOL_CALL_EVENT, {"name": name, "args": args, "result": result}
-            )
-        except Exception:
-            pass
-    elif name in CALENDAR_TOOL_REGISTRY:
-        # Google Calendar tools are per-user: thread the state-resolved user_id (used
-        # to load THAT user's OAuth tokens), never a model-supplied argument.
-        user_id = state.get("user_id", SANDBOX_USER_ID)
-        result = run_calendar_tool(name, user_id, args)
-        content = f"[tool:{name}] {result}"
-        try:
-            dispatch_custom_event(
-                TOOL_CALL_EVENT, {"name": name, "args": args, "result": result}
-            )
-        except Exception:
-            pass
-    elif name in REIT_TOOL_REGISTRY:
-        # REIT report tools are read-only and global (not per-user); user_id is
-        # threaded for a uniform signature. run_reit_tool never raises.
-        user_id = state.get("user_id", SANDBOX_USER_ID)
-        result = run_reit_tool(name, user_id, args)
-        content = f"[tool:{name}] {result}"
-        try:
-            dispatch_custom_event(
-                TOOL_CALL_EVENT, {"name": name, "args": args, "result": result}
-            )
-        except Exception:
-            pass
-    elif name in TOOL_REGISTRY:
-        user_id = state.get("user_id", SANDBOX_USER_ID)
-        result = run_vault_tool(name, user_id, args)
-        content = f"[tool:{name}] {result}"
-        # Surface the call for the SSE stream so the UI can show a
-        # reading/searching indicator. Best-effort: outside a run context (a
-        # direct unit-test call) there is no callback manager and this raises —
-        # swallow it; the result is still recorded on the message channel.
-        try:
-            dispatch_custom_event(
-                TOOL_CALL_EVENT, {"name": name, "args": args, "result": result}
-            )
-        except Exception:
-            pass
+    calls = _requested_tool_calls(state)
+    user_id = state.get("user_id", SANDBOX_USER_ID)
+
+    if not calls:
+        return {
+            "messages": [
+                Message(source="tool_execution", content="[stub] tool executed", step=state["step"])
+            ],
+            "usage": TOOL_USAGE,
+            "visited": ["tool_execution"],
+            "step": 1,
+        }
+
+    # Execute. Several calls run concurrently (independent network I/O against
+    # different backends), bounded so a 15-game schedule doesn't open 15 sockets to
+    # Google Calendar at once. A single call stays on this thread — the overwhelming
+    # majority of turns, and no reason to pay for a pool.
+    if len(calls) == 1:
+        results = [_dispatch_tool(calls[0]["name"], calls[0]["args"], user_id)]
     else:
-        content = "[stub] tool executed"
+        with ThreadPoolExecutor(max_workers=min(MAX_PARALLEL_TOOL_CALLS, len(calls))) as pool:
+            results = list(
+                pool.map(lambda c: _dispatch_tool(c["name"], c["args"], user_id), calls)
+            )
+
+    # Events are dispatched HERE, on the graph's own thread, not inside the workers.
+    # LangChain's callback manager is carried in a contextvar, which pool threads do
+    # not inherit — dispatching from a worker silently loses the event and the UI's
+    # tool indicator never appears. Emitting after the fact also keeps event order
+    # matching call order regardless of which tool finished first.
+    messages: list[Message] = []
+    kb_sources: list[str] | None = None  # set by the KB tool, for the answer's citation
+    for call, (result, sources) in zip(calls, results):
+        if sources is not None:
+            kb_sources = sources
+        messages.append(
+            Message(
+                source="tool_execution",
+                content=f"[tool:{call['name']}] {result}",
+                step=state["step"],
+            )
+        )
+        # Best-effort: outside a run context (a direct unit-test call) there is no
+        # callback manager and this raises — swallow it; the result is still
+        # recorded on the message channel.
+        try:
+            dispatch_custom_event(
+                TOOL_CALL_EVENT,
+                {"name": call["name"], "args": call["args"], "result": result},
+            )
+        except Exception:
+            pass
+
     out: dict = {
-        "messages": [Message(source="tool_execution", content=content, step=state["step"])],
+        "messages": messages,
         "usage": TOOL_USAGE,
         "visited": ["tool_execution"],
         "step": 1,
@@ -1766,6 +2022,7 @@ def _initial_state(payload: IntentPayload, user_id: str) -> GraphState:
         "next": "",
         "status": "",
         "tool_request": None,
+        "tool_calls": None,
     }
 
 
