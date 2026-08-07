@@ -26,6 +26,7 @@ import logging
 import time
 import urllib.robotparser
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor
 from typing import Protocol
 from urllib.parse import urlsplit
 
@@ -228,9 +229,16 @@ class FetchProvider:
 class SearchProvider:
     """Ask the assistant's existing grounded-search tool what happened.
 
-    Returns headline-level items with source URLs; bodies are filled in later by
-    the fetch stage for whichever items survive ranking. Searching is cheap,
-    fetching is not, so the order matters.
+    TITLES MUST BE RESOLVED BY FETCHING. Gemini's grounding metadata returns the
+    SITE for ``web.title`` — "businesswire.com", not the article's headline. Used
+    as-is that produces a Top 5 entry called "reuters.com", and worse, every
+    search result looks near-identical to the clusterer because domain names
+    share no distinctive tokens.
+
+    So unlike the feed providers, this one fetches each result at discovery time
+    to get a real title. That trades the "rank before fetch" saving for
+    correctness — but only over the handful of results a topic returns, not the
+    ~76 items the feeds produce, so the cost is bounded and opt-in.
     """
 
     kind = "search"
@@ -243,21 +251,34 @@ class SearchProvider:
         except Exception as exc:  # noqa: BLE001 — search is best-effort
             logger.warning("search failed for %r: %s", spec.topic, exc)
             return []
-        items: list[RawItem] = []
-        for result in results:
-            url = (result.get("url") or "").strip()
-            title = tidy(result.get("title") or "")
-            if url and title:
-                items.append(
-                    RawItem(
-                        url=url,
-                        title=title,
-                        source_name=result.get("source") or spec.name,
-                        topic=spec.topic,
-                        summary=tidy(result.get("snippet") or "", limit=600) or None,
-                    )
-                )
-        return items
+
+        candidates = [
+            (r.get("url", "").strip(), tidy(r.get("source") or r.get("title") or ""))
+            for r in results
+            if (r.get("url") or "").strip()
+        ]
+        if not candidates:
+            return []
+
+        fetcher = FetchProvider()
+
+        def resolve(pair: tuple[str, str]) -> RawItem | None:
+            url, site = pair
+            item = fetcher.fetch_one(spec, url)
+            if item.skipped_reason or not item.title.strip():
+                # No usable headline and no text. Including it would put a bare
+                # domain in front of the reader.
+                logger.info("dropping search result with no resolvable title: %s (%s)",
+                            url, item.skipped_reason or "empty title")
+                return None
+            item.source_name = site or spec.name
+            item.topic = spec.topic
+            return item
+
+        workers = max(1, min(config.FETCH_CONCURRENCY, len(candidates)))
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            resolved = list(pool.map(resolve, candidates))
+        return [i for i in resolved if i is not None]
 
 
 def _skipped(spec: SourceSpec, url: str, reason: str, *, title: str = "") -> RawItem:

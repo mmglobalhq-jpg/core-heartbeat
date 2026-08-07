@@ -672,3 +672,60 @@ class TestTopicsReachTheSourceList:
         summary = run_module.run_due(Repo(), deliver="none")
         assert seen["topics"] == ["sailing", "rowing"]
         assert summary["failed"] == 1  # our deliberate stop, contained per user
+
+
+class TestSearchResultTitles:
+    """Gemini grounding returns the SITE as web.title — "businesswire.com", not
+    the headline. Used as-is that puts a bare domain in the Top 5, and makes every
+    search result look identical to the clusterer."""
+
+    def _patch(self, monkeypatch, results, pages):
+        monkeypatch.setattr("tools.web_tools.search_web_raw",
+                            lambda q, max_results=10: results)
+        monkeypatch.setattr("briefing.sources.robots_allows", lambda url: True)
+        monkeypatch.setattr("briefing.sources.throttle", lambda url: None)
+
+        def fake_fetch_page(url):
+            if url not in pages:
+                raise TimeoutError("unreachable")
+            return (url, pages[url], "article body")
+
+        monkeypatch.setattr("briefing.sources.fetch_page", fake_fetch_page)
+
+    def test_resolves_the_real_headline(self, monkeypatch):
+        from briefing.models import SourceSpec
+        from briefing.sources import SearchProvider
+
+        self._patch(
+            monkeypatch,
+            [{"url": "https://businesswire.com/a", "title": "businesswire.com",
+              "source": "businesswire.com"}],
+            {"https://businesswire.com/a": "Mortgage REIT announces buyback"},
+        )
+        items = SearchProvider().fetch(SourceSpec("search", "T", "mortgage REITs"))
+        assert len(items) == 1
+        assert items[0].title == "Mortgage REIT announces buyback"
+        assert items[0].source_name == "businesswire.com"
+
+    def test_drops_results_whose_title_cannot_be_resolved(self, monkeypatch):
+        # Better to lose a candidate than to show the reader "reuters.com".
+        from briefing.models import SourceSpec
+        from briefing.sources import SearchProvider
+
+        self._patch(
+            monkeypatch,
+            [{"url": "https://unreachable.example/a", "title": "unreachable.example",
+              "source": "unreachable.example"}],
+            {},
+        )
+        assert SearchProvider().fetch(SourceSpec("search", "T", "topic")) == []
+
+    def test_a_failed_search_is_not_fatal(self, monkeypatch):
+        from briefing.models import SourceSpec
+        from briefing.sources import SearchProvider
+
+        def boom(q, max_results=10):
+            raise RuntimeError("provider down")
+
+        monkeypatch.setattr("tools.web_tools.search_web_raw", boom)
+        assert SearchProvider().fetch(SourceSpec("search", "T", "topic")) == []
