@@ -356,23 +356,48 @@ identical to one with no topics set. Not so high that a topic can take the whole
 list — MAX_PER_SOURCE still caps any single source."""
 
 
+# Every feed below was verified on 2026-08-07: robots.txt permits it under our
+# user agent, it parses, and it carried dated, recent entries. Two candidates were
+# dropped for deliberate refusals, not for being awkward:
+#
+#   AP News       apnews.com/robots.txt has `Disallow: /*.rss`
+#   MarketWatch   robots.txt returns 403 even to an honest agent, on both hosts
+#
+# Re-check with tests/check_feeds.py rather than assuming; feeds rot quietly.
 DEFAULT_SOURCES: tuple[SourceSpec, ...] = (
-    SourceSpec("rss", "NPR News", "top stories",
+    # --- world & general ---
+    SourceSpec("rss", "BBC News", "world",
+               "http://feeds.bbci.co.uk/news/rss.xml", weight=1.1),
+    SourceSpec("rss", "NPR Top Stories", "top stories",
                "https://feeds.npr.org/1001/rss.xml", weight=1.1),
-    SourceSpec("rss", "BBC World", "world",
-               "https://feeds.bbci.co.uk/news/world/rss.xml", weight=1.1),
-    # NOT Google News. news.google.com/robots.txt is `Disallow: /` with a short
-    # allow-list that excludes /rss/, so every request to it was correctly
-    # refused — this slot produced nothing for the feature's whole first day
-    # while the run reported the source as healthy.
+    SourceSpec("rss", "Guardian World", "world",
+               "https://www.theguardian.com/world/rss", weight=1.05),
+    # --- business & economy ---
+    SourceSpec("rss", "FT Home", "business",
+               "https://www.ft.com/rss/home", weight=1.1),
+    SourceSpec("rss", "CNBC Top News", "business",
+               "https://www.cnbc.com/id/100003114/device/rss/rss.html"),
     SourceSpec("rss", "BBC Business", "business",
                "https://feeds.bbci.co.uk/news/business/rss.xml"),
     SourceSpec("rss", "NPR Business", "business",
                "https://feeds.npr.org/1006/rss.xml"),
+    # The Economist's feed returns ~300 entries spanning weeks and is
+    # malformed enough that feedparser flags bozo (it still parses). Low weight:
+    # useful analysis, but it would otherwise flood the pool on volume alone.
+    SourceSpec("rss", "The Economist", "business",
+               "https://www.economist.com/latest/rss.xml", weight=0.85),
+    # --- technology ---
     SourceSpec("rss", "Ars Technica", "technology",
-               "https://feeds.arstechnica.com/arstechnica/index", weight=1.0),
+               "https://feeds.arstechnica.com/arstechnica/index"),
+    SourceSpec("rss", "The Verge", "technology",
+               "https://www.theverge.com/rss/index.xml"),
     SourceSpec("rss", "Hacker News front page", "technology",
-               "https://hnrss.org/frontpage", weight=0.9),
+               "https://news.ycombinator.com/rss", weight=0.9),
+    # --- science ---
+    SourceSpec("rss", "ScienceDaily", "science",
+               "https://www.sciencedaily.com/rss/all.xml", weight=0.9),
+    SourceSpec("rss", "NASA Breaking News", "science",
+               "https://www.nasa.gov/rss/dyn/breaking_news.rss", weight=0.9),
 )
 
 
