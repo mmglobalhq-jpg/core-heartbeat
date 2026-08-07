@@ -497,3 +497,35 @@ class TestFeedparserIsAProductionDependency:
 
     def test_feedparser_is_importable(self):
         import feedparser  # noqa: F401
+
+
+class TestDedupThresholdIsInTheMeasuredBand:
+    """The first production briefing carried one story twice.
+
+    These are real nomic-embed-text scores from that briefing's own headlines.
+    The threshold has to sit between the duplicate score and the highest
+    unrelated score; 0.86 sat above BOTH, so it could never merge anything.
+    """
+
+    SAME_STORY = 0.792          # two outlets, July jobs report
+    HIGHEST_UNRELATED = 0.398   # defence pact vs senate nomination
+
+    def test_threshold_merges_a_real_duplicate(self):
+        assert config.DEDUP_THRESHOLD < self.SAME_STORY
+
+    def test_threshold_does_not_merge_unrelated_stories(self):
+        assert config.DEDUP_THRESHOLD > self.HIGHEST_UNRELATED
+
+    def test_threshold_keeps_margin_on_both_sides(self):
+        # A threshold technically inside the band but hugging either edge would
+        # flip on normal variation between days.
+        assert self.SAME_STORY - config.DEDUP_THRESHOLD > 0.10
+        assert config.DEDUP_THRESHOLD - self.HIGHEST_UNRELATED > 0.10
+
+    def test_clustering_merges_at_the_measured_duplicate_score(self):
+        from briefing.dedup import cosine
+        # Two vectors whose cosine is ~0.79, the measured duplicate score.
+        import math
+        angle = math.acos(self.SAME_STORY)
+        a, b = [1.0, 0.0], [math.cos(angle), math.sin(angle)]
+        assert cosine(a, b) >= config.DEDUP_THRESHOLD

@@ -44,10 +44,29 @@ RESPECT_ROBOTS = os.environ.get("BRIEFING_RESPECT_ROBOTS", "1") != "0"
 
 # --- ranking -----------------------------------------------------------------
 
-DEDUP_THRESHOLD = float(os.environ.get("BRIEFING_DEDUP_THRESHOLD", "0.86"))
-"""Cosine similarity above which two stories are the same story. Tuned high:
-merging two distinct stories loses one entirely, while failing to merge shows a
-near-duplicate, which is the cheaper mistake."""
+DEDUP_THRESHOLD = float(os.environ.get("BRIEFING_DEDUP_THRESHOLD", "0.62"))
+"""Cosine similarity above which two stories are the same story.
+
+MEASURED, NOT GUESSED. The first production briefing carried the July jobs report
+twice — slots 1 and 5, two outlets, one event — because this was 0.86, which is
+ABOVE the score real duplicates get. It could never merge anything.
+
+Scored with nomic-embed-text on that briefing's own headlines:
+
+    same story, two outlets ............ 0.792
+    jobs report vs defence pact ........ 0.383
+    jobs report vs senate nomination ... 0.332
+    defence pact vs senate nomination .. 0.398
+
+So duplicates land near 0.79 and unrelated pairs near 0.33-0.40, leaving an empty
+band between. 0.62 sits in the middle: 0.17 of margin before it misses a
+duplicate, 0.22 before it merges two distinct stories. Token overlap on that same
+pair was 0.14 — useless, which is why the fallback has its own threshold rather
+than sharing this one.
+
+The original 0.86 came with a comment justifying it as deliberately cautious.
+That reasoning was sound and the number was still wrong: nothing had measured
+where real duplicates actually score."""
 
 MAX_PER_SOURCE = int(os.environ.get("BRIEFING_MAX_PER_SOURCE", "2"))
 """Ceiling on Top-N slots one outlet may hold.
