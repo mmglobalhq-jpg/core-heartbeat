@@ -816,3 +816,144 @@ class TestRobotsFetching:
     def test_404_means_no_restriction(self, monkeypatch):
         S, _ = self._load(monkeypatch, status=404)
         assert S.robots_allows("https://norobots.example/anything") is True
+
+
+class TestUserSources:
+    """Sources a user added are appended to the defaults, never replace them."""
+
+    def test_defaults_survive(self):
+        from briefing.sources import DEFAULT_SOURCES, sources_for
+
+        specs = sources_for(None, [{"kind": "rss", "url": "https://mine.example/f",
+                                    "name": "Mine", "topic": "custom"}])
+        assert len(specs) == len(DEFAULT_SOURCES) + 1
+        for d in DEFAULT_SOURCES:
+            assert d in specs
+
+    def test_unknown_kind_is_ignored(self):
+        from briefing.sources import DEFAULT_SOURCES, sources_for
+
+        specs = sources_for(None, [{"kind": "telepathy", "url": "https://x.example/",
+                                    "name": "X", "topic": "custom"}])
+        assert len(specs) == len(DEFAULT_SOURCES)
+
+    def test_blank_url_is_ignored(self):
+        from briefing.sources import DEFAULT_SOURCES, sources_for
+
+        assert len(sources_for(None, [{"kind": "rss", "url": "  ", "name": "X"}])) \
+            == len(DEFAULT_SOURCES)
+
+    def test_user_source_outweighs_defaults_but_is_still_capped(self):
+        from briefing.sources import DEFAULT_SOURCES, sources_for
+        from briefing import config
+
+        spec = sources_for(None, [{"kind": "rss", "url": "https://mine.example/f",
+                                   "name": "Mine"}])[-1]
+        assert spec.weight > max(d.weight for d in DEFAULT_SOURCES)
+        # Weight steers ranking; MAX_PER_SOURCE is what stops one feed taking
+        # the whole list, and it applies to custom sources identically.
+        assert config.MAX_PER_SOURCE < config.TOP_COUNT
+
+
+class TestSiteProvider:
+    """The scraping fallback: one public page, headline links, nothing more."""
+
+    def _patch(self, monkeypatch, html, *, allowed=True):
+        import briefing.sources as S
+
+        monkeypatch.setattr(S, "robots_allows", lambda url: allowed)
+        monkeypatch.setattr(S, "throttle", lambda url: None)
+        monkeypatch.setattr("briefing.discovery._raw_html", lambda url: html)
+
+    HTML = """
+      <a href="/news/one">A genuinely long headline about the harbour works</a>
+      <a href="/news/two">Another headline that is clearly a sentence of news</a>
+      <a href="/news/three">Third headline long enough to look like real news</a>
+      <a href="/login">Sign in</a>
+      <a href="https://other.example/x">An offsite link with a long anchor text here</a>
+    """
+
+    def test_extracts_headlines_and_skips_navigation(self, monkeypatch):
+        from briefing.models import SourceSpec
+        from briefing.sources import SiteProvider
+
+        self._patch(monkeypatch, self.HTML)
+        items = SiteProvider().fetch(SourceSpec("site", "Mine", "custom",
+                                                "https://mine.example/news"))
+        titles = [i.title for i in items]
+        assert len(items) == 3
+        assert not any("Sign in" in t for t in titles)
+
+    def test_does_not_follow_offsite_links(self, monkeypatch):
+        from briefing.models import SourceSpec
+        from briefing.sources import SiteProvider
+
+        self._patch(monkeypatch, self.HTML)
+        items = SiteProvider().fetch(SourceSpec("site", "Mine", "custom",
+                                                "https://mine.example/news"))
+        assert all("other.example" not in i.url for i in items)
+
+    def test_robots_disallow_stops_it(self, monkeypatch):
+        from briefing.models import SourceSpec
+        from briefing.sources import SiteProvider
+
+        self._patch(monkeypatch, self.HTML, allowed=False)
+        items = SiteProvider().fetch(SourceSpec("site", "Mine", "custom",
+                                                "https://mine.example/news"))
+        assert items[0].skipped_reason == "robots_disallow"
+
+    def test_a_paywall_is_reported_not_scraped(self, monkeypatch):
+        from briefing.models import SourceSpec
+        from briefing.sources import SiteProvider
+
+        self._patch(monkeypatch, "<p>Subscribe to continue reading this article</p>")
+        items = SiteProvider().fetch(SourceSpec("site", "Mine", "custom",
+                                                "https://mine.example/news"))
+        assert items[0].skipped_reason == "paywall"
+
+    def test_no_headlines_is_reported(self, monkeypatch):
+        from briefing.models import SourceSpec
+        from briefing.sources import SiteProvider
+
+        self._patch(monkeypatch, "<a href='/x'>Home</a>")
+        items = SiteProvider().fetch(SourceSpec("site", "Mine", "custom",
+                                                "https://mine.example/news"))
+        assert items[0].skipped_reason == "no_headlines_found"
+
+
+class TestDiscovery:
+    def test_rejects_a_non_url(self):
+        from briefing.discovery import discover
+
+        assert discover("not a url at all").ok is False
+
+    def test_rejects_empty(self):
+        from briefing.discovery import discover
+
+        assert discover("").ok is False
+
+    def test_refuses_when_robots_disallows(self, monkeypatch):
+        import briefing.discovery as D
+
+        monkeypatch.setattr(D, "robots_allows", lambda url: False)
+        c = D.discover("https://blocked.example/news")
+        assert c.ok is False and "robots.txt" in c.reason
+
+    def test_finds_an_advertised_feed(self):
+        from briefing.discovery import advertised_feeds
+
+        html = '<link rel="alternate" type="application/rss+xml" href="/feed.xml">'
+        assert advertised_feeds(html, "https://x.example/") == ["https://x.example/feed.xml"]
+
+    def test_ignores_non_xml_alternates(self):
+        from briefing.discovery import advertised_feeds
+
+        html = '<link rel="alternate" type="text/html" href="/amp">'
+        assert advertised_feeds(html, "https://x.example/") == []
+
+    def test_headline_extraction_requires_sentence_length(self):
+        from briefing.discovery import extract_headline_links
+
+        html = '<a href="/a">News</a><a href="/b">A headline long enough to count here</a>'
+        links = extract_headline_links(html, "https://x.example/")
+        assert [t for _, t in links] == ["A headline long enough to count here"]

@@ -40,6 +40,7 @@ logger = logging.getLogger(__name__)
 
 class BriefingRepository(Protocol):
     def list_enabled_prefs(self) -> list[dict]: ...
+    def list_user_sources(self, user_id: str) -> list[dict]: ...
     def upsert_briefing(self, draft: BriefingDraft) -> str: ...
     def replace_sections(self, briefing_id: str, sections: list[Section]) -> None: ...
     def record_delivery(self, briefing_id: str, channel: str, status: str,
@@ -88,6 +89,16 @@ class PostgresRepository:
                  "topics": r[3] or [], "deliver_email": r[4], "email_to": r[5]}
                 for r in cur.fetchall()
             ]
+
+    def list_user_sources(self, user_id: str) -> list[dict]:
+        with self._connect() as conn, conn.cursor() as cur:
+            cur.execute(
+                "select kind, url, name, topic from public.briefing_user_sources "
+                "where user_id = %s and is_active",
+                (user_id,),
+            )
+            return [{"kind": k, "url": u, "name": n, "topic": t}
+                    for k, u, n, t in cur.fetchall()]
 
     def upsert_briefing(self, draft: BriefingDraft) -> str:
         with self._connect() as conn, conn.cursor() as cur:
@@ -228,6 +239,16 @@ class PostgrestRepository:
             row["deliver_at"] = str(row.get("deliver_at") or "06:30")[:5]
             row["topics"] = row.get("topics") or []
         return rows
+
+    def list_user_sources(self, user_id: str) -> list[dict]:
+        with self._client() as client:
+            response = client.get(
+                "/briefing_user_sources",
+                params={"user_id": f"eq.{user_id}", "is_active": "is.true",
+                        "select": "kind,url,name,topic"},
+            )
+        response.raise_for_status()
+        return response.json() or []
 
     def upsert_briefing(self, draft: BriefingDraft) -> str:
         row = {

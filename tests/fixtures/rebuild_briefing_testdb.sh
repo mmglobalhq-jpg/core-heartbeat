@@ -43,6 +43,7 @@ psql_db -v ON_ERROR_STOP=1 -q < "$HERE/supabase_shim.sql"
 
 echo "==> applying briefing migration"
 psql_db -v ON_ERROR_STOP=1 -q < "$MIGRATIONS/0008_daily_briefing.sql"
+psql_db -v ON_ERROR_STOP=1 -q < "$MIGRATIONS/0009_briefing_user_sources.sql"
 
 echo "==> verifying isolation and invariants"
 out=$(psql_db < "$HERE/briefing_rls_check.sql" 2>&1 | grep -E 'PASS|FAIL|ERROR' | sed -E 's/^NOTICE:  //')
@@ -50,7 +51,7 @@ echo "$out" | sed 's/^/    /'
 
 # A check that errored produced no PASS line, which on its own looks like silence
 # rather than failure. Count explicitly and require every check to have reported.
-expected=11
+expected=15
 passed=$(grep -c '^PASS' <<<"$out" || true)
 if grep -qE '^(FAIL|ERROR)' <<<"$out" || [ "$passed" -ne "$expected" ]; then
   echo

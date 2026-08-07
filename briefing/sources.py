@@ -329,10 +329,59 @@ def _skipped(spec: SourceSpec, url: str, reason: str, *, title: str = "") -> Raw
     )
 
 
+
+class SiteProvider:
+    """Read headlines off a public page that has no feed.
+
+    The fallback of last resort, used only when discovery found no feed at all.
+    It reads ONE page — the section or homepage the user pointed at — extracts
+    same-host links whose anchor text is long enough to be a headline, and stops.
+    It does not crawl onward, render JavaScript, or vary its identity.
+
+    Timestamps are unavailable this way, so items carry no ``published_at`` and
+    survive the freshness filter on the strength of the page being current. That
+    is a real weakness of scraping versus a feed, and it is why every other route
+    is tried first.
+    """
+
+    kind = "site"
+
+    def fetch(self, spec: SourceSpec) -> list[RawItem]:
+        from briefing.discovery import extract_headline_links, _raw_html
+
+        if not spec.url:
+            return []
+        if not robots_allows(spec.url):
+            return [_skipped(spec, spec.url, "robots_disallow")]
+        throttle(spec.url)
+        html = _raw_html(spec.url)
+        if not html:
+            return [_skipped(spec, spec.url, "fetch_failed")]
+
+        blocked = classify_block(html)
+        if blocked:
+            return [_skipped(spec, spec.url, blocked)]
+
+        items: list[RawItem] = []
+        for url, headline in extract_headline_links(html, spec.url)[: config.MAX_ITEMS_PER_SOURCE]:
+            items.append(
+                RawItem(
+                    url=url,
+                    title=headline,
+                    source_name=spec.name,
+                    topic=spec.topic,
+                )
+            )
+        if not items:
+            return [_skipped(spec, spec.url, "no_headlines_found")]
+        return items
+
+
 PROVIDERS: dict[str, SourceProvider] = {
     "rss": RssProvider(),
     "fetch": FetchProvider(),
     "search": SearchProvider(),
+    "site": SiteProvider(),
 }
 
 
@@ -401,7 +450,8 @@ DEFAULT_SOURCES: tuple[SourceSpec, ...] = (
 )
 
 
-def sources_for(topics: list[str] | None) -> tuple[SourceSpec, ...]:
+def sources_for(topics: list[str] | None = None,
+                user_sources: list[dict] | None = None) -> tuple[SourceSpec, ...]:
     """The sources to poll. Currently the defaults, whatever the topics.
 
     TOPICS CANNOT ADD SOURCES, and it is worth recording why rather than leaving
@@ -425,4 +475,22 @@ def sources_for(topics: list[str] | None) -> tuple[SourceSpec, ...]:
     yields nothing, and the honest fix for that is letting users add their own
     feeds, which is not built yet.
     """
-    return DEFAULT_SOURCES
+    specs = list(DEFAULT_SOURCES)
+    for row in user_sources or []:
+        url = (row.get("url") or "").strip()
+        kind = row.get("kind") or "rss"
+        if not url or kind not in PROVIDERS:
+            continue
+        specs.append(
+            SourceSpec(
+                kind,
+                row.get("name") or _host(url),
+                row.get("topic") or "custom",
+                url,
+                # Slightly above the defaults: someone who went to the trouble of
+                # adding a source wants to see it. Not high enough to let one
+                # feed take the list — MAX_PER_SOURCE still applies.
+                weight=float(row.get("weight") or 1.2),
+            )
+        )
+    return tuple(specs)

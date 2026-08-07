@@ -58,6 +58,7 @@ def build_briefing(
     *,
     sources: tuple[SourceSpec, ...] | None = None,
     topics: list[str] | None = None,
+    user_sources: list[dict] | None = None,
     timezone: str = config.DEFAULT_TIMEZONE,
     top_count: int | None = None,
     do_editorial: bool = True,
@@ -71,7 +72,7 @@ def build_briefing(
     that is the test seam.
     """
     if sources is None:
-        sources = sources_for(topics)
+        sources = sources_for(topics, user_sources)
     budget = EscalationBudget()
     meta: dict = {"timezone": timezone, "started_at": dt.datetime.now(dt.UTC).isoformat()}
 
@@ -142,12 +143,20 @@ def run_due(repo, *, deliver: str, dry_run: bool = False) -> dict:
     for prefs in pending:
         user_id = prefs["user_id"]
         try:
-            # Topics were read out of the database and then dropped here — the
-            # settings panel promised "a briefing from your topics" while the
-            # pipeline used five hardcoded feeds for everyone.
+            # Loaded per run, not cached: a user can add or remove a source
+            # between ticks and the next briefing reflects it. Failure here is
+            # non-fatal because custom sources are additive — losing them gives a
+            # thinner briefing, not none.
+            try:
+                user_sources = repo.list_user_sources(user_id)
+            except Exception as exc:  # noqa: BLE001 — custom sources are additive
+                logger.warning("could not load custom sources for %s (%s); "
+                               "using defaults", user_id, exc)
+                user_sources = []
             draft = build_briefing(
                 user_id,
                 topics=prefs.get("topics") or [],
+                user_sources=user_sources,
                 timezone=prefs.get("timezone") or config.DEFAULT_TIMEZONE,
             )
             if dry_run:

@@ -152,3 +152,50 @@ exception
 end $$;
 
 reset role;
+
+
+-- --- 9. user-added sources: owned, isolated, user-writable -------------------
+
+set role service_role;
+insert into public.briefing_user_sources (user_id, kind, url, name) values
+  ('aaaaaaaa-0000-0000-0000-000000000001', 'rss', 'https://a.example/feed', 'A feed'),
+  ('bbbbbbbb-0000-0000-0000-000000000002', 'rss', 'https://b.example/feed', 'B feed');
+reset role;
+
+set role authenticated;
+set request.jwt.claim.sub = 'aaaaaaaa-0000-0000-0000-000000000001';
+
+select case when count(*) = 1 then 'PASS 12  user A sees only own sources'
+            else 'FAIL 12  user A saw ' || count(*) || ' sources' end
+from public.briefing_user_sources;
+
+select case when count(*) = 0
+            then 'PASS 13  user A cannot see user B sources'
+            else 'FAIL 13  USER A READ USER B SOURCES' end
+from public.briefing_user_sources where url = 'https://b.example/feed';
+
+-- Unlike briefings, a user OWNS their reading list and may write it.
+do $$
+begin
+  insert into public.briefing_user_sources (user_id, kind, url, name)
+  values ('aaaaaaaa-0000-0000-0000-000000000001', 'rss', 'https://new.example/f', 'New');
+  raise notice 'PASS 14  user can add their own source';
+exception when others then
+  raise exception 'FAIL 14  user could NOT add own source: %', sqlerrm;
+end $$;
+
+-- But not one belonging to somebody else.
+do $$
+begin
+  insert into public.briefing_user_sources (user_id, kind, url, name)
+  values ('bbbbbbbb-0000-0000-0000-000000000002', 'rss', 'https://evil.example/f', 'X');
+  raise exception 'FAIL 15  USER A INSERTED A SOURCE FOR USER B';
+exception
+  when insufficient_privilege then raise notice 'PASS 15  cross-user source insert denied';
+  when others then
+    if sqlerrm like '%row-level security%' then
+      raise notice 'PASS 15  cross-user source insert denied by RLS';
+    else raise; end if;
+end $$;
+
+reset role;
