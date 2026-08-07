@@ -529,3 +529,76 @@ class TestDedupThresholdIsInTheMeasuredBand:
         angle = math.acos(self.SAME_STORY)
         a, b = [1.0, 0.0], [math.cos(angle), math.sin(angle)]
         assert cosine(a, b) >= config.DEDUP_THRESHOLD
+
+
+class TestFetchRetry:
+    """The first production briefing could not read 4 of 6 selected articles.
+
+    The cause was timeouts, not access controls — the same URLs read fine on a
+    second attempt. Retry transport failures; never retry a refusal.
+    """
+
+    def _provider(self, monkeypatch, side_effects):
+        from briefing.sources import FetchProvider
+
+        calls = {"n": 0}
+
+        def fake_fetch_page(url):
+            i = calls["n"]
+            calls["n"] += 1
+            outcome = side_effects[min(i, len(side_effects) - 1)]
+            if isinstance(outcome, Exception):
+                raise outcome
+            return outcome
+
+        monkeypatch.setattr("briefing.sources.fetch_page", fake_fetch_page)
+        monkeypatch.setattr("briefing.sources.robots_allows", lambda url: True)
+        monkeypatch.setattr("briefing.sources.throttle", lambda url: None)
+        return FetchProvider(), calls
+
+    def test_retries_a_timeout_and_succeeds(self, monkeypatch):
+        from briefing.models import SourceSpec
+
+        provider, calls = self._provider(
+            monkeypatch,
+            [TimeoutError("read timed out"), ("https://a.example/x", "Title", "body text")],
+        )
+        item = provider.fetch_one(SourceSpec("fetch", "A", "news", "https://a.example/x"),
+                                  "https://a.example/x")
+        assert item.skipped_reason is None
+        assert item.body == "body text"
+        assert calls["n"] == 2
+
+    def test_gives_up_after_the_retry(self, monkeypatch):
+        from briefing.models import SourceSpec
+
+        provider, calls = self._provider(monkeypatch, [TimeoutError("nope")])
+        item = provider.fetch_one(SourceSpec("fetch", "A", "news", "https://a.example/x"),
+                                  "https://a.example/x")
+        assert item.skipped_reason.startswith("fetch_failed")
+        assert calls["n"] == 2  # bounded, not unlimited
+
+    def test_does_not_retry_a_refusal(self, monkeypatch):
+        # A paywall or an SSRF refusal is a decision. Retrying pesters a host
+        # that already said no.
+        from briefing.models import SourceSpec
+        from services.web import WebFetchError
+
+        provider, calls = self._provider(monkeypatch, [WebFetchError("refused")])
+        item = provider.fetch_one(SourceSpec("fetch", "A", "news", "https://a.example/x"),
+                                  "https://a.example/x")
+        assert item.skipped_reason.startswith("fetch_failed")
+        assert calls["n"] == 1
+
+    def test_robots_disallow_is_never_fetched_at_all(self, monkeypatch):
+        from briefing.models import SourceSpec
+        from briefing.sources import FetchProvider
+
+        monkeypatch.setattr("briefing.sources.robots_allows", lambda url: False)
+        called = {"n": 0}
+        monkeypatch.setattr("briefing.sources.fetch_page",
+                            lambda u: called.__setitem__("n", called["n"] + 1))
+        item = FetchProvider().fetch_one(
+            SourceSpec("fetch", "A", "news", "https://a.example/x"), "https://a.example/x")
+        assert item.skipped_reason == "robots_disallow"
+        assert called["n"] == 0

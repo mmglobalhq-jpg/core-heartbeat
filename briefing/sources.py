@@ -179,17 +179,38 @@ class FetchProvider:
             return []
         return [self.fetch_one(spec, spec.url)]
 
-    def fetch_one(self, spec: SourceSpec, url: str) -> RawItem:
+    def fetch_one(self, spec: SourceSpec, url: str, *, attempts: int = 2) -> RawItem:
+        """Read one page, retrying once on a transient failure.
+
+        The first production briefing could not read 4 of its 6 selected
+        articles, and the write-ups fell back to headlines — visible in the
+        output as a padded Deep Dive. The cause was not paywalls or robots.txt
+        but plain TIMEOUTS: re-fetching the same URLs by hand succeeded.
+
+        So one retry, and only for transport failures. A robots disallow or a
+        paywall is a decision, not a hiccup — retrying those would be pestering a
+        host that already said no.
+        """
         if not robots_allows(url):
             return _skipped(spec, url, "robots_disallow")
-        throttle(url)
-        try:
-            final_url, title, text = fetch_page(url)
-        except WebFetchError as exc:
-            return _skipped(spec, url, f"fetch_failed: {exc}")
-        except Exception as exc:  # noqa: BLE001 — one bad page must not end the run
-            logger.warning("unexpected fetch failure for %s: %s", url, exc)
-            return _skipped(spec, url, "fetch_failed")
+
+        last_reason = "fetch_failed"
+        for attempt in range(1, attempts + 1):
+            throttle(url)
+            try:
+                final_url, title, text = fetch_page(url)
+                break
+            except WebFetchError as exc:
+                # A refusal from the far end, not a transport hiccup — do not retry.
+                last_reason = f"fetch_failed: {exc}"
+                return _skipped(spec, url, last_reason)
+            except Exception as exc:  # noqa: BLE001 — one bad page must not end the run
+                last_reason = f"fetch_failed: {type(exc).__name__}"
+                if attempt < attempts:
+                    logger.info("retrying %s after %s", url, type(exc).__name__)
+                    continue
+                logger.warning("unexpected fetch failure for %s: %s", url, exc)
+                return _skipped(spec, url, last_reason)
 
         blocked = classify_block(text)
         if blocked:
