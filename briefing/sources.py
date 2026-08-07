@@ -24,7 +24,9 @@ from __future__ import annotations
 import datetime as dt
 import logging
 import time
+import urllib.error
 import urllib.parse
+import urllib.request
 import urllib.robotparser
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
@@ -76,17 +78,52 @@ def robots_allows(url: str) -> bool:
         return True
     host = _host(url)
     if host not in _robots_cache:
-        parts = urlsplit(url)
-        parser = urllib.robotparser.RobotFileParser()
-        parser.set_url(f"{parts.scheme}://{parts.netloc}/robots.txt")
-        try:
-            parser.read()
-        except Exception as exc:  # noqa: BLE001 — unreachable robots.txt is not fatal
-            logger.debug("robots.txt unreadable for %s (%s); treating as allowed", host, exc)
-            parser = None
-        _robots_cache[host] = parser
+        _robots_cache[host] = _load_robots(url)
     parser = _robots_cache[host]
     return True if parser is None else parser.can_fetch(config.USER_AGENT, url)
+
+
+def _load_robots(url: str) -> urllib.robotparser.RobotFileParser | None:
+    """Fetch and parse robots.txt using OUR user agent.
+
+    ``RobotFileParser.read()`` fetches with ``Python-urllib/x.y``, and a great
+    many sites answer that with 403 as basic bot defence. The parser then treats
+    401/403 as *disallow everything* — so a site that merely dislikes the default
+    agent was recorded as forbidding all access.
+
+    That is not hypothetical. ft.com returns 403 to ``Python-urllib`` and 200 to a
+    real agent string; its rules allow ``/rss/`` and disallow only ``/login``,
+    ``/search``, ``/myft`` and similar. This pipeline was refusing FT's public
+    feed on the strength of a robots.txt it had never actually read.
+
+    A 401/403 received while identifying ourselves honestly still means
+    disallow-all, which is the convention and is deliberately preserved.
+    """
+    parts = urlsplit(url)
+    robots_url = f"{parts.scheme}://{parts.netloc}/robots.txt"
+    parser = urllib.robotparser.RobotFileParser()
+    parser.set_url(robots_url)
+    request = urllib.request.Request(robots_url, headers={"User-Agent": config.USER_AGENT})
+    try:
+        with urllib.request.urlopen(request, timeout=15) as response:
+            body = response.read(512_000).decode("utf-8", "replace")
+    except urllib.error.HTTPError as exc:
+        if exc.code in (401, 403):
+            # Refused even when asking honestly — treat as off-limits.
+            parser.disallow_all = True
+            logger.info("robots.txt for %s returned %s; treating host as disallowed",
+                        parts.netloc, exc.code)
+            return parser
+        # 404 and friends: no robots.txt means no restriction.
+        logger.debug("no robots.txt for %s (HTTP %s); treating as allowed",
+                     parts.netloc, exc.code)
+        return None
+    except Exception as exc:  # noqa: BLE001 — unreachable robots.txt is not fatal
+        logger.debug("robots.txt unreadable for %s (%s); treating as allowed",
+                     parts.netloc, exc)
+        return None
+    parser.parse(body.splitlines())
+    return parser
 
 
 # Phrases that mean "you are not the intended reader". Detecting these lets the

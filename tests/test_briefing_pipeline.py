@@ -751,3 +751,68 @@ class TestSearchResultTitles:
 
         monkeypatch.setattr("tools.web_tools.search_web_raw", boom)
         assert SearchProvider().fetch(SourceSpec("search", "T", "topic")) == []
+
+
+class TestRobotsFetching:
+    """RobotFileParser.read() fetches with Python-urllib, which many sites 403.
+
+    The parser treats 401/403 as disallow-all, so a site that merely dislikes the
+    default agent was recorded as forbidding everything. ft.com does exactly
+    that: 403 to Python-urllib, 200 to a real agent, and its rules allow /rss/.
+    """
+
+    FT_ROBOTS = "\n".join([
+        "User-agent: *",
+        "Disallow: /login",
+        "Disallow: /search",
+        "Disallow: /myft",
+        "Allow: /__assets/",
+        "Crawl-Delay: 1",
+    ])
+
+    def _load(self, monkeypatch, *, status=200, body=""):
+        import urllib.error
+        import briefing.sources as S
+
+        S._robots_cache.clear()
+
+        class FakeResponse:
+            def __init__(self, data): self._d = data.encode()
+            def read(self, n=None): return self._d
+            def __enter__(self): return self
+            def __exit__(self, *a): return False
+
+        def fake_urlopen(request, timeout=None):
+            seen["ua"] = request.get_header("User-agent")
+            if status != 200:
+                raise urllib.error.HTTPError(request.full_url, status, "no", {}, None)
+            return FakeResponse(body)
+
+        seen: dict = {}
+        monkeypatch.setattr(S.urllib.request, "urlopen", fake_urlopen)
+        return S, seen
+
+    def test_sends_our_user_agent_not_the_default(self, monkeypatch):
+        from briefing import config
+
+        S, seen = self._load(monkeypatch, body=self.FT_ROBOTS)
+        S.robots_allows("https://www.ft.com/rss/home")
+        assert seen["ua"] == config.USER_AGENT
+        assert "urllib" not in (seen["ua"] or "").lower()
+
+    def test_allows_a_path_the_rules_permit(self, monkeypatch):
+        S, _ = self._load(monkeypatch, body=self.FT_ROBOTS)
+        assert S.robots_allows("https://www.ft.com/rss/home") is True
+
+    def test_still_honours_a_real_disallow(self, monkeypatch):
+        S, _ = self._load(monkeypatch, body=self.FT_ROBOTS)
+        assert S.robots_allows("https://www.ft.com/login") is False
+
+    def test_403_while_identifying_honestly_means_disallowed(self, monkeypatch):
+        # The convention is preserved: refused when asking properly = off-limits.
+        S, _ = self._load(monkeypatch, status=403)
+        assert S.robots_allows("https://locked.example/anything") is False
+
+    def test_404_means_no_restriction(self, monkeypatch):
+        S, _ = self._load(monkeypatch, status=404)
+        assert S.robots_allows("https://norobots.example/anything") is True
