@@ -24,6 +24,7 @@ from __future__ import annotations
 import datetime as dt
 import logging
 import time
+import urllib.parse
 import urllib.robotparser
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
@@ -332,6 +333,12 @@ DEFAULT_SOURCES: tuple[SourceSpec, ...] = (
 )
 
 
+def topic_feed_url(topic: str) -> str:
+    """A Google News RSS search for one topic, restricted to the last day."""
+    query = urllib.parse.quote_plus(f"{topic} when:1d")
+    return f"https://news.google.com/rss/search?q={query}&hl=en-US&gl=US&ceid=US:en"
+
+
 def sources_for(topics: list[str] | None) -> tuple[SourceSpec, ...]:
     """The sources to poll for one user.
 
@@ -339,8 +346,21 @@ def sources_for(topics: list[str] | None) -> tuple[SourceSpec, ...]:
     would silently omit the day's major news, and someone who typed "sailing"
     should still hear that the government fell.
 
-    Each topic becomes one grounded search. Deduplicated case-insensitively so
-    "AI" and "ai" do not double-weight the same subject.
+    TOPICS USE RSS, NOT GROUNDED SEARCH. Gemini's grounding metadata does not
+    return article URLs — it returns
+    ``vertexaisearch.cloud.google.com/grounding-api-redirect/...`` wrappers, and
+    that host's robots.txt disallows automated fetching. Every result was
+    correctly refused. Resolving those redirects anyway would mean overriding a
+    robots directive to make a feature work, which is precisely what this module
+    does not do.
+
+    A Google News RSS search returns real headlines and real publisher URLs from
+    a feed intended for machine readers, so it needs no title resolution and no
+    access-control argument. ``SearchProvider`` remains available for an
+    explicitly configured ``search`` source; nothing uses it by default.
+
+    Deduplicated case-insensitively so "AI" and "ai" do not double-weight the
+    same subject.
     """
     specs = list(DEFAULT_SOURCES)
     seen: set[str] = set()
@@ -351,6 +371,7 @@ def sources_for(topics: list[str] | None) -> tuple[SourceSpec, ...]:
             continue
         seen.add(key)
         specs.append(
-            SourceSpec("search", f"Topic: {topic}", topic, weight=TOPIC_SOURCE_WEIGHT)
+            SourceSpec("rss", f"Topic: {topic}", topic,
+                       topic_feed_url(topic), weight=TOPIC_SOURCE_WEIGHT)
         )
     return tuple(specs)

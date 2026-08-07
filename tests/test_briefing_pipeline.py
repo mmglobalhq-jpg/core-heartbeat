@@ -614,13 +614,29 @@ class TestTopicsReachTheSourceList:
         assert sources_for([]) == DEFAULT_SOURCES
         assert sources_for(None) == DEFAULT_SOURCES
 
-    def test_each_topic_becomes_a_search_source(self):
+    def test_each_topic_becomes_an_rss_source(self):
         from briefing.sources import DEFAULT_SOURCES, sources_for
 
         specs = sources_for(["AI safety", "shipping"])
         added = specs[len(DEFAULT_SOURCES):]
-        assert [s.kind for s in added] == ["search", "search"]
+        # RSS, not grounded search: grounding returns redirect wrappers whose
+        # host disallows crawling, so every result was refused.
+        assert [s.kind for s in added] == ["rss", "rss"]
         assert [s.topic for s in added] == ["AI safety", "shipping"]
+
+    def test_topic_feed_url_is_encoded_and_time_bounded(self):
+        from briefing.sources import topic_feed_url
+
+        url = topic_feed_url("commercial real estate")
+        assert "commercial+real+estate" in url
+        assert "when%3A1d" in url or "when:1d" in url
+        assert url.startswith("https://news.google.com/rss/search?")
+
+    def test_topic_with_special_characters_is_escaped(self):
+        from briefing.sources import topic_feed_url
+
+        url = topic_feed_url("AT&T earnings")
+        assert "&" not in url.split("q=")[1].split("&hl=")[0].replace("%26", "")
 
     def test_default_feeds_always_survive(self):
         # A briefing built only from topics would omit the day's major news.
