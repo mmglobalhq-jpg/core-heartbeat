@@ -20,6 +20,7 @@ distro==1.9.0
 # are resolved by docling's own pins rather than fully pinned here.
 docling==2.111.0
 fastapi==0.139.0
+feedparser==6.0.14
 google-auth==2.55.1
 google-genai==2.10.0
 h11==0.16.0
@@ -46,6 +47,7 @@ langsmith==0.9.5
 orjson==3.11.9
 ormsgpack==1.12.2
 packaging==26.2
+protego==0.5.0
 pyasn1==0.6.3
 pyasn1_modules==0.4.2
 pycparser==3.0

@@ -1,0 +1,23 @@
+[Unit]
+Description=Hourly check for users due a daily briefing
+Documentation=file:///home/mmglobal/projects/system-source-of-truth/docs/30-daily-briefing.md
+
+[Timer]
+# Hourly, not once a day at a fixed time. Users pick their own delivery time and
+# timezone, so the job asks "who is due?" on each tick. It is idempotent by
+# construction — "due" means no ready briefing exists for the user's local date —
+# and UNIQUE (user_id, briefing_date) is the real guarantee behind that.
+OnCalendar=*-*-* *:05:00
+
+# Catch up after downtime. Without this, a host asleep at someone's delivery hour
+# means no briefing that day at all; with it, the next tick picks them up.
+Persistent=true
+
+# Spread load off the exact minute boundary — this competes with the local model
+# and the other platform timers.
+RandomizedDelaySec=180
+
+Unit=core-briefing.service
+
+[Install]
+WantedBy=timers.target
