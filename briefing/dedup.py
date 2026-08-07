@@ -180,7 +180,53 @@ def cluster(items: list[RawItem]) -> list[list[RawItem]]:
 # --- ranking -----------------------------------------------------------------
 
 
+TOPIC_BOOST = 1.6
+"""Multiplier for a story matching one of the user's topics.
+
+Chosen so a topic match reliably beats a same-day general story but cannot beat
+strong corroboration outright — a story carried by five outlets still competes.
+The point is to steer the list, not to hand it over."""
+
+
+def _topic_tokens(text: str) -> set[str]:
+    """Tokens for topic matching.
+
+    Two characters minimum, not three. The clustering tokenizer drops anything
+    shorter than three characters, which is right for comparing headlines and
+    wrong here: it reduces the topic "AI" to the empty set, and an empty set is a
+    subset of everything — so "AI" would have matched every story in the briefing
+    rather than none.
+    """
+    return {w for w in _WORD.findall((text or "").lower()) if w not in _STOP and len(w) > 1}
+
+
+def topic_boost(item: RawItem, topics: list[str] | None) -> float:
+    """How much this story matches what the user asked for.
+
+    Matching is on whole words in the headline and summary. Substring matching
+    would fire "AI" on "said", "maintain" and "Dubai" — not a subtle failure, but
+    most of the corpus.
+
+    A multi-word topic ("commercial real estate") matches only if ALL of its
+    significant words appear, so it does not fire on every story containing
+    "real".
+    """
+    if not topics:
+        return 1.0
+    haystack = _topic_tokens(f"{item.title} {item.summary or ''}")
+    if not haystack:
+        return 1.0
+    for raw in topics:
+        wanted = _topic_tokens(raw or "")
+        # `wanted` must be non-empty: the empty set is a subset of anything, so a
+        # topic of pure stopwords would boost every story.
+        if wanted and wanted <= haystack:
+            return TOPIC_BOOST
+    return 1.0
+
+
 def score_cluster(group: list[RawItem], *, weights: dict[str, float] | None = None,
+                  topics: list[str] | None = None,
                   now: dt.datetime | None = None) -> float:
     """How much does this story deserve a slot?
 
@@ -201,10 +247,13 @@ def score_cluster(group: list[RawItem], *, weights: dict[str, float] | None = No
     age = min(item.age_hours(now) for item in group)
     freshness = 0.5 ** (age / config.RECENCY_HALF_LIFE_H)
     weight = max(weights.get(item.source_name, 1.0) for item in group)
-    return corroboration * (0.35 + 0.65 * freshness) * weight * (1.0 if lead.readable else 0.5)
+    boost = max(topic_boost(item, topics) for item in group)
+    return (corroboration * (0.35 + 0.65 * freshness) * weight * boost
+            * (1.0 if lead.readable else 0.5))
 
 
 def rank(items: list[RawItem], *, weights: dict[str, float] | None = None,
+         topics: list[str] | None = None,
          now: dt.datetime | None = None) -> list[ScoredItem]:
     """Cluster, score, and order. Deterministic for identical input.
 
@@ -216,7 +265,7 @@ def rank(items: list[RawItem], *, weights: dict[str, float] | None = None,
     scored = [
         ScoredItem(
             item=group[0],
-            score=score_cluster(group, weights=weights, now=now),
+            score=score_cluster(group, weights=weights, topics=topics, now=now),
             cluster_id=url_hash(group[0].url),
             duplicates=group[1:],
         )
@@ -259,6 +308,7 @@ def diversify(ranked: list[ScoredItem], *, count: int,
 
 def select(items: list[RawItem], *, weights: dict[str, float] | None = None,
            top_count: int | None = None, max_per_source: int | None = None,
+           topics: list[str] | None = None,
            now: dt.datetime | None = None) -> tuple[list[ScoredItem], ScoredItem | None]:
     """Pick the Top N and the Deep Dive.
 
@@ -269,7 +319,7 @@ def select(items: list[RawItem], *, weights: dict[str, float] | None = None,
     below the cut, it falls back to the top story rather than omitting the
     section, because the structure is fixed.
     """
-    ranked = rank(items, weights=weights, now=now)
+    ranked = rank(items, weights=weights, topics=topics, now=now)
     count = top_count if top_count is not None else config.TOP_COUNT
     top = diversify(ranked, count=count, max_per_source=max_per_source)
     chosen = {id(s) for s in top}

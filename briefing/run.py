@@ -64,9 +64,11 @@ def build_briefing(
 ) -> BriefingDraft:
     """Produce a briefing in memory. No persistence, no delivery.
 
-    ``topics`` expands the source list with one grounded search each, on top of
-    the default feeds. Passing ``sources`` explicitly overrides both — that is
-    the test seam.
+    ``topics`` steers RANKING, not ingestion — no permissible news-search source
+    exists (see ``sources.sources_for``), so a topic promotes matching stories
+    within what the default feeds already carry. A topic nothing covers still
+    yields nothing. Passing ``sources`` explicitly overrides the default list;
+    that is the test seam.
     """
     if sources is None:
         sources = sources_for(topics)
@@ -81,7 +83,7 @@ def build_briefing(
 
     weights = {s.name: s.weight for s in sources}
     count = top_count if top_count is not None else config.TOP_COUNT
-    top, deep = select(items, weights=weights, top_count=count)
+    top, deep = select(items, weights=weights, top_count=count, topics=topics)
     if len(top) < count:
         raise RuntimeError(
             f"only {len(top)} distinct stories after clustering; need {count}"

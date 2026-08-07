@@ -46,12 +46,19 @@ def discover(specs: list[SourceSpec]) -> tuple[list[RawItem], dict]:
     workers = max(1, min(config.FETCH_CONCURRENCY, len(specs) or 1))
     with ThreadPoolExecutor(max_workers=workers) as pool:
         for spec, produced in zip(specs, pool.map(one, specs)):
-            if produced:
+            items.extend(produced)
+            # A source counts as OK only if it produced something USABLE. A list
+            # holding one skip-marker is truthy, so `if produced:` reported a
+            # fully blocked feed as healthy — every production run said
+            # "sources_ok=5/5" while one source was contributing nothing at all.
+            usable = sum(1 for i in produced if i.readable)
+            if usable:
                 stats["sources_ok"] += 1
-                items.extend(produced)
             else:
                 stats["sources_failed"] += 1
-                logger.info("source %s produced nothing", spec.name)
+                reasons = {i.skipped_reason for i in produced if i.skipped_reason}
+                logger.warning("source %s produced no usable items%s", spec.name,
+                               f" ({', '.join(sorted(reasons))})" if reasons else "")
 
     fresh = _filter_fresh(items)
     stats["discovered"] = len(items)

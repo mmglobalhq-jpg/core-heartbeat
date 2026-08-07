@@ -324,8 +324,14 @@ DEFAULT_SOURCES: tuple[SourceSpec, ...] = (
                "https://feeds.npr.org/1001/rss.xml", weight=1.1),
     SourceSpec("rss", "BBC World", "world",
                "https://feeds.bbci.co.uk/news/world/rss.xml", weight=1.1),
-    SourceSpec("rss", "Reuters via Google News", "business",
-               "https://news.google.com/rss/search?q=business+when:1d&hl=en-US&gl=US&ceid=US:en"),
+    # NOT Google News. news.google.com/robots.txt is `Disallow: /` with a short
+    # allow-list that excludes /rss/, so every request to it was correctly
+    # refused — this slot produced nothing for the feature's whole first day
+    # while the run reported the source as healthy.
+    SourceSpec("rss", "BBC Business", "business",
+               "https://feeds.bbci.co.uk/news/business/rss.xml"),
+    SourceSpec("rss", "NPR Business", "business",
+               "https://feeds.npr.org/1006/rss.xml"),
     SourceSpec("rss", "Ars Technica", "technology",
                "https://feeds.arstechnica.com/arstechnica/index", weight=1.0),
     SourceSpec("rss", "Hacker News front page", "technology",
@@ -333,45 +339,28 @@ DEFAULT_SOURCES: tuple[SourceSpec, ...] = (
 )
 
 
-def topic_feed_url(topic: str) -> str:
-    """A Google News RSS search for one topic, restricted to the last day."""
-    query = urllib.parse.quote_plus(f"{topic} when:1d")
-    return f"https://news.google.com/rss/search?q={query}&hl=en-US&gl=US&ceid=US:en"
-
-
 def sources_for(topics: list[str] | None) -> tuple[SourceSpec, ...]:
-    """The sources to poll for one user.
+    """The sources to poll. Currently the defaults, whatever the topics.
 
-    The default feeds ALWAYS run. A briefing built only from a user's topics
-    would silently omit the day's major news, and someone who typed "sailing"
-    should still hear that the government fell.
+    TOPICS CANNOT ADD SOURCES, and it is worth recording why rather than leaving
+    the next person to rediscover it. Two routes were tried against production
+    and both are closed:
 
-    TOPICS USE RSS, NOT GROUNDED SEARCH. Gemini's grounding metadata does not
-    return article URLs — it returns
-    ``vertexaisearch.cloud.google.com/grounding-api-redirect/...`` wrappers, and
-    that host's robots.txt disallows automated fetching. Every result was
-    correctly refused. Resolving those redirects anyway would mean overriding a
-    robots directive to make a feature work, which is precisely what this module
-    does not do.
+    * **Gemini grounded search** returns
+      ``vertexaisearch.cloud.google.com/grounding-api-redirect/...`` wrappers,
+      not article URLs, and that host's robots.txt disallows automated fetching.
+    * **Google News RSS search** would give real headlines and real publisher
+      URLs, but ``news.google.com/robots.txt`` is ``Disallow: /`` with an
+      allow-list that excludes ``/rss/``.
 
-    A Google News RSS search returns real headlines and real publisher URLs from
-    a feed intended for machine readers, so it needs no title resolution and no
-    access-control argument. ``SearchProvider`` remains available for an
-    explicitly configured ``search`` source; nothing uses it by default.
+    Bing and Yahoo news search feeds return no entries for our agent. No
+    general-purpose news search is available to us on terms we are willing to
+    accept, and overriding a robots directive to make a feature work is not
+    something this module does.
 
-    Deduplicated case-insensitively so "AI" and "ai" do not double-weight the
-    same subject.
+    So topics steer RANKING instead — see ``dedup.topic_boost``. That works only
+    over what the default feeds already carry: a topic no feed covers still
+    yields nothing, and the honest fix for that is letting users add their own
+    feeds, which is not built yet.
     """
-    specs = list(DEFAULT_SOURCES)
-    seen: set[str] = set()
-    for raw in topics or []:
-        topic = (raw or "").strip()
-        key = topic.lower()
-        if not topic or key in seen:
-            continue
-        seen.add(key)
-        specs.append(
-            SourceSpec("rss", f"Topic: {topic}", topic,
-                       topic_feed_url(topic), weight=TOPIC_SOURCE_WEIGHT)
-        )
-    return tuple(specs)
+    return DEFAULT_SOURCES

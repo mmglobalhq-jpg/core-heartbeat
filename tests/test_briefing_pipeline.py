@@ -604,66 +604,72 @@ class TestFetchRetry:
         assert called["n"] == 0
 
 
-class TestTopicsReachTheSourceList:
-    """Topics were stored, loaded out of the database into the job, and then
-    dropped — while the settings panel promised 'a briefing from your topics'."""
+class TestTopicsSteerRanking:
+    """Topics were stored, loaded into the job, and then dropped — while the
+    settings panel promised 'a briefing from your topics'.
 
-    def test_no_topics_gives_just_the_defaults(self):
+    They cannot add SOURCES: Gemini grounding returns redirect wrappers whose host
+    disallows crawling, and news.google.com is `Disallow: /`. So a topic promotes
+    matching stories within what the permitted feeds already carry.
+    """
+
+    def test_sources_do_not_change_with_topics(self):
         from briefing.sources import DEFAULT_SOURCES, sources_for
 
-        assert sources_for([]) == DEFAULT_SOURCES
+        assert sources_for(["anything"]) == DEFAULT_SOURCES
         assert sources_for(None) == DEFAULT_SOURCES
 
-    def test_each_topic_becomes_an_rss_source(self):
-        from briefing.sources import DEFAULT_SOURCES, sources_for
+    def test_a_matching_story_is_boosted(self):
+        from briefing.dedup import TOPIC_BOOST, topic_boost
 
-        specs = sources_for(["AI safety", "shipping"])
-        added = specs[len(DEFAULT_SOURCES):]
-        # RSS, not grounded search: grounding returns redirect wrappers whose
-        # host disallows crawling, so every result was refused.
-        assert [s.kind for s in added] == ["rss", "rss"]
-        assert [s.topic for s in added] == ["AI safety", "shipping"]
+        it = item("Mortgage REITs rally on rate cut hopes", "https://x.example/1")
+        assert topic_boost(it, ["mortgage REITs"]) == TOPIC_BOOST
 
-    def test_topic_feed_url_is_encoded_and_time_bounded(self):
-        from briefing.sources import topic_feed_url
+    def test_a_non_matching_story_is_not_boosted(self):
+        from briefing.dedup import topic_boost
 
-        url = topic_feed_url("commercial real estate")
-        assert "commercial+real+estate" in url
-        assert "when%3A1d" in url or "when:1d" in url
-        assert url.startswith("https://news.google.com/rss/search?")
+        it = item("Ferry service resumes to northern islands", "https://x.example/1")
+        assert topic_boost(it, ["mortgage REITs"]) == 1.0
 
-    def test_topic_with_special_characters_is_escaped(self):
-        from briefing.sources import topic_feed_url
+    def test_multiword_topic_needs_every_word(self):
+        from briefing.dedup import topic_boost
 
-        url = topic_feed_url("AT&T earnings")
-        assert "&" not in url.split("q=")[1].split("&hl=")[0].replace("%26", "")
+        it = item("Real estate agents report a quiet July", "https://x.example/1")
+        # "real" and "estate" present, "commercial" absent.
+        assert topic_boost(it, ["commercial real estate"]) == 1.0
 
-    def test_default_feeds_always_survive(self):
-        # A briefing built only from topics would omit the day's major news.
-        from briefing.sources import DEFAULT_SOURCES, sources_for
+    def test_two_letter_topic_still_matches(self):
+        from briefing.dedup import TOPIC_BOOST, topic_boost
 
-        specs = sources_for(["sailing"])
-        for default in DEFAULT_SOURCES:
-            assert default in specs
+        # The clustering tokenizer drops <3 chars, which would reduce "AI" to the
+        # empty set — and the empty set is a subset of everything, so "AI" would
+        # have boosted every story instead of none.
+        it = item("AI startup raises a large round", "https://x.example/1")
+        assert topic_boost(it, ["AI"]) == TOPIC_BOOST
+        other = item("Ferry service resumes to northern islands", "https://x.example/2")
+        assert topic_boost(other, ["AI"]) == 1.0
 
-    def test_topics_are_deduplicated_case_insensitively(self):
-        from briefing.sources import DEFAULT_SOURCES, sources_for
+    def test_substring_matches_do_not_count(self):
+        from briefing.dedup import topic_boost
 
-        specs = sources_for(["AI", "ai", "Ai"])
-        assert len(specs) == len(DEFAULT_SOURCES) + 1
+        it = item("Officials said the plant would maintain output", "https://x.example/1")
+        assert topic_boost(it, ["AI"]) == 1.0
 
-    def test_blank_topics_are_ignored(self):
-        from briefing.sources import DEFAULT_SOURCES, sources_for
+    def test_topic_of_only_stopwords_boosts_nothing(self):
+        from briefing.dedup import topic_boost
 
-        assert sources_for(["", "   ", None]) == DEFAULT_SOURCES
+        it = item("Ferry service resumes to northern islands", "https://x.example/1")
+        assert topic_boost(it, ["the and of"]) == 1.0
 
-    def test_topic_sources_outweigh_default_feeds(self):
-        # Five feeds producing ~76 items would otherwise drown a search
-        # returning ~10, making topics invisible in the result.
-        from briefing.sources import DEFAULT_SOURCES, sources_for
+    def test_matching_story_outranks_an_equally_fresh_one(self):
+        from briefing.dedup import rank
 
-        added = sources_for(["shipping"])[len(DEFAULT_SOURCES):]
-        assert added[0].weight > max(d.weight for d in DEFAULT_SOURCES)
+        items = [
+            item("Ferry service resumes to northern islands", "https://a.example/1"),
+            item("Mortgage REITs rally on rate cut hopes", "https://b.example/2"),
+        ]
+        top = rank(items, topics=["mortgage REITs"])
+        assert "mortgage" in top[0].item.title.lower()
 
     def test_run_due_passes_each_users_topics(self, monkeypatch):
         """The actual regression: the scheduled path dropping them."""
