@@ -44,6 +44,10 @@ COMMON_FEED_PATHS = (
     # Conventional enough to be worth trying, and it is the difference between
     # "FT works" and "FT cannot be added".
     "/rss/home", "/news/rss", "/feeds/rss",
+    # A `.rss` suffix, which a wildcard rule like `Disallow: /*.rss` matches and
+    # the bare `/rss` form does not. apnews.com uses exactly that rule, so
+    # without this probe the site looked wide open.
+    "/index.rss",
 )
 
 MIN_HEADLINE_CHARS = 28
@@ -224,6 +228,20 @@ def discover(url: str) -> SourceCandidate:
                                    title or _site_name(url), sample=sample)
 
     # 5. No feed anywhere — fall back to reading the page for headlines.
+    #
+    # Unless the site has explicitly closed its feeds. apnews.com allows `/` but
+    # carries `Disallow: /*.rss`; robots therefore permits scraping their
+    # homepage, and doing so would obey the letter of a rule while ignoring what
+    # it plainly says. A publisher who shuts their feed has stated a preference
+    # about automated consumption, and "the HTML was technically allowed" is not
+    # a good answer to it.
+    if _feeds_are_closed(origin):
+        return SourceCandidate(
+            False,
+            reason=f"{parts.netloc} blocks automated access to its feeds, so we do not "
+                   "read its pages instead. Nothing can be added from this site.",
+        )
+
     links = extract_headline_links(html, final_url)
     if len(links) >= 3:
         return SourceCandidate(
@@ -236,6 +254,20 @@ def discover(url: str) -> SourceCandidate:
         reason="No feed found, and no headlines could be read from that page. "
                "Try linking directly to the site's news or RSS page.",
     )
+
+
+def _feeds_are_closed(origin: str) -> bool:
+    """Has this site deliberately shut automated access to its feeds?
+
+    ANY refusal among the conventional feed paths counts. A robots rule that
+    names feeds is written deliberately — nobody blocks ``/*.rss`` by accident —
+    and the conservative direction here is to decline, since the site simply does
+    not become a source rather than anything breaking.
+
+    Erring the other way would mean scraping the HTML of publishers who took the
+    trouble to close their feeds, which is the outcome this exists to prevent.
+    """
+    return any(not robots_allows(urljoin(origin, path)) for path in COMMON_FEED_PATHS)
 
 
 def _raw_html(url: str) -> str:

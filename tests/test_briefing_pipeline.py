@@ -957,3 +957,79 @@ class TestDiscovery:
         html = '<a href="/a">News</a><a href="/b">A headline long enough to count here</a>'
         links = extract_headline_links(html, "https://x.example/")
         assert [t for _, t in links] == ["A headline long enough to count here"]
+
+
+class TestClosedFeedsBlockTheScrapingFallback:
+    """apnews.com allows `/` but carries `Disallow: /*.rss`.
+
+    Robots therefore permits scraping their homepage — which would obey the
+    letter of the rule while ignoring what it plainly says. A publisher who shuts
+    their feed has stated a preference about automated consumption.
+    """
+
+    def test_site_fallback_refused_when_feeds_are_closed(self, monkeypatch):
+        import briefing.discovery as D
+
+        # Everything allowed except feed paths.
+        monkeypatch.setattr(D, "robots_allows",
+                            lambda url: not any(p in url for p in ("rss", "feed", "atom", "index.xml")))
+        assert D._feeds_are_closed("https://apnews.example") is True
+
+    def test_open_site_is_not_flagged(self, monkeypatch):
+        import briefing.discovery as D
+
+        monkeypatch.setattr(D, "robots_allows", lambda url: True)
+        assert D._feeds_are_closed("https://open.example") is False
+
+    def test_a_wildcard_rss_rule_is_detected(self, monkeypatch):
+        import briefing.discovery as D
+
+        # apnews.com carries `Disallow: /*.rss`, which matches only paths ENDING
+        # in .rss. Probing bare `/rss` and `/rss.xml` never triggered it, so the
+        # site looked wide open and the scraping fallback engaged.
+        monkeypatch.setattr(D, "robots_allows", lambda url: not url.endswith(".rss"))
+        assert D._feeds_are_closed("https://apnews.example") is True
+
+    def test_single_refusal_counts_as_intent(self, monkeypatch):
+        import briefing.discovery as D
+
+        # Nobody blocks a feed path by accident, and declining costs only a
+        # source that never gets added.
+        monkeypatch.setattr(D, "robots_allows", lambda url: "/atom.xml" not in url)
+        assert D._feeds_are_closed("https://closed.example") is True
+
+
+class TestRobotsWildcards:
+    """urllib.robotparser matches rule paths with a literal startswith(), so
+    `Disallow: /*.rss` matched nothing and every wildcard rule in every
+    robots.txt was silently ignored."""
+
+    ROBOTS = "User-agent: *\nAllow: /\nDisallow: /*.rss\nDisallow: /private/\n"
+
+    def _rules(self):
+        from briefing.sources import _parse_rules
+
+        return _parse_rules(self.ROBOTS)
+
+    def test_wildcard_suffix_rule_is_honoured(self):
+        assert self._rules().can_fetch("https://a.example/index.rss") is False
+
+    def test_ordinary_paths_still_allowed(self):
+        assert self._rules().can_fetch("https://a.example/world") is True
+
+    def test_plain_prefix_rule_still_works(self):
+        assert self._rules().can_fetch("https://a.example/private/x") is False
+
+    def test_stdlib_alone_would_have_got_this_wrong(self):
+        # Pinning the reason protego is a dependency: if someone removes it,
+        # this documents what breaks.
+        import urllib.robotparser
+
+        p = urllib.robotparser.RobotFileParser()
+        p.parse(self.ROBOTS.splitlines())
+        assert p.can_fetch("agent", "https://a.example/index.rss") is True
+
+    def test_deny_all_short_circuits(self):
+        from briefing.sources import _Rules
+
+        assert _Rules(deny_all=True).can_fetch("https://a.example/anything") is False

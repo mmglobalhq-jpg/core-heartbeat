@@ -51,7 +51,7 @@ class SourceProvider(Protocol):
 # --- politeness --------------------------------------------------------------
 
 _last_request_at: dict[str, float] = defaultdict(float)
-_robots_cache: dict[str, urllib.robotparser.RobotFileParser | None] = {}
+_robots_cache: dict[str, "_Rules | None"] = {}
 
 
 def _host(url: str) -> str:
@@ -79,11 +79,57 @@ def robots_allows(url: str) -> bool:
     host = _host(url)
     if host not in _robots_cache:
         _robots_cache[host] = _load_robots(url)
-    parser = _robots_cache[host]
-    return True if parser is None else parser.can_fetch(config.USER_AGENT, url)
+    rules = _robots_cache[host]
+    return True if rules is None else rules.can_fetch(url)
 
 
-def _load_robots(url: str) -> urllib.robotparser.RobotFileParser | None:
+class _Rules:
+    """A robots.txt decision, whichever parser produced it.
+
+    WHY NOT THE STANDARD LIBRARY ALONE. ``urllib.robotparser`` matches rule paths
+    with ``filename.startswith(path)`` — a literal prefix, with no wildcard
+    support whatsoever. A modern rule like ``Disallow: /*.rss`` is therefore
+    compared as the literal string ``/*.rss`` and matches nothing, so the stdlib
+    reports ``can_fetch("/index.rss") == True`` for a site that plainly forbids
+    it. apnews.com uses exactly that rule.
+
+    Wildcards are ubiquitous in real robots.txt files, so this is not an edge
+    case: every such rule was being silently ignored. ``protego`` implements the
+    current specification (wildcards, ``$`` anchors, Allow/Disallow precedence by
+    specificity) and is the parser Scrapy relies on.
+
+    The stdlib remains the fallback so a missing dependency degrades to
+    less-precise matching rather than to no robots checking at all.
+    """
+
+    def __init__(self, *, protego_rules=None, std_rules=None, deny_all: bool = False) -> None:
+        self._protego = protego_rules
+        self._std = std_rules
+        self._deny_all = deny_all
+
+    def can_fetch(self, url: str) -> bool:
+        if self._deny_all:
+            return False
+        if self._protego is not None:
+            return bool(self._protego.can_fetch(url, config.USER_AGENT))
+        if self._std is not None:
+            return bool(self._std.can_fetch(config.USER_AGENT, url))
+        return True
+
+
+def _parse_rules(body: str) -> _Rules:
+    try:
+        from protego import Protego
+
+        return _Rules(protego_rules=Protego.parse(body))
+    except Exception as exc:  # noqa: BLE001 — fall back rather than stop checking
+        logger.warning("protego unavailable (%s); robots wildcards will be ignored", exc)
+        parser = urllib.robotparser.RobotFileParser()
+        parser.parse(body.splitlines())
+        return _Rules(std_rules=parser)
+
+
+def _load_robots(url: str) -> _Rules | None:
     """Fetch and parse robots.txt using OUR user agent.
 
     ``RobotFileParser.read()`` fetches with ``Python-urllib/x.y``, and a great
@@ -101,8 +147,6 @@ def _load_robots(url: str) -> urllib.robotparser.RobotFileParser | None:
     """
     parts = urlsplit(url)
     robots_url = f"{parts.scheme}://{parts.netloc}/robots.txt"
-    parser = urllib.robotparser.RobotFileParser()
-    parser.set_url(robots_url)
     request = urllib.request.Request(robots_url, headers={"User-Agent": config.USER_AGENT})
     try:
         with urllib.request.urlopen(request, timeout=15) as response:
@@ -110,10 +154,9 @@ def _load_robots(url: str) -> urllib.robotparser.RobotFileParser | None:
     except urllib.error.HTTPError as exc:
         if exc.code in (401, 403):
             # Refused even when asking honestly — treat as off-limits.
-            parser.disallow_all = True
             logger.info("robots.txt for %s returned %s; treating host as disallowed",
                         parts.netloc, exc.code)
-            return parser
+            return _Rules(deny_all=True)
         # 404 and friends: no robots.txt means no restriction.
         logger.debug("no robots.txt for %s (HTTP %s); treating as allowed",
                      parts.netloc, exc.code)
@@ -122,8 +165,7 @@ def _load_robots(url: str) -> urllib.robotparser.RobotFileParser | None:
         logger.debug("robots.txt unreadable for %s (%s); treating as allowed",
                      parts.netloc, exc)
         return None
-    parser.parse(body.splitlines())
-    return parser
+    return _parse_rules(body)
 
 
 # Phrases that mean "you are not the intended reader". Detecting these lets the
