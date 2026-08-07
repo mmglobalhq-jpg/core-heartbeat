@@ -27,6 +27,7 @@ import urllib.request
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any
+from services.secrets import secret as read_secret
 
 # Fan-out for the two lookups that cannot be batched. Bounded so a health check
 # never becomes the heaviest client Supabase has.
@@ -70,7 +71,7 @@ class FundPollerError(RuntimeError):
 
 def _config() -> tuple[str, str]:
     url = os.environ.get(FUNDS_SUPABASE_URL_ENV)
-    key = os.environ.get(FUNDS_SERVICE_ROLE_ENV)
+    key = read_secret(FUNDS_SERVICE_ROLE_ENV)
     if not url:
         raise FundPollerError(f"{FUNDS_SUPABASE_URL_ENV} is not set")
     if not key:

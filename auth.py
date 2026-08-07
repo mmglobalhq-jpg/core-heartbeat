@@ -42,6 +42,7 @@ import os
 
 import jwt
 from fastapi import Request
+from services.secrets import secret as read_secret
 
 logger = logging.getLogger(__name__)
 
@@ -159,15 +160,15 @@ def _verify_hs256(token: str) -> str | None:
 
     Missing/blank secret degrades gracefully to ``None`` with a warning.
     """
-    secret = os.environ.get(SUPABASE_JWT_SECRET_ENV)
-    if not secret or not secret.strip():
+    secret_value = read_secret(SUPABASE_JWT_SECRET_ENV)
+    if not secret_value or not secret_value.strip():
         logger.warning(
             "%s is not set; cannot verify this HS256 JWT — treating the caller as "
             "unverified (sandbox fallback).",
             SUPABASE_JWT_SECRET_ENV,
         )
         return None
-    return _decode_and_extract_sub(token, secret, JWT_ALGORITHMS)
+    return _decode_and_extract_sub(token, secret_value, JWT_ALGORITHMS)
 
 
 def verify_supabase_jwt(token: str) -> str | None:

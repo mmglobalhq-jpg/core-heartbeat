@@ -15,6 +15,7 @@ import base64
 import os
 
 import httpx
+from services.secrets import secret as read_secret
 
 GRAPHRAG_URL_ENV = "GRAPHRAG_SERVICE_URL"
 GRAPHRAG_KEY_ENV = "GRAPHRAG_API_KEY"
@@ -51,7 +52,7 @@ def _kb_headers(owner: str) -> dict[str, str]:
 async def is_admin(user_id: str) -> bool:
     """True iff profiles.is_admin is set for this user (service-role read; fail-closed)."""
     url = os.environ.get(SUPABASE_URL_ENV)
-    key = os.environ.get(SERVICE_ROLE_ENV)
+    key = read_secret(SERVICE_ROLE_ENV)
     if not (url and key):
         return False
     headers = {"apikey": key, "Authorization": f"Bearer {key}", "Accept": "application/json"}

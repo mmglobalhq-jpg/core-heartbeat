@@ -20,6 +20,7 @@ from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 import httpx
+from services.secrets import secret as read_secret
 
 logger = logging.getLogger(__name__)
 
@@ -70,7 +71,7 @@ def _sb_url() -> str:
 
 
 def _sb_headers() -> dict[str, str]:
-    key = os.environ.get(SERVICE_ROLE_ENV)
+    key = read_secret(SERVICE_ROLE_ENV)
     if not key:
         raise CalendarError(f"{SERVICE_ROLE_ENV} is not set")
     return {"apikey": key, "Authorization": f"Bearer {key}", "Content-Type": "application/json"}

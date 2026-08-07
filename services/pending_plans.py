@@ -31,6 +31,7 @@ import threading
 import time
 
 import httpx
+from services.secrets import secret as read_secret
 
 logger = logging.getLogger(__name__)
 
@@ -55,7 +56,7 @@ _transport: httpx.BaseTransport | None = None
 
 def _config() -> tuple[str, str] | None:
     url = (os.environ.get(SUPABASE_URL_ENV) or "").rstrip("/")
-    key = os.environ.get(SERVICE_ROLE_ENV)
+    key = read_secret(SERVICE_ROLE_ENV)
     return (url, key) if url and key else None
 
 

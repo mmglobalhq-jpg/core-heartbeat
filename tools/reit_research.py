@@ -30,6 +30,7 @@ import os
 import re
 
 import httpx
+from services.secrets import secret as read_secret
 
 REITS_SUPABASE_URL_ENV = "REITS_SUPABASE_URL"
 REITS_SERVICE_ROLE_ENV = "REITS_SUPABASE_SERVICE_ROLE_KEY"
@@ -216,7 +217,7 @@ def _sb_headers() -> dict[str, str]:
     legacy key is still active** and keeps working after rotation — there is no
     flag day. The key is never logged; it exists only in the returned mapping.
     """
-    key = os.environ.get(REITS_SERVICE_ROLE_ENV)
+    key = read_secret(REITS_SERVICE_ROLE_ENV)
     if not key:
         raise ReitError(f"{REITS_SERVICE_ROLE_ENV} is not set")
     headers = {

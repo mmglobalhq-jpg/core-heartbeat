@@ -12,6 +12,7 @@ import os
 import httpx
 
 from services.storage_sync import build_s3_client
+from services.secrets import secret as read_secret
 
 DOCS_BUCKET = os.environ.get("DOCS_BUCKET", "user-docs")
 
@@ -38,7 +39,7 @@ def fetch_content_types(user_id: str, doc_ids: list[str]) -> dict[str, str]:
     if not doc_ids:
         return {}
     url = (os.environ.get(SUPABASE_URL_ENV) or "").rstrip("/")
-    key = os.environ.get(SERVICE_ROLE_ENV)
+    key = read_secret(SERVICE_ROLE_ENV)
     if not url or not key:
         return {}
     try:
