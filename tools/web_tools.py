@@ -95,6 +95,64 @@ def search_web(user_id: str, args: dict) -> str:
     return text
 
 
+def search_web_raw(query: str, *, max_results: int = 10) -> list[dict[str, str]]:
+    """Grounded search returning STRUCTURED results.
+
+    ``search_web`` above answers a question in prose for the assistant to speak.
+    The briefing pipeline needs the underlying sources as data — it ranks and
+    deduplicates them, then fetches the survivors. Re-parsing the prose form to
+    recover the URLs would be lossy and would break the moment the wording
+    changed, so the grounding metadata is read directly here instead.
+
+    Returns ``[{"url", "title", "snippet", "source"}, ...]``; empty on any
+    failure, because a briefing missing one source is better than a briefing that
+    did not run.
+    """
+    key = _google_key()
+    if not key or not query.strip():
+        return []
+    try:
+        from google import genai
+        from google.genai import types
+
+        client = genai.Client(api_key=key)
+        response = client.models.generate_content(
+            model=os.environ.get(SEARCH_MODEL_ENV) or DEFAULT_SEARCH_MODEL,
+            contents=f"What are the most significant news stories about: {query}",
+            config=types.GenerateContentConfig(
+                tools=[types.Tool(google_search=types.GoogleSearch())],
+            ),
+        )
+    except Exception as exc:
+        logger.warning("structured web search failed for %r: %s", query, exc)
+        return []
+
+    results: list[dict[str, str]] = []
+    seen: set[str] = set()
+    try:
+        for candidate in getattr(response, "candidates", None) or []:
+            meta = getattr(candidate, "grounding_metadata", None)
+            for chunk in getattr(meta, "grounding_chunks", None) or []:
+                web = getattr(chunk, "web", None)
+                uri = getattr(web, "uri", None)
+                if not uri or uri in seen:
+                    continue
+                seen.add(uri)
+                results.append(
+                    {
+                        "url": uri,
+                        "title": getattr(web, "title", None) or uri,
+                        "snippet": "",
+                        "source": getattr(web, "domain", None) or getattr(web, "title", "") or "",
+                    }
+                )
+                if len(results) >= max_results:
+                    return results
+    except Exception:  # noqa: BLE001 — metadata shape varies by SDK version
+        logger.debug("could not read grounding metadata", exc_info=True)
+    return results
+
+
 def fetch_url(user_id: str, args: dict) -> str:
     """Read one public web page and return its text."""
     url = (args.get("url") or "").strip()
