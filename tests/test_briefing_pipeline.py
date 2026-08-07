@@ -602,3 +602,73 @@ class TestFetchRetry:
             SourceSpec("fetch", "A", "news", "https://a.example/x"), "https://a.example/x")
         assert item.skipped_reason == "robots_disallow"
         assert called["n"] == 0
+
+
+class TestTopicsReachTheSourceList:
+    """Topics were stored, loaded out of the database into the job, and then
+    dropped — while the settings panel promised 'a briefing from your topics'."""
+
+    def test_no_topics_gives_just_the_defaults(self):
+        from briefing.sources import DEFAULT_SOURCES, sources_for
+
+        assert sources_for([]) == DEFAULT_SOURCES
+        assert sources_for(None) == DEFAULT_SOURCES
+
+    def test_each_topic_becomes_a_search_source(self):
+        from briefing.sources import DEFAULT_SOURCES, sources_for
+
+        specs = sources_for(["AI safety", "shipping"])
+        added = specs[len(DEFAULT_SOURCES):]
+        assert [s.kind for s in added] == ["search", "search"]
+        assert [s.topic for s in added] == ["AI safety", "shipping"]
+
+    def test_default_feeds_always_survive(self):
+        # A briefing built only from topics would omit the day's major news.
+        from briefing.sources import DEFAULT_SOURCES, sources_for
+
+        specs = sources_for(["sailing"])
+        for default in DEFAULT_SOURCES:
+            assert default in specs
+
+    def test_topics_are_deduplicated_case_insensitively(self):
+        from briefing.sources import DEFAULT_SOURCES, sources_for
+
+        specs = sources_for(["AI", "ai", "Ai"])
+        assert len(specs) == len(DEFAULT_SOURCES) + 1
+
+    def test_blank_topics_are_ignored(self):
+        from briefing.sources import DEFAULT_SOURCES, sources_for
+
+        assert sources_for(["", "   ", None]) == DEFAULT_SOURCES
+
+    def test_topic_sources_outweigh_default_feeds(self):
+        # Five feeds producing ~76 items would otherwise drown a search
+        # returning ~10, making topics invisible in the result.
+        from briefing.sources import DEFAULT_SOURCES, sources_for
+
+        added = sources_for(["shipping"])[len(DEFAULT_SOURCES):]
+        assert added[0].weight > max(d.weight for d in DEFAULT_SOURCES)
+
+    def test_run_due_passes_each_users_topics(self, monkeypatch):
+        """The actual regression: the scheduled path dropping them."""
+        from briefing import run as run_module
+
+        seen = {}
+
+        def fake_build(user_id, *, topics=None, timezone=None, **kw):
+            seen["topics"] = topics
+            raise RuntimeError("stop here — only the arguments matter")
+
+        monkeypatch.setattr(run_module, "build_briefing", fake_build)
+
+        class Repo:
+            def list_enabled_prefs(self):
+                return [{"user_id": "u1", "deliver_at": "00:00",
+                         "timezone": "UTC", "topics": ["sailing", "rowing"]}]
+
+            def get_briefing(self, user_id, date):
+                return None
+
+        summary = run_module.run_due(Repo(), deliver="none")
+        assert seen["topics"] == ["sailing", "rowing"]
+        assert summary["failed"] == 1  # our deliberate stop, contained per user

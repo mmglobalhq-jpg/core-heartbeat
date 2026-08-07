@@ -288,6 +288,15 @@ def provider_for(spec: SourceSpec) -> SourceProvider:
 # Feeds only. Every one of these is a publisher-operated feed intended for
 # machine consumption, on a general-interest topic, with no access control.
 
+TOPIC_SOURCE_WEIGHT = 1.25
+"""Topic results outrank the general feeds slightly.
+
+A user who typed a topic asked for it. Without a nudge, five general feeds
+producing ~76 items drown a search returning ~10, and the briefing looks
+identical to one with no topics set. Not so high that a topic can take the whole
+list — MAX_PER_SOURCE still caps any single source."""
+
+
 DEFAULT_SOURCES: tuple[SourceSpec, ...] = (
     SourceSpec("rss", "NPR News", "top stories",
                "https://feeds.npr.org/1001/rss.xml", weight=1.1),
@@ -300,3 +309,27 @@ DEFAULT_SOURCES: tuple[SourceSpec, ...] = (
     SourceSpec("rss", "Hacker News front page", "technology",
                "https://hnrss.org/frontpage", weight=0.9),
 )
+
+
+def sources_for(topics: list[str] | None) -> tuple[SourceSpec, ...]:
+    """The sources to poll for one user.
+
+    The default feeds ALWAYS run. A briefing built only from a user's topics
+    would silently omit the day's major news, and someone who typed "sailing"
+    should still hear that the government fell.
+
+    Each topic becomes one grounded search. Deduplicated case-insensitively so
+    "AI" and "ai" do not double-weight the same subject.
+    """
+    specs = list(DEFAULT_SOURCES)
+    seen: set[str] = set()
+    for raw in topics or []:
+        topic = (raw or "").strip()
+        key = topic.lower()
+        if not topic or key in seen:
+            continue
+        seen.add(key)
+        specs.append(
+            SourceSpec("search", f"Topic: {topic}", topic, weight=TOPIC_SOURCE_WEIGHT)
+        )
+    return tuple(specs)

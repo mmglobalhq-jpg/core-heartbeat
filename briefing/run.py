@@ -10,9 +10,9 @@ fetched, so the run makes a handful of article requests rather than a few hundre
 Structure is validated BEFORE anything is persisted, so a malformed briefing fails
 in the job rather than in someone's inbox.
 
-NOTHING HERE IS SCHEDULED. There is no systemd unit and no timer for this in
-production; the job is invoked by hand. Wiring it to a schedule is a production
-change and is deliberately not part of this build.
+SCHEDULED IN PRODUCTION since 2026-08-07: ``core-briefing.timer`` fires hourly and
+runs ``--due``, which generates for every enabled user past their own delivery
+time in their own timezone. See system-source-of-truth doc 30.
 """
 
 from __future__ import annotations
@@ -33,7 +33,7 @@ from briefing.ingest import discover, enrich
 from briefing.llm import EscalationBudget, local_available
 from briefing.models import BriefingDraft, SourceSpec
 from briefing.render import render_all
-from briefing.sources import DEFAULT_SOURCES
+from briefing.sources import DEFAULT_SOURCES, sources_for
 
 logger = logging.getLogger("briefing.run")
 
@@ -56,12 +56,20 @@ def local_date(timezone: str) -> dt.date:
 def build_briefing(
     user_id: str,
     *,
-    sources: tuple[SourceSpec, ...] = DEFAULT_SOURCES,
+    sources: tuple[SourceSpec, ...] | None = None,
+    topics: list[str] | None = None,
     timezone: str = config.DEFAULT_TIMEZONE,
     top_count: int | None = None,
     do_editorial: bool = True,
 ) -> BriefingDraft:
-    """Produce a briefing in memory. No persistence, no delivery."""
+    """Produce a briefing in memory. No persistence, no delivery.
+
+    ``topics`` expands the source list with one grounded search each, on top of
+    the default feeds. Passing ``sources`` explicitly overrides both — that is
+    the test seam.
+    """
+    if sources is None:
+        sources = sources_for(topics)
     budget = EscalationBudget()
     meta: dict = {"timezone": timezone, "started_at": dt.datetime.now(dt.UTC).isoformat()}
 
@@ -132,7 +140,14 @@ def run_due(repo, *, deliver: str, dry_run: bool = False) -> dict:
     for prefs in pending:
         user_id = prefs["user_id"]
         try:
-            draft = build_briefing(user_id, timezone=prefs.get("timezone") or config.DEFAULT_TIMEZONE)
+            # Topics were read out of the database and then dropped here — the
+            # settings panel promised "a briefing from your topics" while the
+            # pipeline used five hardcoded feeds for everyone.
+            draft = build_briefing(
+                user_id,
+                topics=prefs.get("topics") or [],
+                timezone=prefs.get("timezone") or config.DEFAULT_TIMEZONE,
+            )
             if dry_run:
                 logger.info("[dry run] would store and deliver for %s", user_id)
                 summary["generated"] += 1
@@ -179,6 +194,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--to", default="", help="recipient (file sender uses it for the filename)")
     parser.add_argument("--timezone", default=config.DEFAULT_TIMEZONE)
     parser.add_argument("--top", type=int, default=config.TOP_COUNT)
+    parser.add_argument("--topic", action="append", default=[], dest="topics",
+                        help="add a topic search (repeatable); --due reads them per user")
     parser.add_argument("--no-editorial", action="store_true")
     parser.add_argument("--dry-run", action="store_true",
                         help="build and render only; never persist or deliver")
@@ -211,6 +228,7 @@ def main(argv: list[str] | None = None) -> int:
 
     draft = build_briefing(
         args.user,
+        topics=args.topics,
         timezone=args.timezone,
         top_count=args.top,
         do_editorial=not args.no_editorial,
