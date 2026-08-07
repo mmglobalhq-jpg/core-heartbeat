@@ -1,0 +1,36 @@
+[Unit]
+# Generate briefings for every enabled user who is due.
+#
+# Runs INSIDE the already-deployed backend container rather than as a host
+# process, so it uses exactly the code, dependencies and mounted secrets that the
+# running service uses. A host-side copy would drift from the deployed image, and
+# this platform has been bitten by the gap between built and deployed before.
+Description=Daily briefing generation (due users)
+Documentation=file:///home/mmglobal/projects/system-source-of-truth/docs/30-daily-briefing.md
+After=docker.service
+Requires=docker.service
+
+# Route failures into the existing alert path used by every other platform unit.
+OnFailure=alert@%n.service
+
+[Service]
+Type=oneshot
+User=mmglobal
+Group=mmglobal
+
+# --repo postgrest: production data path (Supabase over PostgREST).
+# --deliver resend: email only for users who enabled it AND set an address.
+# Exits non-zero if any user's briefing failed, so OnFailure= above fires.
+ExecStart=/usr/bin/docker exec core-heartbeat \
+    python -m briefing.run --due --repo postgrest --deliver resend
+
+# Generation makes external requests and runs a local model; it should never hold
+# the timer open indefinitely.
+TimeoutStartSec=1800
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=core-briefing
+
+[Install]
+WantedBy=multi-user.target

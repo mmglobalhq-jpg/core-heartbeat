@@ -8,6 +8,7 @@ runs in a development checkout with nothing configured. Names are prefixed
 from __future__ import annotations
 
 import os
+from urllib.parse import urlsplit
 
 # --- structure ---------------------------------------------------------------
 
@@ -69,7 +70,28 @@ RECENCY_HALF_LIFE_H = float(os.environ.get("BRIEFING_RECENCY_HALF_LIFE_H", "12")
 
 LOCAL_MODEL = os.environ.get("BRIEFING_LOCAL_MODEL", "qwen2.5:7b")
 EMBED_MODEL = os.environ.get("BRIEFING_EMBED_MODEL", "nomic-embed-text")
-OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://127.0.0.1:11434")
+
+
+def _ollama_base(raw: str) -> str:
+    """Reduce OLLAMA_URL to scheme://host:port.
+
+    THIS PLATFORM SETS OLLAMA_URL TO A FULL ENDPOINT, not a base — compose sets
+    ``http://host.docker.internal:11434/api/generate``, matching what
+    orchestrator.py posts to directly. This module needs several paths
+    (/api/generate, /api/embeddings, /api/tags), so it appends its own.
+
+    Treating the configured value as a base produced
+    ``/api/generate/api/tags`` — a 404 that read as "Ollama is unreachable". The
+    first production run degraded every write-up to the publisher's summary
+    because of it, while reporting only a warning.
+    """
+    parts = urlsplit(raw.strip())
+    if parts.scheme and parts.netloc:
+        return f"{parts.scheme}://{parts.netloc}"
+    return raw.strip().rstrip("/")
+
+
+OLLAMA_URL = _ollama_base(os.environ.get("OLLAMA_URL") or "http://127.0.0.1:11434")
 
 ESCALATION_MODEL = os.environ.get("BRIEFING_ESCALATION_MODEL", "gemini-2.5-flash")
 MAX_ESCALATIONS = int(os.environ.get("BRIEFING_MAX_ESCALATIONS", "3"))

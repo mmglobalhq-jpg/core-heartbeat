@@ -39,6 +39,7 @@ logger = logging.getLogger(__name__)
 
 
 class BriefingRepository(Protocol):
+    def list_enabled_prefs(self) -> list[dict]: ...
     def upsert_briefing(self, draft: BriefingDraft) -> str: ...
     def replace_sections(self, briefing_id: str, sections: list[Section]) -> None: ...
     def record_delivery(self, briefing_id: str, channel: str, status: str,
@@ -75,6 +76,18 @@ class PostgresRepository:
         import psycopg
 
         return psycopg.connect(self.dsn, autocommit=True)
+
+    def list_enabled_prefs(self) -> list[dict]:
+        with self._connect() as conn, conn.cursor() as cur:
+            cur.execute(
+                "select user_id, deliver_at, timezone, topics, deliver_email, email_to "
+                "from public.briefing_prefs where enabled"
+            )
+            return [
+                {"user_id": str(r[0]), "deliver_at": str(r[1])[:5], "timezone": r[2],
+                 "topics": r[3] or [], "deliver_email": r[4], "email_to": r[5]}
+                for r in cur.fetchall()
+            ]
 
     def upsert_briefing(self, draft: BriefingDraft) -> str:
         with self._connect() as conn, conn.cursor() as cur:
@@ -199,6 +212,22 @@ class PostgrestRepository:
             timeout=20.0,
             transport=self._transport,
         )
+
+    def list_enabled_prefs(self) -> list[dict]:
+        with self._client() as client:
+            response = client.get(
+                "/briefing_prefs",
+                params={
+                    "enabled": "is.true",
+                    "select": "user_id,deliver_at,timezone,topics,deliver_email,email_to",
+                },
+            )
+        response.raise_for_status()
+        rows = response.json() or []
+        for row in rows:
+            row["deliver_at"] = str(row.get("deliver_at") or "06:30")[:5]
+            row["topics"] = row.get("topics") or []
+        return rows
 
     def upsert_briefing(self, draft: BriefingDraft) -> str:
         row = {

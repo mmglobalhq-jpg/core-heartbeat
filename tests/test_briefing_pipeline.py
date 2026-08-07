@@ -453,3 +453,47 @@ class TestTidy:
     def test_truncates_on_a_word_boundary(self):
         assert tidy("alpha beta gamma delta", limit=12).endswith("…")
         assert "gamm" not in tidy("alpha beta gamma delta", limit=12)
+
+
+class TestOllamaUrlNormalisation:
+    """This platform sets OLLAMA_URL to a full endpoint, not a base.
+
+    The first production run appended this module's own paths to it, producing
+    /api/generate/api/tags — a 404 that looked like "Ollama is unreachable" and
+    silently degraded every write-up.
+    """
+
+    def test_strips_the_endpoint_path(self):
+        from briefing.config import _ollama_base
+
+        assert (_ollama_base("http://host.docker.internal:11434/api/generate")
+                == "http://host.docker.internal:11434")
+
+    def test_leaves_a_bare_base_alone(self):
+        from briefing.config import _ollama_base
+
+        assert _ollama_base("http://127.0.0.1:11434") == "http://127.0.0.1:11434"
+
+    def test_strips_a_trailing_slash(self):
+        from briefing.config import _ollama_base
+
+        assert _ollama_base("http://127.0.0.1:11434/") == "http://127.0.0.1:11434"
+
+    def test_tolerates_a_value_with_no_scheme(self):
+        from briefing.config import _ollama_base
+
+        assert _ollama_base("127.0.0.1:11434/") == "127.0.0.1:11434"
+
+
+class TestFeedparserIsAProductionDependency:
+    def test_feedparser_is_pinned_in_requirements(self):
+        """It was installed into the dev venv only, so every RSS source failed on
+        the first production run with 'No module named feedparser'."""
+        import pathlib
+
+        req = pathlib.Path(__file__).parent.parent / "requirements.txt"
+        assert any(line.startswith("feedparser==")
+                   for line in req.read_text().splitlines())
+
+    def test_feedparser_is_importable(self):
+        import feedparser  # noqa: F401

@@ -113,9 +113,66 @@ def build_briefing(
     )
 
 
+def run_due(repo, *, deliver: str, dry_run: bool = False) -> dict:
+    """Generate for everyone who is due. The scheduled entry point.
+
+    One user's failure never stops the others: a briefing is per-user work, and a
+    feed that breaks one person's run has nothing to do with anyone else's.
+    """
+    from briefing.delivery import sender_for
+    from briefing.schedule import due_users
+
+    summary = {"due": 0, "generated": 0, "failed": 0, "delivered": 0, "errors": []}
+    pending = due_users(repo)
+    summary["due"] = len(pending)
+    if not pending:
+        logger.info("no users due")
+        return summary
+
+    for prefs in pending:
+        user_id = prefs["user_id"]
+        try:
+            draft = build_briefing(user_id, timezone=prefs.get("timezone") or config.DEFAULT_TIMEZONE)
+            if dry_run:
+                logger.info("[dry run] would store and deliver for %s", user_id)
+                summary["generated"] += 1
+                continue
+
+            briefing_id = repo.upsert_briefing(draft)
+            repo.replace_sections(briefing_id, draft.sections)
+            summary["generated"] += 1
+            logger.info("stored briefing %s for %s", briefing_id, user_id)
+
+            # Email only if the user asked for it AND gave an address. Defaulting
+            # to "send" on a half-configured preference would mail people who
+            # never opted in.
+            if prefs.get("deliver_email") and prefs.get("email_to"):
+                rendered = render_all(draft)
+                result = sender_for(deliver).send(
+                    to=prefs["email_to"],
+                    subject=rendered["subject"],
+                    html=rendered["html"],
+                    text=rendered["text"],
+                )
+                repo.record_delivery(briefing_id, "email", result.status,
+                                     result.provider, result.detail)
+                if result.status == "sent":
+                    summary["delivered"] += 1
+                else:
+                    logger.warning("delivery for %s: %s", user_id, result)
+        except Exception as exc:  # noqa: BLE001
+            summary["failed"] += 1
+            summary["errors"].append(f"{user_id}: {type(exc).__name__}: {exc}")
+            logger.exception("briefing failed for %s", user_id)
+
+    return summary
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Generate a daily briefing.")
-    parser.add_argument("--user", required=True, help="user uuid")
+    parser.add_argument("--user", help="user uuid (omit with --due)")
+    parser.add_argument("--due", action="store_true",
+                        help="generate for every enabled user who is due (scheduled mode)")
     parser.add_argument("--repo", choices=("postgres", "postgrest", "none"), default="none",
                         help="where to persist; 'none' keeps it in memory")
     parser.add_argument("--deliver", choices=("file", "resend", "none"), default="file")
@@ -136,6 +193,21 @@ def main(argv: list[str] | None = None) -> int:
     if not local_available():
         logger.warning("local model unreachable at %s — composition will degrade",
                        config.OLLAMA_URL)
+
+    if args.due:
+        if args.repo == "none":
+            parser.error("--due needs a repository (--repo postgrest or postgres)")
+        from briefing.repository import PostgresRepository, PostgrestRepository
+
+        repo = PostgresRepository() if args.repo == "postgres" else PostgrestRepository()
+        summary = run_due(repo, deliver=args.deliver, dry_run=args.dry_run)
+        print(json.dumps(summary, indent=2, default=str))
+        # Non-zero on any failure so systemd's OnFailure= alerting fires. A job
+        # that swallows per-user errors and exits 0 is a job nobody hears about.
+        return 1 if summary["failed"] else 0
+
+    if not args.user:
+        parser.error("--user is required unless --due is given")
 
     draft = build_briefing(
         args.user,
