@@ -1478,3 +1478,43 @@ class TestTopicJudge:
         assert "BEGIN_UNTRUSTED" in seen["prompt"]
         assert "END_UNTRUSTED" in seen["prompt"]
         assert seen["prompt"].index("END_UNTRUSTED") < seen["prompt"].rindex("borderline")
+
+
+class TestDuplicateArticlesDoNotDisableSemanticMatching:
+    """One article carried by two feeds silently turned the whole semantic layer
+    off. embed_all is keyed by hash, so duplicates collapse: 199 vectors for 200
+    items tripped a `len(vectors) != len(items)` guard and every topic fell back
+    to exact tokens. The only trace was an INFO line. cluster() escaped it by
+    calling dedupe_exact first; topic_relevance did not."""
+
+    def test_a_shared_article_between_two_feeds_keeps_embeddings_on(self, monkeypatch):
+        import briefing.llm as llm
+        from briefing import dedup
+
+        shared_url = "https://espn.example/same-story"
+        a = item("The 51 freshmen poised to make an impact", shared_url, source="ESPN CFB")
+        b = item("The 51 freshmen poised to make an impact", shared_url, source="ESPN Top")
+        off = [item(f"Unrelated story {i}", f"https://x.example/{i}") for i in range(3)]
+        items = [a, b, *off]
+        assert a.hash == b.hash                      # same normalised URL
+
+        # `a` sits on the topic; the rest are far from it, so the batch-relative
+        # cutoff has a real distribution to work against.
+        vectors = {a.hash: [1.0, 0.0]}
+        vectors.update({o.hash: [0.30, 0.954] for o in off})
+        assert len(vectors) < len(items)             # the condition that broke it
+        monkeypatch.setattr(llm, "embed", lambda t: [1.0, 0.0])
+
+        boosts = dedup.topic_relevance(items, ["Financial Markets"], vectors=vectors)
+        assert boosts, "a duplicate article must not disable semantic matching"
+        assert a.hash in boosts
+
+    def test_genuinely_partial_embeddings_still_fall_back(self, monkeypatch):
+        """The guard must still fire when the model really did fail part way."""
+        import briefing.llm as llm
+        from briefing import dedup
+
+        items = [item(f"Story {i}", f"https://x.example/{i}") for i in range(3)]
+        monkeypatch.setattr(llm, "embed", lambda t: [1.0, 0.0])
+        partial = {items[0].hash: [1.0, 0.0]}        # 1 vector, 3 distinct items
+        assert dedup.topic_relevance(items, ["Financial Markets"], vectors=partial) == {}

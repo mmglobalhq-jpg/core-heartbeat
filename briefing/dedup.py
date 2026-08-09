@@ -401,8 +401,20 @@ def topic_relevance(items: list[RawItem], topics: list[str] | None,
         return {}
     if vectors is None:
         vectors = embed_all(items)
-    if len(vectors) != len(items) or not vectors:
-        logger.info("topic relevance on tokens only (embeddings unavailable or partial)")
+    # Compare against DISTINCT hashes, not len(items). `embed_all` returns a dict
+    # keyed by hash, so two feeds carrying the same article yield one vector for
+    # two items and the old `len(vectors) != len(items)` test tripped.
+    #
+    # That was not theoretical. On 2026-08-09, ONE article carried by both ESPN
+    # Top Headlines and ESPN College Football produced 199 vectors for 200 items
+    # and silently disabled semantic topic matching for the entire run — every
+    # topic fell back to exact tokens, 7 of 11 topics matched nothing at all, and
+    # the only trace was an INFO line reading "embeddings unavailable or partial".
+    # `cluster()` never hit this because it calls `dedupe_exact` first.
+    distinct = {i.hash for i in items}
+    if not vectors or len(vectors) < len(distinct):
+        logger.info("topic relevance on tokens only (embeddings unavailable or partial): "
+                    "%d vectors for %d distinct items", len(vectors), len(distinct))
         return {}
 
     from briefing.llm import embed
