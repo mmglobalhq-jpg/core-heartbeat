@@ -84,7 +84,11 @@ def build_briefing(
 
     weights = {s.name: s.weight for s in sources}
     count = top_count if top_count is not None else config.TOP_COUNT
-    top, deep = select(items, weights=weights, top_count=count, topics=topics)
+    calibration: dict = {}
+    top, deep = select(items, weights=weights, top_count=count, topics=topics,
+                       calibration=calibration)
+    if calibration:
+        meta["topic_calibration"] = calibration
 
     # Record whether each topic actually matched anything. Topics were wired
     # through ranking correctly and still had zero effect for months, and nothing

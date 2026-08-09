@@ -180,12 +180,35 @@ def cluster(items: list[RawItem]) -> list[list[RawItem]]:
 # --- ranking -----------------------------------------------------------------
 
 
-TOPIC_BOOST = 1.6
+TOPIC_BOOST = config.TOPIC_BOOST
 """Multiplier for a story matching one of the user's topics.
 
-Chosen so a topic match reliably beats a same-day general story but cannot beat
-strong corroboration outright — a story carried by five outlets still competes.
-The point is to steer the list, not to hand it over."""
+RAISED FROM 1.6 TO 2.4 on 2026-08-09, and this is PROVISIONAL — see below.
+
+1.6 was chosen so a topic match "reliably beats a same-day general story but
+cannot beat strong corroboration outright". The first half was never true.
+Measured 2026-08-09: fifth place scored 1.7470, while the best exact-match topic
+story — carried by 2 outlets — scored 0.7483 and needed **2.33x** to earn a slot.
+Top-N *membership* was identical with and without topics; only the ordering
+moved. So the value did not steer the list, it decorated it.
+
+2.4 clears that measured requirement with a little headroom. What it deliberately
+does NOT do is hand the list over:
+
+  2 outlets, exact match   0.748 x 2.4 = 1.80  -> makes the cut
+  1 outlet,  exact match   ~0.61 x 2.4 = 1.47  -> still does not
+
+That second line matters for niche single-source interests. A story only one
+outlet carries — which is every story from a personal feed like Dawg Sports —
+still will not reach the Top N on boost alone, and raising the multiplier until
+it does would let one feed take the briefing. The honest fix for that is a
+reserved slot, not a bigger number.
+
+CALIBRATED FROM ONE DAY, WHICH IS HOW THIS CONSTANT WENT WRONG BEFORE. Every run
+now records `run_meta.topic_calibration` with the cut score, the best missed
+topic story, and the shortfall multiplier. Revisit this with several days of
+that data rather than by reasoning about it again. `BRIEFING_TOPIC_BOOST`
+overrides it without a rebuild."""
 
 
 MIN_TOPIC_FRACTION = 0.5
@@ -335,6 +358,22 @@ def _exact_token_boost(item: RawItem, topics: list[str] | None) -> float:
     return TOPIC_BOOST if topic_fraction(item, topics) >= 1.0 else 1.0
 
 
+def effective_boost(item: RawItem, topics: list[str] | None,
+                    boosts: dict[str, float] | None) -> float:
+    """The multiplier this story actually receives.
+
+    ONE definition, used by both scoring and calibration. They disagreed once:
+    calibration read only the semantic dict, so a story boosted purely by an
+    exact token match — "Trump renews push to fire Fed Governor Lisa Cook",
+    which contains "mortgage" — was scored as a topic hit but reported as a
+    miss. Telemetry that measures something other than what the ranker did is
+    worse than none, because it is what the next calibration will trust.
+    """
+    if boosts:
+        return max(boosts.get(item.hash, 1.0), _exact_token_boost(item, topics))
+    return topic_boost(item, topics)
+
+
 def _median(values: list[float]) -> float:
     if not values:
         return 0.0
@@ -425,18 +464,15 @@ def score_cluster(group: list[RawItem], *, weights: dict[str, float] | None = No
     # back to the generous partial-token rule only when there is no semantic
     # score at all keeps the offline path useful without importing its false
     # positives into the normal path.
-    if boosts:
-        boost = max(max(boosts.get(item.hash, 1.0), _exact_token_boost(item, topics))
-                    for item in group)
-    else:
-        boost = max(topic_boost(item, topics) for item in group)
+    boost = max(effective_boost(item, topics, boosts) for item in group)
     return (corroboration * (0.35 + 0.65 * freshness) * weight * boost
             * (1.0 if lead.readable else 0.5))
 
 
 def rank(items: list[RawItem], *, weights: dict[str, float] | None = None,
          topics: list[str] | None = None,
-         now: dt.datetime | None = None) -> list[ScoredItem]:
+         now: dt.datetime | None = None,
+         boosts: dict[str, float] | None = None) -> list[ScoredItem]:
     """Cluster, score, and order. Deterministic for identical input.
 
     One clock reading for the whole run, so equally-fresh stories score
@@ -448,7 +484,8 @@ def rank(items: list[RawItem], *, weights: dict[str, float] | None = None,
     full set.
     """
     now = now or dt.datetime.now(dt.UTC)
-    boosts = topic_relevance(items, topics)
+    if boosts is None:
+        boosts = topic_relevance(items, topics)
     scored = [
         ScoredItem(
             item=group[0],
@@ -494,10 +531,45 @@ def diversify(ranked: list[ScoredItem], *, count: int,
     return chosen[:count]
 
 
+def topic_calibration(ranked: list[ScoredItem], top: list[ScoredItem],
+                      boosts: dict[str, float],
+                      topics: list[str] | None = None) -> dict:
+    """What the topic boost actually achieved on this run.
+
+    Exists because TOPIC_BOOST has now been wrong twice for the same reason: it
+    was set from reasoning rather than from where topic-matched stories actually
+    sit in the score distribution. Recording this every run turns the next
+    adjustment into arithmetic over several days instead of another guess.
+
+    ``shortfall`` is the multiplier the best *missed* topic story still needed to
+    reach the cut. Above 1.0 means the boost is too weak to change the Top N on
+    this day's news; at or below 1.0 the boost is doing its job.
+    """
+    if not ranked or not (boosts or topics):
+        return {}
+    chosen = {id(s) for s in top}
+    cut = min((s.score for s in top), default=0.0)
+    matched = [s for s in ranked if effective_boost(s.item, topics, boosts) > 1.0]
+    if not matched:
+        return {}
+    missed = [s for s in matched if id(s) not in chosen]
+    best_missed = max((s.score for s in missed), default=0.0)
+    return {
+        "boost": TOPIC_BOOST,
+        "matched": len(matched),
+        "in_top": sum(1 for s in top if effective_boost(s.item, topics, boosts) > 1.0),
+        "cut_score": round(cut, 4),
+        "best_missed_score": round(best_missed, 4),
+        # >1 means the boost was too weak by this factor on this day.
+        "shortfall": round(cut / best_missed, 3) if best_missed > 0 else None,
+    }
+
+
 def select(items: list[RawItem], *, weights: dict[str, float] | None = None,
            top_count: int | None = None, max_per_source: int | None = None,
            topics: list[str] | None = None,
-           now: dt.datetime | None = None) -> tuple[list[ScoredItem], ScoredItem | None]:
+           now: dt.datetime | None = None,
+           calibration: dict | None = None) -> tuple[list[ScoredItem], ScoredItem | None]:
     """Pick the Top N and the Deep Dive.
 
     The Deep Dive is the best-corroborated story *below* the Top N, not the
@@ -507,9 +579,14 @@ def select(items: list[RawItem], *, weights: dict[str, float] | None = None,
     below the cut, it falls back to the top story rather than omitting the
     section, because the structure is fixed.
     """
-    ranked = rank(items, weights=weights, topics=topics, now=now)
+    # Computed here rather than inside rank() so the same scores can be reused
+    # for calibration without embedding the batch a second time.
+    boosts = topic_relevance(items, topics)
+    ranked = rank(items, weights=weights, topics=topics, now=now, boosts=boosts)
     count = top_count if top_count is not None else config.TOP_COUNT
     top = diversify(ranked, count=count, max_per_source=max_per_source)
+    if calibration is not None:
+        calibration.update(topic_calibration(ranked, top, boosts, topics))
     chosen = {id(s) for s in top}
     remainder = [s for s in ranked if id(s) not in chosen]
     if remainder:

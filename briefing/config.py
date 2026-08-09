@@ -85,6 +85,12 @@ every headline in the batch into one cluster."""
 
 RECENCY_HALF_LIFE_H = float(os.environ.get("BRIEFING_RECENCY_HALF_LIFE_H", "12"))
 
+TOPIC_BOOST = float(os.environ.get("BRIEFING_TOPIC_BOOST", "2.4"))
+"""Score multiplier for a story matching a user's topic. See `dedup.TOPIC_BOOST`
+for the measurement this was set from, and why it is provisional. Overridable by
+environment so it can be retuned from `run_meta.topic_calibration` without a
+rebuild."""
+
 # --- models ------------------------------------------------------------------
 
 LOCAL_MODEL = os.environ.get("BRIEFING_LOCAL_MODEL", "qwen2.5:7b")

@@ -1196,3 +1196,43 @@ class TestDeliveryLead:
         prefs = {"timezone": "America/Chicago", "deliver_at": "06:30"}
         now = dt.datetime(2026, 8, 10, 6, 24, tzinfo=ZoneInfo("America/Chicago"))
         assert is_due(prefs, existing_dates={"2026-08-10"}, now=now) is False
+
+
+class TestTopicCalibration:
+    """TOPIC_BOOST has been wrong twice for the same reason: set from reasoning
+    rather than from where topic-matched stories actually sit. Every run now
+    records what the boost achieved, so the next adjustment is arithmetic."""
+
+    def test_shortfall_reports_how_much_more_boost_was_needed(self):
+        from briefing.dedup import topic_calibration
+
+        top = [ScoredItem(item=item("In list", "https://x.example/1"),
+                          score=1.75, cluster_id="a", duplicates=[])]
+        missed = ScoredItem(item=item("Topic story missed", "https://x.example/2"),
+                            score=0.70, cluster_id="b", duplicates=[])
+        boosts = {missed.item.hash: 2.4}
+        out = topic_calibration(top + [missed], top, boosts)
+        assert out["in_top"] == 0
+        assert out["matched"] == 1
+        assert out["shortfall"] == pytest.approx(1.75 / 0.70, rel=1e-3)
+
+    def test_shortfall_at_or_below_one_means_the_boost_is_working(self):
+        from briefing.dedup import topic_calibration
+
+        won = ScoredItem(item=item("Topic story that won", "https://x.example/1"),
+                         score=1.90, cluster_id="a", duplicates=[])
+        other = ScoredItem(item=item("Also in list", "https://x.example/2"),
+                           score=1.80, cluster_id="b", duplicates=[])
+        missed = ScoredItem(item=item("Weaker topic story", "https://x.example/3"),
+                            score=1.90, cluster_id="c", duplicates=[])
+        boosts = {won.item.hash: 2.4, missed.item.hash: 2.4}
+        out = topic_calibration([won, other, missed], [won, other], boosts)
+        assert out["in_top"] == 1
+        assert out["shortfall"] <= 1.0
+
+    def test_no_topics_records_nothing_rather_than_zeroes(self):
+        from briefing.dedup import topic_calibration
+
+        top = [ScoredItem(item=item("A", "https://x.example/1"),
+                          score=1.0, cluster_id="a", duplicates=[])]
+        assert topic_calibration(top, top, {}) == {}
