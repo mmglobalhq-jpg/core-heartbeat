@@ -26,7 +26,7 @@ from zoneinfo import ZoneInfo
 
 from briefing import config
 from briefing.compose import compose_deep_dive, compose_top, validate_structure
-from briefing.dedup import select
+from briefing.dedup import select, topic_boost
 from briefing.delivery import sender_for
 from briefing.editorial import polish_sections
 from briefing.ingest import discover, enrich
@@ -85,6 +85,17 @@ def build_briefing(
     weights = {s.name: s.weight for s in sources}
     count = top_count if top_count is not None else config.TOP_COUNT
     top, deep = select(items, weights=weights, top_count=count, topics=topics)
+
+    # Record whether each topic actually matched anything. Topics were wired
+    # through ranking correctly and still had zero effect for months, and nothing
+    # in run_meta would have shown it — the run reported sources, clusters,
+    # escalations and editorial rejections, but never this. A topic sitting at 0
+    # is now visible in the stored briefing instead of silent.
+    if topics:
+        meta["topics"] = list(topics)
+        meta["topics_matched"] = {
+            t: sum(1 for i in items if topic_boost(i, [t]) > 1.0) for t in topics
+        }
     if len(top) < count:
         raise RuntimeError(
             f"only {len(top)} distinct stories after clustering; need {count}"

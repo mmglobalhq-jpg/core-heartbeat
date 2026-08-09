@@ -631,12 +631,120 @@ class TestTopicsSteerRanking:
         it = item("Ferry service resumes to northern islands", "https://x.example/1")
         assert topic_boost(it, ["mortgage REITs"]) == 1.0
 
-    def test_multiword_topic_needs_every_word(self):
-        from briefing.dedup import topic_boost
+    def test_multiword_topic_partial_match_earns_a_partial_boost(self):
+        """Changed 2026-08-09. This previously asserted 1.0 (all-or-nothing).
+
+        Requiring every word made the feature inert: measured against the live
+        corpus, "Financial Markets" matched 0 of 127 items because no single
+        story contained both "financial" and "markets". A 2-of-3 match is a real
+        signal and now earns a proportional boost.
+        """
+        from briefing.dedup import TOPIC_BOOST, topic_boost
 
         it = item("Real estate agents report a quiet July", "https://x.example/1")
-        # "real" and "estate" present, "commercial" absent.
+        # "real" and "estate" present, "commercial" absent -> 2/3.
+        boost = topic_boost(it, ["commercial real estate"])
+        assert 1.0 < boost < TOPIC_BOOST
+        assert boost == pytest.approx(1.0 + (TOPIC_BOOST - 1.0) * (2 / 3))
+
+    def test_single_shared_word_still_boosts_nothing(self):
+        """The original concern, still enforced: don't fire on "real" alone."""
+        from briefing.dedup import topic_boost
+
+        it = item("A real problem for ferry timetables", "https://x.example/1")
+        # only "real" of three words -> 1/3, below MIN_TOPIC_FRACTION.
         assert topic_boost(it, ["commercial real estate"]) == 1.0
+
+    def test_plural_topic_matches_singular_article_text(self):
+        """The "Mortgages" defect: 2 stories said "mortgage", none said
+        "mortgages", and the topic scored zero against content about it."""
+        from briefing.dedup import TOPIC_BOOST, topic_boost
+
+        it = item("Fed move puts mortgage rates back in play", "https://x.example/1")
+        assert topic_boost(it, ["Mortgages"]) == TOPIC_BOOST
+        # and the reverse direction
+        other = item("Banks tighten mortgages for new buyers", "https://x.example/2")
+        assert topic_boost(other, ["mortgage"]) == TOPIC_BOOST
+
+    def test_stemming_does_not_maul_double_s_words(self):
+        from briefing.dedup import _stem
+
+        for w in ("business", "press", "class", "gas"):
+            assert _stem(w) == w
+        assert _stem("markets") == _stem("market")
+        assert _stem("companies") == "company"
+        assert _stem("taxes") == "tax"
+
+    def test_semantic_relevance_falls_back_when_embeddings_are_partial(self, monkeypatch):
+        """Degrade exactly like clustering: half a semantic score is worse than
+        none, because the cutoff is relative to the whole batch."""
+        from briefing import dedup
+
+        items = [item(f"Story {i}", f"https://x.example/{i}") for i in range(3)]
+        monkeypatch.setattr(dedup, "embed_all", lambda its: {items[0].hash: [1.0, 0.0]})
+        assert dedup.topic_relevance(items, ["Financial Markets"]) == {}
+
+    def test_semantic_floor_rejects_a_topic_nothing_covers(self, monkeypatch):
+        """The UGA case. A purely relative rule would promote the least-bad
+        match; a topic no story covers must promote nothing at all."""
+        import briefing.llm as llm
+        from briefing import dedup
+
+        items = [item(f"Story {i}", f"https://x.example/{i}") for i in range(4)]
+        # Every story sits far from the topic vector: cosine ~0.30, under the floor.
+        vectors = {i.hash: [0.30, 0.954] for i in items}
+        monkeypatch.setattr(llm, "embed", lambda text: [1.0, 0.0])
+        assert dedup.topic_relevance(items, ["UGA football"], vectors=vectors) == {}
+
+    def test_semantic_boost_scales_and_is_capped(self, monkeypatch):
+        import briefing.llm as llm
+        from briefing import dedup
+
+        items = [item(f"Story {i}", f"https://x.example/{i}") for i in range(4)]
+        # Item 0 well above EMBED_TOPIC_FULL, item 1 mid-band, rest below the floor.
+        sims = [0.95, 0.57, 0.20, 0.20]
+        vectors = {it.hash: [s, (1 - s ** 2) ** 0.5] for it, s in zip(items, sims)}
+        monkeypatch.setattr(llm, "embed", lambda text: [1.0, 0.0])
+        boosts = dedup.topic_relevance(items, ["Financial Markets"], vectors=vectors)
+        assert boosts[items[0].hash] == pytest.approx(dedup.TOPIC_BOOST)
+        assert 1.0 < boosts[items[1].hash] < dedup.TOPIC_BOOST
+        assert items[2].hash not in boosts and items[3].hash not in boosts
+
+    def test_exact_token_match_survives_a_weak_semantic_score(self, monkeypatch):
+        """Measured case: a headline containing "mortgage" scored only 0.525 to
+        the topic "Mortgages". Tokens must still carry it."""
+        from briefing import dedup
+
+        it = item("Fed move puts mortgage rates back in play", "https://x.example/1")
+        assert dedup._exact_token_boost(it, ["Mortgages"]) == dedup.TOPIC_BOOST
+        # ...but a partial match must NOT, on the semantic path.
+        soccer = item("Is football AI-proof? World Cup investors", "https://x.example/2")
+        assert dedup._exact_token_boost(soccer, ["UGA football"]) == 1.0
+
+    def test_semantic_ranking_is_deterministic(self, monkeypatch):
+        """§7 #5 already cost this pipeline two different briefings from one
+        input. A batch-relative cutoff must not reintroduce that."""
+        import briefing.llm as llm
+        from briefing import dedup
+
+        items = [item(f"Story {i}", f"https://x.example/{i}", hours_old=i + 1)
+                 for i in range(6)]
+        sims = [0.95, 0.80, 0.57, 0.30, 0.20, 0.10]
+        vectors = {it.hash: [s, (1 - s ** 2) ** 0.5] for it, s in zip(items, sims)}
+        monkeypatch.setattr(llm, "embed", lambda text: [1.0, 0.0])
+        runs = [dedup.topic_relevance(items, ["Financial Markets"], vectors=vectors)
+                for _ in range(5)]
+        assert all(r == runs[0] for r in runs)
+
+    def test_run_meta_records_a_topic_that_matched_nothing(self):
+        """Topics were inert for months and run_meta showed nothing. An
+        unmatched topic must now be visible in the stored briefing."""
+        from briefing.dedup import topic_boost
+
+        items = [item("Ferry service resumes to northern islands", "https://x.example/1")]
+        matched = {t: sum(1 for i in items if topic_boost(i, [t]) > 1.0)
+                   for t in ["UGA football"]}
+        assert matched == {"UGA football": 0}
 
     def test_two_letter_topic_still_matches(self):
         from briefing.dedup import TOPIC_BOOST, topic_boost
