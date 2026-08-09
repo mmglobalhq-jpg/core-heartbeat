@@ -362,15 +362,12 @@ def effective_boost(item: RawItem, topics: list[str] | None,
                     boosts: dict[str, float] | None) -> float:
     """The multiplier this story actually receives.
 
-    ONE definition, used by both scoring and calibration. They disagreed once:
-    calibration read only the semantic dict, so a story boosted purely by an
-    exact token match — "Trump renews push to fire Fed Governor Lisa Cook",
-    which contains "mortgage" — was scored as a topic hit but reported as a
-    miss. Telemetry that measures something other than what the ranker did is
-    worse than none, because it is what the next calibration will trust.
+    ONE definition, used by scoring, calibration and the reserved slot. They
+    disagreed once and the telemetry silently measured something the ranker was
+    not doing.
     """
-    if boosts:
-        return max(boosts.get(item.hash, 1.0), _exact_token_boost(item, topics))
+    if boosts is not None:
+        return boosts.get(item.hash, 1.0)
     return topic_boost(item, topics)
 
 
@@ -386,7 +383,7 @@ def _median(values: list[float]) -> float:
 
 def topic_relevance(items: list[RawItem], topics: list[str] | None,
                     *, vectors: dict[str, list[float]] | None = None,
-                    attribution: dict[str, set[str]] | None = None
+                    attribution: dict[str, dict[str, float]] | None = None
                     ) -> dict[str, float]:
     """Boost multiplier per item hash, semantic where possible.
 
@@ -436,24 +433,36 @@ def topic_relevance(items: list[RawItem], topics: list[str] | None,
             # which on this corpus is always a finance story, and a topic the
             # feeds cover thinly would never surface however well it matched.
             if attribution is not None:
-                attribution.setdefault(item_hash, set()).add(text)
+                slot = attribution.setdefault(item_hash, {})
+                slot[text] = max(slot.get(text, 1.0),
+                                 1.0 + (TOPIC_BOOST - 1.0) * share)
     return boosts
 
 
-def topic_hits(item: RawItem, topics: list[str] | None,
-               attribution: dict[str, set[str]] | None = None) -> set[str]:
-    """Every topic this story matches, semantic or exact-token.
+def add_token_hits(items: list[RawItem], topics: list[str] | None,
+                   attribution: dict[str, dict[str, float]]) -> None:
+    """Fold exact full-token matches into the same structure as the semantic pass.
 
-    Mirrors `effective_boost`, which takes the max of the same two paths. They
-    must agree on WHAT matched as well as how much, or the reserved slot would
-    consider a story unmatched that the ranker had already boosted.
+    Both paths must live in ONE place. They were separate once and disagreed:
+    calibration read only the semantic dict, so a story boosted by an exact token
+    match counted for the ranker and against the telemetry.
     """
-    hits = set((attribution or {}).get(item.hash, ()))
-    for raw in topics or []:
-        text = (raw or "").strip()
-        if text and topic_fraction(item, [text]) >= 1.0:
-            hits.add(text)
-    return hits
+    for it in items:
+        for raw in topics or []:
+            text = (raw or "").strip()
+            if text and topic_fraction(it, [text]) >= 1.0:
+                slot = attribution.setdefault(it.hash, {})
+                slot[text] = max(slot.get(text, 1.0), TOPIC_BOOST)
+
+
+def boosts_from(attribution: dict[str, dict[str, float]]) -> dict[str, float]:
+    """Final multiplier per item: its strongest surviving topic."""
+    return {h: max(d.values()) for h, d in attribution.items() if d}
+
+
+def topic_hits(item: RawItem, attribution: dict[str, dict[str, float]] | None = None) -> set[str]:
+    """Every topic this story still matches after judging."""
+    return set((attribution or {}).get(item.hash, {}))
 
 
 def reserve_topic_slots(ranked: list[ScoredItem], top: list[ScoredItem],
@@ -494,20 +503,20 @@ def reserve_topic_slots(ranked: list[ScoredItem], top: list[ScoredItem],
         chosen = {id(s) for s in result}
         represented: set[str] = set()
         for s in result:
-            represented |= topic_hits(s.item, topics, attribution)
+            represented |= topic_hits(s.item, attribution)
 
         # Best-scoring outsider matching a topic nothing in the list covers.
         candidate = next(
             (s for s in ranked
              if id(s) not in chosen
-             and topic_hits(s.item, topics, attribution) - represented),
+             and topic_hits(s.item, attribution) - represented),
             None,
         )
         if candidate is None:
             break
 
         # Only a story serving no topic may be displaced, weakest first.
-        droppable = [s for s in result if not topic_hits(s.item, topics, attribution)]
+        droppable = [s for s in result if not topic_hits(s.item, attribution)]
         if not droppable:
             break
         victim = min(droppable, key=lambda s: (s.score, url_hash(s.item.url)))
@@ -656,11 +665,60 @@ def topic_calibration(ranked: list[ScoredItem], top: list[ScoredItem],
     }
 
 
+def apply_topic_judge(items: list[RawItem], topics: list[str] | None,
+                      attribution: dict[str, dict[str, float]],
+                      *, budget=None) -> dict:
+    """Let the model strike topics that similarity got wrong.
+
+    PRECISION ONLY. It sees just the candidates already surfaced, and can only
+    REMOVE a topic from a story, never add one — so a model failure costs
+    targeting, never a wrong promotion. Recall stays with the feeds and the
+    embedding pass, which are cheap; judging all ~130 items would cost far more
+    and change nothing, because an unsurfaced story was never going to be picked.
+
+    Fails OPEN: an unreachable or unparseable model leaves every candidate
+    exactly as it was, matching how clustering degrades when embeddings are
+    unavailable. Failing closed would delete the feature on the day the model was
+    down — the worse outcome, and the harder one to notice.
+    """
+    from briefing import topic_judge
+
+    if not topics or not attribution or not topic_judge.enabled():
+        return {}
+
+    by_hash = {i.hash: i for i in items}
+    limit = config.TOPIC_JUDGE_CANDIDATES
+    candidates: dict[str, list[RawItem]] = {}
+    for topic in topics:
+        text = (topic or "").strip()
+        if not text:
+            continue
+        scored = sorted(
+            ((d[text], h) for h, d in attribution.items() if text in d),
+            key=lambda pair: (-pair[0], pair[1]),          # deterministic order
+        )[:limit]
+        if scored:
+            candidates[text] = [by_hash[h] for _, h in scored if h in by_hash]
+
+    if not candidates:
+        return {}
+
+    confirmed, stats = topic_judge.judge(candidates, budget=budget)
+    for topic, kept in confirmed.items():
+        for item in candidates.get(topic, []):
+            if item.hash not in kept:
+                attribution.get(item.hash, {}).pop(topic, None)
+    for h in [h for h, d in attribution.items() if not d]:
+        del attribution[h]
+    return stats
+
+
 def select(items: list[RawItem], *, weights: dict[str, float] | None = None,
            top_count: int | None = None, max_per_source: int | None = None,
            topics: list[str] | None = None,
            now: dt.datetime | None = None,
-           calibration: dict | None = None) -> tuple[list[ScoredItem], ScoredItem | None]:
+           calibration: dict | None = None,
+           budget=None) -> tuple[list[ScoredItem], ScoredItem | None]:
     """Pick the Top N and the Deep Dive.
 
     The Deep Dive is the best-corroborated story *below* the Top N, not the
@@ -672,8 +730,20 @@ def select(items: list[RawItem], *, weights: dict[str, float] | None = None,
     """
     # Computed here rather than inside rank() so the same scores can be reused
     # for calibration without embedding the batch a second time.
-    attribution: dict[str, set[str]] = {}
-    boosts = topic_relevance(items, topics, attribution=attribution)
+    attribution: dict[str, dict[str, float]] = {}
+    topic_relevance(items, topics, attribution=attribution)
+    add_token_hits(items, topics, attribution)
+    judge_stats = apply_topic_judge(items, topics, attribution, budget=budget)
+    boosts = boosts_from(attribution)
+    if calibration is not None:
+        if judge_stats:
+            calibration["judge"] = judge_stats
+        # Counted from the POST-judge attribution, so it reports what the ranker
+        # actually used. Counting it separately is how this drifted before.
+        calibration["matched_by_topic"] = {
+            (t or "").strip(): sum(1 for d in attribution.values() if (t or "").strip() in d)
+            for t in (topics or []) if (t or "").strip()
+        }
     ranked = rank(items, weights=weights, topics=topics, now=now, boosts=boosts)
     count = top_count if top_count is not None else config.TOP_COUNT
     top = diversify(ranked, count=count, max_per_source=max_per_source)

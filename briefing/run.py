@@ -26,7 +26,7 @@ from zoneinfo import ZoneInfo
 
 from briefing import config
 from briefing.compose import compose_deep_dive, compose_top, validate_structure
-from briefing.dedup import select, topic_boost
+from briefing.dedup import select
 from briefing.delivery import sender_for
 from briefing.editorial import polish_sections
 from briefing.ingest import discover, enrich
@@ -86,7 +86,7 @@ def build_briefing(
     count = top_count if top_count is not None else config.TOP_COUNT
     calibration: dict = {}
     top, deep = select(items, weights=weights, top_count=count, topics=topics,
-                       calibration=calibration)
+                       calibration=calibration, budget=budget)
     if calibration:
         meta["topic_calibration"] = calibration
 
@@ -97,9 +97,10 @@ def build_briefing(
     # is now visible in the stored briefing instead of silent.
     if topics:
         meta["topics"] = list(topics)
-        meta["topics_matched"] = {
-            t: sum(1 for i in items if topic_boost(i, [t]) > 1.0) for t in topics
-        }
+        # Taken from selection, not recomputed here. Recomputing it with the raw
+        # token matcher reported a different number from the one the ranker used
+        # — the same drift that made `in_top` read 1 when the answer was 2.
+        meta["topics_matched"] = calibration.get("matched_by_topic", {})
     if len(top) < count:
         raise RuntimeError(
             f"only {len(top)} distinct stories after clustering; need {count}"

@@ -85,6 +85,22 @@ every headline in the batch into one cluster."""
 
 RECENCY_HALF_LIFE_H = float(os.environ.get("BRIEFING_RECENCY_HALF_LIFE_H", "12"))
 
+TOPIC_JUDGE = os.environ.get("BRIEFING_TOPIC_JUDGE", "1") not in ("0", "false", "False", "")
+"""Ask the model whether a candidate story is really about a user's topic.
+
+Embeddings answer "is this nearby in meaning", which is not the same question:
+`"UGA football"` scored highest against World Cup soccer and a Ted Lasso
+newsletter. A model knows UGA is the University of Georgia and that college
+football is not association football.
+
+A PRECISION filter only — it can take a topic away from a story, never add one,
+and it only sees candidates the embedding pass already surfaced. `0` disables it
+and returns selection to fully deterministic behaviour."""
+
+TOPIC_JUDGE_CANDIDATES = int(os.environ.get("BRIEFING_TOPIC_JUDGE_CANDIDATES", "8"))
+"""Stories per topic sent to the judge. Bounds cost: one local call per topic
+carrying at most this many headlines."""
+
 TOPIC_RESERVED_SLOTS = int(os.environ.get("BRIEFING_TOPIC_RESERVED_SLOTS", "1"))
 """Top-N slots guaranteed to a topic the list does not already cover.
 
