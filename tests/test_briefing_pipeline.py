@@ -1664,3 +1664,67 @@ class TestReservedSlotRespectsTheCategoryCap:
         out = reserve_topic_slots([s1, gen, biz], [s1, gen], ["Wall Street"], attr,
                                   categories=cats, max_per_category=2)
         assert "Markets move" in [x.item.title for x in out]
+
+
+class TestNonNewsFilter:
+    """A briefing led with "How to watch Valkyries vs. Sparks: TV channel and
+    streaming options" and deep-dived on a fantasy 'Do Not Draft' list. Ranking
+    scores corroboration, freshness and source weight — none of which can tell an
+    article from a schedule."""
+
+    def test_drops_per_fixture_viewing_pages(self):
+        from briefing.newsworthiness import reason
+
+        assert reason(item("How to watch Rays vs. Mariners: TV channel and streaming options",
+                           "https://x.example/1")) == "how_to_watch"
+        assert reason(item("Where to watch Georgia vs Alabama", "https://x.example/2"))
+
+    def test_drops_fantasy_and_betting_columns(self):
+        from briefing.newsworthiness import reason
+
+        assert reason(item("Fantasy football managers, beware: The full 'Do Not Draft' list",
+                           "https://x.example/1")) == "fantasy"
+        assert reason(item("Week 1 best bets and prop bets", "https://x.example/2")) == "betting"
+
+    def test_keeps_real_stories_that_merely_look_similar(self):
+        """The two patterns removed during tuning, kept as regressions."""
+        from briefing.newsworthiness import reason
+
+        # matched an earlier `as it happened` rule — real political reporting
+        assert reason(item("Labor open to 'sensible amendments' on gambling reforms, "
+                           "minister says - as it happened", "https://x.example/1")) is None
+        # matched an earlier `injury report` rule — a genuine sports story
+        assert reason(item("Sources: Commanders' Tunsil suffers torn tricep",
+                           "https://x.example/2")) is None
+        # a bare \bodds\b rule would have taken this
+        assert reason(item("Traders cut the odds of a September recession",
+                           "https://x.example/3")) is None
+
+    def test_reports_what_it_dropped(self):
+        from briefing.newsworthiness import filter_items
+
+        items = [item("How to watch A vs B: TV channel", "https://x.example/1"),
+                 item("Fantasy football Do Not Draft list", "https://x.example/2"),
+                 item("Central bank holds interest rates steady", "https://x.example/3")]
+        kept, counts = filter_items(items)
+        assert len(kept) == 1
+        assert counts == {"how_to_watch": 1, "fantasy": 1}
+
+    def test_refuses_to_empty_the_briefing(self):
+        """A quality preference must not become a correctness failure."""
+        from briefing.newsworthiness import filter_items
+
+        items = [item("How to watch A vs B: TV channel", "https://x.example/1"),
+                 item("Where to watch C vs D", "https://x.example/2")]
+        kept, counts = filter_items(items)
+        assert len(kept) == 2
+        assert "disabled_would_empty" in counts
+
+    def test_can_be_disabled(self, monkeypatch):
+        from briefing import config
+        from briefing.newsworthiness import filter_items
+
+        monkeypatch.setattr(config, "FILTER_NON_NEWS", False)
+        items = [item("How to watch A vs B: TV channel", "https://x.example/1")]
+        kept, counts = filter_items(items)
+        assert len(kept) == 1 and counts == {}

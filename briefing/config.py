@@ -42,6 +42,18 @@ detection — a host that does not want automated traffic is entitled to refuse 
 
 RESPECT_ROBOTS = os.environ.get("BRIEFING_RESPECT_ROBOTS", "1") != "0"
 
+FILTER_NON_NEWS = os.environ.get("BRIEFING_FILTER_NON_NEWS", "1") not in ("0", "false", "False", "")
+"""Drop items that are not stories: per-fixture TV listings, fantasy columns,
+betting cards, liveblog shells.
+
+Ranking cannot tell an article from a schedule — it scores corroboration,
+freshness and source weight, and a how-to-watch page published per fixture wins
+on all three. A real briefing led with "How to watch Valkyries vs. Sparks" and
+deep-dived on a 'Do Not Draft' list. See `newsworthiness.py` for why a pattern
+list is the right tool here when `untrusted.detect_injection` refuses to be one."""
+
+FILTER_NON_NEWS_MIN_KEPT = 0
+
 # --- ranking -----------------------------------------------------------------
 
 DEDUP_THRESHOLD = float(os.environ.get("BRIEFING_DEDUP_THRESHOLD", "0.62"))

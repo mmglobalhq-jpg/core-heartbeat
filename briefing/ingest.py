@@ -60,9 +60,16 @@ def discover(specs: list[SourceSpec]) -> tuple[list[RawItem], dict]:
                 logger.warning("source %s produced no usable items%s", spec.name,
                                f" ({', '.join(sorted(reasons))})" if reasons else "")
 
+    from briefing.newsworthiness import filter_items
+
+    # Before the freshness cut, so a day full of listings does not consume the
+    # MAX_TOTAL_ITEMS budget and push real stories out of the pool.
+    items, non_news = filter_items(items)
     fresh = _filter_fresh(items)
     stats["discovered"] = len(items)
     stats["fresh"] = len(fresh)
+    if non_news:
+        stats["non_news"] = non_news
     stats["skipped"] = sum(1 for i in items if i.skipped_reason)
     return fresh[: config.MAX_TOTAL_ITEMS], stats
 
