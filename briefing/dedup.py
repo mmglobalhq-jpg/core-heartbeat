@@ -385,7 +385,8 @@ def _median(values: list[float]) -> float:
 
 
 def topic_relevance(items: list[RawItem], topics: list[str] | None,
-                    *, vectors: dict[str, list[float]] | None = None
+                    *, vectors: dict[str, list[float]] | None = None,
+                    attribution: dict[str, set[str]] | None = None
                     ) -> dict[str, float]:
     """Boost multiplier per item hash, semantic where possible.
 
@@ -430,7 +431,97 @@ def topic_relevance(items: list[RawItem], topics: list[str] | None,
             share = min(1.0, (score - cutoff) / span)
             boosts[item_hash] = max(boosts.get(item_hash, 1.0),
                                     1.0 + (TOPIC_BOOST - 1.0) * share)
+            # WHICH topic matched, not just how strongly. The reserved slot needs
+            # this: without it the slot always goes to the highest-scoring match,
+            # which on this corpus is always a finance story, and a topic the
+            # feeds cover thinly would never surface however well it matched.
+            if attribution is not None:
+                attribution.setdefault(item_hash, set()).add(text)
     return boosts
+
+
+def topic_hits(item: RawItem, topics: list[str] | None,
+               attribution: dict[str, set[str]] | None = None) -> set[str]:
+    """Every topic this story matches, semantic or exact-token.
+
+    Mirrors `effective_boost`, which takes the max of the same two paths. They
+    must agree on WHAT matched as well as how much, or the reserved slot would
+    consider a story unmatched that the ranker had already boosted.
+    """
+    hits = set((attribution or {}).get(item.hash, ()))
+    for raw in topics or []:
+        text = (raw or "").strip()
+        if text and topic_fraction(item, [text]) >= 1.0:
+            hits.add(text)
+    return hits
+
+
+def reserve_topic_slots(ranked: list[ScoredItem], top: list[ScoredItem],
+                        topics: list[str] | None,
+                        attribution: dict[str, set[str]],
+                        *, reserved: int | None = None,
+                        max_per_source: int | None = None) -> list[ScoredItem]:
+    """Guarantee slots for topics the score alone would never surface.
+
+    WHY THIS EXISTS. Ranking is dominated by corroboration: a story four outlets
+    carried beats one that a single outlet carried, which is right for general
+    news and wrong for a personal interest. A niche topic is niche precisely
+    because one outlet covers it. Measured — a 1-outlet story needs about 2.9x to
+    reach fifth place, and TOPIC_BOOST is 2.4 and deliberately capped below that,
+    because a multiplier large enough to promote single-source stories would let
+    one feed take the whole briefing. A reserved slot promotes exactly one story
+    without touching what everything else scores.
+
+    THE SLOT PREFERS AN UNREPRESENTED TOPIC. Filling it with the best-scoring
+    match would be nearly free to implement and would defeat the purpose: on this
+    corpus the strongest matches are always finance, so the slot would add a third
+    finance story while the topic with thin coverage — the one that actually needs
+    help — stayed invisible. Represented topics are already being served.
+
+    Displaces the LOWEST-scoring story that matches no topic at all, never a
+    topic match, and never more than `reserved` slots. If every story in the Top N
+    already matches something, nothing is displaced. Per-source caps still hold,
+    so this cannot become a way for one feed to take two slots.
+    """
+    n = config.TOPIC_RESERVED_SLOTS if reserved is None else reserved
+    if n <= 0 or not topics or not ranked or not top:
+        return top
+
+    cap = config.MAX_PER_SOURCE if max_per_source is None else max_per_source
+    result = list(top)
+
+    for _ in range(n):
+        chosen = {id(s) for s in result}
+        represented: set[str] = set()
+        for s in result:
+            represented |= topic_hits(s.item, topics, attribution)
+
+        # Best-scoring outsider matching a topic nothing in the list covers.
+        candidate = next(
+            (s for s in ranked
+             if id(s) not in chosen
+             and topic_hits(s.item, topics, attribution) - represented),
+            None,
+        )
+        if candidate is None:
+            break
+
+        # Only a story serving no topic may be displaced, weakest first.
+        droppable = [s for s in result if not topic_hits(s.item, topics, attribution)]
+        if not droppable:
+            break
+        victim = min(droppable, key=lambda s: (s.score, url_hash(s.item.url)))
+
+        used: dict[str, int] = defaultdict(int)
+        for s in result:
+            if id(s) != id(victim):
+                used[s.item.source_name or "unknown"] += 1
+        if used[candidate.item.source_name or "unknown"] >= cap:
+            break
+
+        result = [candidate if id(s) == id(victim) else s for s in result]
+
+    return result
 
 
 def score_cluster(group: list[RawItem], *, weights: dict[str, float] | None = None,
@@ -581,12 +672,31 @@ def select(items: list[RawItem], *, weights: dict[str, float] | None = None,
     """
     # Computed here rather than inside rank() so the same scores can be reused
     # for calibration without embedding the batch a second time.
-    boosts = topic_relevance(items, topics)
+    attribution: dict[str, set[str]] = {}
+    boosts = topic_relevance(items, topics, attribution=attribution)
     ranked = rank(items, weights=weights, topics=topics, now=now, boosts=boosts)
     count = top_count if top_count is not None else config.TOP_COUNT
     top = diversify(ranked, count=count, max_per_source=max_per_source)
+
+    # Calibration is measured on the PRE-reservation list, deliberately. A
+    # reserved slot promotes a story the score did not earn, which drags the cut
+    # score down to that story's score — measured, 1.7755 -> 0.8739, turning a
+    # shortfall of 1.436 into 0.707. Read after reservation it would report that
+    # TOPIC_BOOST is carrying the list when the slot is doing the work, and the
+    # next calibration would lower the boost on that evidence.
     if calibration is not None:
         calibration.update(topic_calibration(ranked, top, boosts, topics))
+
+    reserved_top = reserve_topic_slots(ranked, top, topics, attribution,
+                                       max_per_source=max_per_source)
+    if calibration is not None:
+        calibration["reserved_used"] = sum(
+            1 for s in reserved_top if id(s) not in {id(t) for t in top}
+        )
+    top = reserved_top
+    # Re-sort: a reserved story is promoted on relevance, not score, so without
+    # this it would sit wherever the story it displaced happened to rank.
+    top.sort(key=lambda s: (-s.score, url_hash(s.item.url)))
     chosen = {id(s) for s in top}
     remainder = [s for s in ranked if id(s) not in chosen]
     if remainder:

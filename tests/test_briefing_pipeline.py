@@ -1236,3 +1236,131 @@ class TestTopicCalibration:
         top = [ScoredItem(item=item("A", "https://x.example/1"),
                           score=1.0, cluster_id="a", duplicates=[])]
         assert topic_calibration(top, top, {}) == {}
+
+
+class TestReservedTopicSlot:
+    """Corroboration dominates ranking, so a single-outlet niche story can never
+    win a slot on score. A 1-outlet story needs ~2.9x to reach fifth place and
+    TOPIC_BOOST is capped at 2.4 on purpose."""
+
+    def _scored(self, title, url, score, source="Outlet"):
+        return ScoredItem(item=item(title, url, source=source), score=score,
+                          cluster_id=url, duplicates=[])
+
+    def test_promotes_an_uncovered_topic_over_a_higher_scoring_one(self):
+        """The whole point. Filling the slot with the BEST match would add a
+        second finance story and leave the thin topic invisible."""
+        from briefing.dedup import reserve_topic_slots
+
+        fin = self._scored("Markets rally on earnings", "https://a.example/1", 2.0, source="FT")
+        gen1 = self._scored("Ferry service resumes", "https://b.example/2", 1.5, source="BBC")
+        gen2 = self._scored("Museum recovers bronze", "https://c.example/3", 1.2, source="NPR")
+        better_fin = self._scored("Stocks climb again", "https://d.example/4", 1.1, source="CNBC")
+        uga = self._scored("Kirby Smart on fall camp", "https://e.example/5", 0.4,
+                           source="Dawg Sports")
+        ranked = [fin, gen1, gen2, better_fin, uga]
+        attr = {fin.item.hash: {"Financial Markets"},
+                better_fin.item.hash: {"Financial Markets"},
+                uga.item.hash: {"UGA football"}}
+        out = reserve_topic_slots(ranked, [fin, gen1, gen2],
+                                  ["Financial Markets", "UGA football"], attr)
+        titles = [s.item.title for s in out]
+        assert "Kirby Smart on fall camp" in titles
+        assert "Stocks climb again" not in titles      # finance is already covered
+        assert "Museum recovers bronze" not in titles  # weakest untopical dropped
+        assert "Ferry service resumes" in titles       # stronger untopical survives
+        assert len(out) == 3
+
+    def test_displaces_the_weakest_untopical_story_only(self):
+        from briefing.dedup import reserve_topic_slots
+
+        keep = self._scored("Strong general story", "https://a.example/1", 3.0)
+        weak = self._scored("Weak general story", "https://b.example/2", 0.9)
+        uga = self._scored("Georgia lands recruit", "https://c.example/3", 0.3)
+        attr = {uga.item.hash: {"UGA football"}}
+        out = reserve_topic_slots([keep, weak, uga], [keep, weak], ["UGA football"], attr)
+        assert [s.item.title for s in out] == ["Strong general story", "Georgia lands recruit"]
+
+    def test_never_displaces_a_topic_match(self):
+        from briefing.dedup import reserve_topic_slots
+
+        a = self._scored("Markets story", "https://a.example/1", 2.0)
+        b = self._scored("Mortgage story", "https://b.example/2", 1.0)
+        uga = self._scored("Georgia story", "https://c.example/3", 0.3)
+        attr = {a.item.hash: {"Financial Markets"}, b.item.hash: {"Mortgages"},
+                uga.item.hash: {"UGA football"}}
+        out = reserve_topic_slots([a, b, uga], [a, b],
+                                  ["Financial Markets", "Mortgages", "UGA football"], attr)
+        assert [s.item.title for s in out] == ["Markets story", "Mortgage story"]
+
+    def test_respects_the_per_source_cap(self):
+        """A reserved slot must not become a way for one feed to take two."""
+        from briefing.dedup import reserve_topic_slots
+
+        f1 = self._scored("Feed story one", "https://a.example/1", 2.0, source="Dawg Sports")
+        f2 = self._scored("Feed story two", "https://a.example/2", 1.9, source="Dawg Sports")
+        gen = self._scored("General story", "https://b.example/3", 1.0)
+        extra = self._scored("Feed story three", "https://a.example/4", 0.4, source="Dawg Sports")
+        attr = {f1.item.hash: {"UGA football"}, f2.item.hash: {"UGA football"},
+                extra.item.hash: {"Other topic"}}
+        out = reserve_topic_slots([f1, f2, gen, extra], [f1, f2, gen],
+                                  ["UGA football", "Other topic"], attr,
+                                  max_per_source=2)
+        assert "Feed story three" not in [s.item.title for s in out]
+
+    def test_does_nothing_when_every_topic_is_already_covered(self):
+        from briefing.dedup import reserve_topic_slots
+
+        a = self._scored("Markets story", "https://a.example/1", 2.0)
+        gen = self._scored("General story", "https://b.example/2", 1.0)
+        other = self._scored("Another markets story", "https://c.example/3", 0.5)
+        attr = {a.item.hash: {"Financial Markets"}, other.item.hash: {"Financial Markets"}}
+        out = reserve_topic_slots([a, gen, other], [a, gen], ["Financial Markets"], attr)
+        assert [s.item.title for s in out] == ["Markets story", "General story"]
+
+    def test_disabled_by_zero(self):
+        from briefing.dedup import reserve_topic_slots
+
+        gen = self._scored("General story", "https://a.example/1", 2.0)
+        uga = self._scored("Georgia story", "https://b.example/2", 0.3)
+        attr = {uga.item.hash: {"UGA football"}}
+        out = reserve_topic_slots([gen, uga], [gen], ["UGA football"], attr, reserved=0)
+        assert [s.item.title for s in out] == ["General story"]
+
+    def test_select_still_returns_exactly_top_count(self):
+        items = [item(h, f"https://x.example/{i}") for i, h in enumerate(HEADLINES)]
+        top, deep = select(items, top_count=5, topics=["irrigation limits"])
+        assert len(top) == 5
+        assert len({s.item.url for s in top}) == 5
+        assert deep is not None and deep.item.url not in {s.item.url for s in top}
+
+
+class TestCalibrationIsMeasuredBeforeReservation:
+    """A reserved slot drags the cut score down to the score of a story the
+    ranking did not earn. Measured on the live corpus: cut 1.7755 -> 0.8739,
+    shortfall 1.436 -> 0.707. Read after reservation, calibration would claim
+    TOPIC_BOOST is carrying the list when the slot is doing the work - and the
+    next tuning pass would lower the boost on that evidence."""
+
+    def test_cut_score_ignores_the_reserved_story(self, monkeypatch):
+        import briefing.llm as llm
+        from briefing import config, dedup
+
+        items = [item(h, f"https://x.example/{i}", source=f"Outlet{i}")
+                 for i, h in enumerate(HEADLINES)]
+        # One clearly on-topic story that cannot win a slot on score.
+        niche = item("Irrigation limits protested by farmers again",
+                     "https://niche.example/1", source="Niche Feed", hours_old=40)
+        allitems = items + [niche]
+        monkeypatch.setattr(config, "TOPIC_RESERVED_SLOTS", 1)
+        monkeypatch.setattr(dedup, "embed_all", lambda its: {})
+        monkeypatch.setattr(llm, "embed", lambda t: [])
+
+        cal = {}
+        top, _ = dedup.select(allitems, top_count=5, topics=["irrigation limits"],
+                              calibration=cal)
+        if cal.get("reserved_used"):
+            cut = cal["cut_score"]
+            assert cut == pytest.approx(min(s.score for s in top
+                                            if s.item.url != "https://niche.example/1"),
+                                        rel=1e-6)

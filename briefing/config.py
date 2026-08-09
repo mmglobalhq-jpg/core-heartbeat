@@ -85,6 +85,15 @@ every headline in the batch into one cluster."""
 
 RECENCY_HALF_LIFE_H = float(os.environ.get("BRIEFING_RECENCY_HALF_LIFE_H", "12"))
 
+TOPIC_RESERVED_SLOTS = int(os.environ.get("BRIEFING_TOPIC_RESERVED_SLOTS", "1"))
+"""Top-N slots guaranteed to a topic the list does not already cover.
+
+Ranking is dominated by corroboration, and a niche interest is niche precisely
+because one outlet covers it — a 1-outlet story needs ~2.9x to reach fifth place,
+while TOPIC_BOOST is capped at 2.4 on purpose. A reserved slot promotes one story
+without inflating what everything else scores. `0` disables it. See
+`dedup.reserve_topic_slots` for why the slot prefers an UNREPRESENTED topic."""
+
 TOPIC_BOOST = float(os.environ.get("BRIEFING_TOPIC_BOOST", "2.4"))
 """Score multiplier for a story matching a user's topic. See `dedup.TOPIC_BOOST`
 for the measurement this was set from, and why it is provisional. Overridable by
