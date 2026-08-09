@@ -1262,8 +1262,11 @@ class TestReservedTopicSlot:
         attr = {fin.item.hash: {"Financial Markets"},
                 better_fin.item.hash: {"Financial Markets"},
                 uga.item.hash: {"UGA football"}}
+        # category cap disabled: this test is about topic preference, and the
+        # fixture deliberately shares one category. The cap has its own tests.
         out = reserve_topic_slots(ranked, [fin, gen1, gen2],
-                                  ["Financial Markets", "UGA football"], attr)
+                                  ["Financial Markets", "UGA football"], attr,
+                                  max_per_category=0)
         titles = [s.item.title for s in out]
         assert "Kirby Smart on fall camp" in titles
         assert "Stocks climb again" not in titles      # finance is already covered
@@ -1624,3 +1627,40 @@ class TestTopicInterpretation:
             '{"Something else": {"name": "Nonsense", "terms": []}, "AI": "not-a-dict"}')
         resolved, _ = tj.interpret(["AI"])
         assert resolved == {}
+
+
+class TestReservedSlotRespectsTheCategoryCap:
+    """diversify held sport to 2 slots and reserve_topic_slots then swapped in a
+    third: the balance cap was enforced and quietly undone one step later. A slot
+    that exists to improve balance must not be what breaks it."""
+
+    def _s(self, title, url, score, source, topic):
+        it = RawItem(url=url, title=title, source_name=source, topic=topic,
+                     summary=None, body=None, published_at=NOW, skipped_reason=None)
+        return ScoredItem(item=it, score=score, cluster_id=url, duplicates=[])
+
+    def test_will_not_exceed_the_category_cap(self):
+        from briefing.dedup import reserve_topic_slots
+
+        s1 = self._s("Sport one", "https://a.example/1", 9.0, "ESPN", "sport")
+        s2 = self._s("Sport two", "https://b.example/2", 8.0, "Athletic", "sport")
+        gen = self._s("General story", "https://c.example/3", 1.0, "BBC", "world")
+        s3 = self._s("Sport three", "https://d.example/4", 0.5, "ESPN CFB", "sport")
+        cats = {"ESPN": "sport", "Athletic": "sport", "BBC": "world", "ESPN CFB": "sport"}
+        attr = {s3.item.hash: {"Baseball": 2.4}}          # an uncovered topic
+        out = reserve_topic_slots([s1, s2, gen, s3], [s1, s2, gen], ["Baseball"], attr,
+                                  categories=cats, max_per_category=2)
+        assert "Sport three" not in [x.item.title for x in out]
+        assert len(out) == 3
+
+    def test_still_promotes_when_the_category_has_room(self):
+        from briefing.dedup import reserve_topic_slots
+
+        s1 = self._s("Sport one", "https://a.example/1", 9.0, "ESPN", "sport")
+        gen = self._s("General story", "https://c.example/3", 1.0, "BBC", "world")
+        biz = self._s("Markets move", "https://d.example/4", 0.5, "FT", "business")
+        cats = {"ESPN": "sport", "BBC": "world", "FT": "business"}
+        attr = {biz.item.hash: {"Wall Street": 2.4}}
+        out = reserve_topic_slots([s1, gen, biz], [s1, gen], ["Wall Street"], attr,
+                                  categories=cats, max_per_category=2)
+        assert "Markets move" in [x.item.title for x in out]

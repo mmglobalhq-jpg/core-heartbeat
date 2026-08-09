@@ -504,7 +504,9 @@ def reserve_topic_slots(ranked: list[ScoredItem], top: list[ScoredItem],
                         topics: list[str] | None,
                         attribution: dict[str, set[str]],
                         *, reserved: int | None = None,
-                        max_per_source: int | None = None) -> list[ScoredItem]:
+                        max_per_source: int | None = None,
+                        categories: dict[str, str] | None = None,
+                        max_per_category: int | None = None) -> list[ScoredItem]:
     """Guarantee slots for topics the score alone would never surface.
 
     WHY THIS EXISTS. Ranking is dominated by corroboration: a story four outlets
@@ -532,6 +534,12 @@ def reserve_topic_slots(ranked: list[ScoredItem], top: list[ScoredItem],
         return top
 
     cap = config.MAX_PER_SOURCE if max_per_source is None else max_per_source
+    cat_cap = config.MAX_PER_CATEGORY if max_per_category is None else max_per_category
+    categories = categories or {}
+
+    def category_of(scored: ScoredItem) -> str:
+        return categories.get(scored.item.source_name or "") or scored.item.topic or "other"
+
     result = list(top)
 
     for _ in range(n):
@@ -554,11 +562,20 @@ def reserve_topic_slots(ranked: list[ScoredItem], top: list[ScoredItem],
             break
         victim = min(droppable, key=lambda s: (s.score, url_hash(s.item.url)))
 
+        # BOTH caps, not just the source one. The reserved slot used to honour
+        # MAX_PER_SOURCE alone, so on 2026-08-09 diversify correctly held sport
+        # to 2 slots and this then swapped in a THIRD — the balance cap was
+        # enforced and then quietly undone one step later. A slot that exists to
+        # improve balance must not be the thing that breaks it.
         used: dict[str, int] = defaultdict(int)
+        used_cat: dict[str, int] = defaultdict(int)
         for s in result:
             if id(s) != id(victim):
                 used[s.item.source_name or "unknown"] += 1
+                used_cat[category_of(s)] += 1
         if used[candidate.item.source_name or "unknown"] >= cap:
+            break
+        if cat_cap > 0 and used_cat[category_of(candidate)] >= cat_cap:
             break
 
         result = [candidate if id(s) == id(victim) else s for s in result]
