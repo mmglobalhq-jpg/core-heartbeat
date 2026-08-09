@@ -101,6 +101,101 @@ is genuinely borderline, include it. If none qualify, return {{"relevant": []}}.
 Do not explain."""
 
 
+INTERPRET_SYSTEM = (
+    "You normalise the subjects a person typed into their news preferences. "
+    "For each subject, return the standard name for what they plainly meant and "
+    "a few extra terms that news stories about it would actually use — team "
+    "names, people, institutions, tickers, common abbreviations. "
+    "Correct obvious misspellings. Do not reinterpret a subject into something "
+    "else: if you cannot tell what was meant, return it unchanged. "
+    "Reply with JSON only, no prose."
+)
+
+_INTERPRET_PROMPT = """Here are the subjects a reader follows:
+
+{fenced}
+
+Return JSON of exactly this shape and nothing else, one key per subject
+EXACTLY as it was written above:
+
+{{"<subject as written>": {{"name": "<standard name>", "terms": ["<other terms news would use>"]}}}}
+
+Correct clear misspellings — a subject one or two letters away from a well-known
+name is a typo, not a different subject. Keep "name" short: it is used to search
+headlines. Give at most five extra terms, and only ones that would really appear
+in a story about the subject. If a subject is already correct, return it
+unchanged with useful extra terms. Do not explain."""
+
+
+def interpret(topics: list[str], *,
+              budget: EscalationBudget | None = None) -> tuple[dict[str, dict], dict]:
+    """Resolve what each typed subject actually means, before any matching.
+
+    WHY THIS RUNS FIRST, AND WHY THE JUDGE COULD NOT DO IT.
+    The judge is a precision filter: it only ever sees candidates that embeddings
+    or exact tokens already surfaced, and it can only take a topic away. A
+    misspelled subject fails BEFORE any of that — "Wall Streat" embeds nowhere
+    near a market story and shares no token with one, so it surfaces nothing and
+    the model is never asked. The failure is upstream of the only place a model
+    was looking. Interpretation has to happen before candidate selection or it
+    cannot help at all.
+
+    Returns ``{original: {"name": str, "terms": [str]}}``. The ORIGINAL string
+    stays the key and stays what the user sees; only matching uses the resolved
+    form, so a wrong interpretation degrades targeting rather than silently
+    rewriting someone's preferences.
+
+    Fails open like everything else here: no reply means topics are used exactly
+    as typed, which is the behaviour that existed before this step.
+    """
+    topics = [t.strip() for t in (topics or []) if t and t.strip()]
+    if not topics:
+        return {}, {}
+    prompt = _INTERPRET_PROMPT.format(
+        fenced=wrap("\n".join(f"- {t}" for t in topics), label="READER SUBJECTS"))
+    stats: dict = {"asked": len(topics)}
+    raw = ""
+    if budget is not None and budget.remaining > 0:
+        try:
+            raw = generate_escalated(prompt, system=INTERPRET_SYSTEM, budget=budget,
+                                     temperature=0.0)
+            stats["model"] = "hosted"
+        except EscalationExhausted:
+            logger.info("no escalation budget for topic interpretation")
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("hosted topic interpretation failed (%s)", exc)
+    if not raw:
+        try:
+            raw = generate_local(prompt, system=INTERPRET_SYSTEM, temperature=0.0)
+            stats["model"] = "local"
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("local topic interpretation failed (%s)", exc)
+
+    out: dict[str, dict] = {}
+    match = re.search(r"\{.*\}", raw or "", re.S)
+    if match:
+        try:
+            data = json.loads(match.group(0))
+        except (ValueError, TypeError):
+            data = {}
+        if isinstance(data, dict):
+            for topic in topics:
+                entry = data.get(topic)
+                if not isinstance(entry, dict):
+                    continue
+                name = str(entry.get("name") or "").strip() or topic
+                terms = [str(x).strip() for x in (entry.get("terms") or [])
+                         if str(x).strip()][:5]
+                out[topic] = {"name": name, "terms": terms}
+    if not out:
+        stats["interpreted"] = False
+        return {}, stats
+    stats["interpreted"] = True
+    stats["corrected"] = {t: v["name"] for t, v in out.items()
+                          if v["name"].lower() != t.lower()}
+    return out, stats
+
+
 def _candidates_block(items: list[RawItem]) -> str:
     lines = []
     for n, it in enumerate(items, 1):

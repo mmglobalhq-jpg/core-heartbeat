@@ -89,8 +89,10 @@ def build_briefing(
     # normal path now, and a real run already spends 2 of 3 on the deep dive and
     # the editorial pass. Sharing would let topic judging starve them.
     judge_budget = EscalationBudget(limit=config.TOPIC_JUDGE_ESCALATIONS)
+    categories = {s.name: s.topic for s in sources}
     top, deep = select(items, weights=weights, top_count=count, topics=topics,
-                       calibration=calibration, budget=judge_budget)
+                       calibration=calibration, budget=judge_budget,
+                       categories=categories)
     if calibration:
         meta["topic_calibration"] = calibration
 

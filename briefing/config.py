@@ -68,6 +68,20 @@ The original 0.86 came with a comment justifying it as deliberately cautious.
 That reasoning was sound and the number was still wrong: nothing had measured
 where real duplicates actually score."""
 
+MAX_PER_CATEGORY = int(os.environ.get("BRIEFING_MAX_PER_CATEGORY", "2"))
+"""Ceiling on Top-N slots one SUBJECT AREA may hold, using each source's declared
+topic (sport, business, technology, world, science, local).
+
+MAX_PER_SOURCE alone does not bound this. On 2026-08-09, after five sports and
+local feeds were added, a real briefing came back with five of six slots on
+sport — no single outlet broke its own cap, they simply outnumbered everything
+else. Capping the outlet is not the same as capping the subject.
+
+The cap is per category rather than a special case for sport, because the same
+thing happens to whichever area gets the most feeds. Relaxed rather than enforced
+when there are too few categories to fill the list, exactly like MAX_PER_SOURCE:
+the fixed structure outranks the balance preference."""
+
 MAX_PER_SOURCE = int(os.environ.get("BRIEFING_MAX_PER_SOURCE", "2"))
 """Ceiling on Top-N slots one outlet may hold.
 
@@ -97,7 +111,7 @@ A PRECISION filter only — it can take a topic away from a story, never add one
 and it only sees candidates the embedding pass already surfaced. `0` disables it
 and returns selection to fully deterministic behaviour."""
 
-TOPIC_JUDGE_ESCALATIONS = int(os.environ.get("BRIEFING_TOPIC_JUDGE_ESCALATIONS", "1"))
+TOPIC_JUDGE_ESCALATIONS = int(os.environ.get("BRIEFING_TOPIC_JUDGE_ESCALATIONS", "2"))
 """Hosted calls the topic judge may spend, on its OWN budget.
 
 Reversing an earlier decision, deliberately. The judge first shared the

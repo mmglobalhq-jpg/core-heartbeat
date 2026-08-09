@@ -383,7 +383,8 @@ def _median(values: list[float]) -> float:
 
 def topic_relevance(items: list[RawItem], topics: list[str] | None,
                     *, vectors: dict[str, list[float]] | None = None,
-                    attribution: dict[str, dict[str, float]] | None = None
+                    attribution: dict[str, dict[str, float]] | None = None,
+                    resolved: dict | None = None
                     ) -> dict[str, float]:
     """Boost multiplier per item hash, semantic where possible.
 
@@ -424,8 +425,13 @@ def topic_relevance(items: list[RawItem], topics: list[str] | None,
         text = (raw or "").strip()
         if not text:
             continue
+        terms = match_terms(text, resolved)
+        # Embed the resolved name together with its terms: one call, and a
+        # richer vector than the raw string. "Wall Streat" alone embeds nowhere
+        # near a market story; "Wall Street, stocks, S&P 500" does.
+        probe = terms[0] if len(terms) == 1 else f"{terms[0]}. {', '.join(terms[1:])}"
         try:
-            topic_vector = embed(text)
+            topic_vector = embed(probe)
         except Exception as exc:  # noqa: BLE001 - any failure means fall back
             logger.warning("could not embed topic %r (%s); skipping it", text, exc)
             continue
@@ -451,8 +457,22 @@ def topic_relevance(items: list[RawItem], topics: list[str] | None,
     return boosts
 
 
+def match_terms(topic: str, resolved: dict | None = None) -> list[str]:
+    """Strings used to MATCH a topic. The original stays the label.
+
+    Matching uses the resolved name and its extra terms; attribution is still
+    keyed by what the reader typed, so a wrong interpretation costs targeting
+    and never silently rewrites someone's preferences.
+    """
+    entry = (resolved or {}).get(topic)
+    if not entry:
+        return [topic]
+    return [entry.get("name") or topic, *(entry.get("terms") or [])]
+
+
 def add_token_hits(items: list[RawItem], topics: list[str] | None,
-                   attribution: dict[str, dict[str, float]]) -> None:
+                   attribution: dict[str, dict[str, float]],
+                   resolved: dict | None = None) -> None:
     """Fold exact full-token matches into the same structure as the semantic pass.
 
     Both paths must live in ONE place. They were separate once and disagreed:
@@ -462,7 +482,10 @@ def add_token_hits(items: list[RawItem], topics: list[str] | None,
     for it in items:
         for raw in topics or []:
             text = (raw or "").strip()
-            if text and topic_fraction(it, [text]) >= 1.0:
+            if not text:
+                continue
+            if any(topic_fraction(it, [term]) >= 1.0
+                   for term in match_terms(text, resolved)):
                 slot = attribution.setdefault(it.hash, {})
                 slot[text] = max(slot.get(text, 1.0), TOPIC_BOOST)
 
@@ -517,7 +540,6 @@ def reserve_topic_slots(ranked: list[ScoredItem], top: list[ScoredItem],
         for s in result:
             represented |= topic_hits(s.item, attribution)
 
-        # Best-scoring outsider matching a topic nothing in the list covers.
         candidate = next(
             (s for s in ranked
              if id(s) not in chosen
@@ -527,7 +549,6 @@ def reserve_topic_slots(ranked: list[ScoredItem], top: list[ScoredItem],
         if candidate is None:
             break
 
-        # Only a story serving no topic may be displaced, weakest first.
         droppable = [s for s in result if not topic_hits(s.item, attribution)]
         if not droppable:
             break
@@ -613,33 +634,56 @@ def rank(items: list[RawItem], *, weights: dict[str, float] | None = None,
 
 
 def diversify(ranked: list[ScoredItem], *, count: int,
-              max_per_source: int | None = None) -> list[ScoredItem]:
-    """Take the best ``count`` stories without letting one outlet take them all.
+              max_per_source: int | None = None,
+              categories: dict[str, str] | None = None,
+              max_per_category: int | None = None) -> list[ScoredItem]:
+    """Take the best ``count`` stories without letting one outlet — or one
+    subject area — take them all.
 
-    Two passes. The first respects the per-outlet cap; the second backfills from
-    whatever was passed over, in score order, if there were not enough distinct
-    outlets to fill the list. Structure wins over diversity — a briefing with
-    four items would be a worse outcome than one with three items from the same
-    paper.
+    THE CATEGORY CAP EXISTS BECAUSE THE SOURCE CAP DID NOT BOUND SUBJECT MATTER.
+    After five sports and local feeds were added, a real briefing on 2026-08-09
+    came back with five of six slots on sport while no single outlet exceeded its
+    own cap — they simply outnumbered everything else. Capping the outlet is not
+    the same as capping the subject.
+
+    THREE PASSES, RELAXING THE WEAKER CONSTRAINT FIRST. A single pass plus an
+    unconstrained backfill let the category cap CAUSE a source-cap violation: the
+    category cap blocked slots in the first pass, and the backfill then filled
+    them with more items from an outlet already at its limit. Balance of subject
+    matter is the softer preference, so it gives way first. The fixed item count
+    still outranks both — a briefing with four items is worse than one with three
+    items from the same paper.
     """
     cap = config.MAX_PER_SOURCE if max_per_source is None else max_per_source
+    cat_cap = config.MAX_PER_CATEGORY if max_per_category is None else max_per_category
+    categories = categories or {}
+
+    def category_of(scored: ScoredItem) -> str:
+        return categories.get(scored.item.source_name or "") or scored.item.topic or "other"
+
     chosen: list[ScoredItem] = []
-    passed_over: list[ScoredItem] = []
     used: dict[str, int] = defaultdict(int)
+    used_cat: dict[str, int] = defaultdict(int)
+    taken: set[int] = set()
 
-    for scored in ranked:
-        source = scored.item.source_name or "unknown"
-        if len(chosen) < count and used[source] < cap:
+    def fill(respect_source: bool, respect_category: bool) -> None:
+        for index, scored in enumerate(ranked):
+            if len(chosen) >= count or index in taken:
+                continue
+            source = scored.item.source_name or "unknown"
+            category = category_of(scored)
+            if respect_source and used[source] >= cap:
+                continue
+            if respect_category and cat_cap > 0 and used_cat[category] >= cat_cap:
+                continue
             chosen.append(scored)
+            taken.add(index)
             used[source] += 1
-        else:
-            passed_over.append(scored)
+            used_cat[category] += 1
 
-    for scored in passed_over:
-        if len(chosen) >= count:
-            break
-        chosen.append(scored)
-
+    fill(respect_source=True, respect_category=True)
+    fill(respect_source=True, respect_category=False)
+    fill(respect_source=False, respect_category=False)
     return chosen[:count]
 
 
@@ -730,7 +774,8 @@ def select(items: list[RawItem], *, weights: dict[str, float] | None = None,
            topics: list[str] | None = None,
            now: dt.datetime | None = None,
            calibration: dict | None = None,
-           budget=None) -> tuple[list[ScoredItem], ScoredItem | None]:
+           budget=None,
+           categories: dict[str, str] | None = None) -> tuple[list[ScoredItem], ScoredItem | None]:
     """Pick the Top N and the Deep Dive.
 
     The Deep Dive is the best-corroborated story *below* the Top N, not the
@@ -742,9 +787,21 @@ def select(items: list[RawItem], *, weights: dict[str, float] | None = None,
     """
     # Computed here rather than inside rank() so the same scores can be reused
     # for calibration without embedding the batch a second time.
+    # Interpretation runs BEFORE matching, because a misspelled subject fails
+    # upstream of everywhere a model was previously looking: it embeds nowhere
+    # near a relevant story and shares no token with one, so it surfaces no
+    # candidates and the judge is never asked about it.
+    resolved: dict = {}
+    if topics:
+        from briefing import topic_judge
+        if topic_judge.enabled():
+            resolved, interp_stats = topic_judge.interpret(topics, budget=budget)
+            if calibration is not None and interp_stats:
+                calibration["interpret"] = interp_stats
+
     attribution: dict[str, dict[str, float]] = {}
-    topic_relevance(items, topics, attribution=attribution)
-    add_token_hits(items, topics, attribution)
+    topic_relevance(items, topics, attribution=attribution, resolved=resolved)
+    add_token_hits(items, topics, attribution, resolved)
     judge_stats = apply_topic_judge(items, topics, attribution, budget=budget)
     boosts = boosts_from(attribution)
     if calibration is not None:
@@ -758,7 +815,8 @@ def select(items: list[RawItem], *, weights: dict[str, float] | None = None,
         }
     ranked = rank(items, weights=weights, topics=topics, now=now, boosts=boosts)
     count = top_count if top_count is not None else config.TOP_COUNT
-    top = diversify(ranked, count=count, max_per_source=max_per_source)
+    top = diversify(ranked, count=count, max_per_source=max_per_source,
+                    categories=categories)
 
     # Calibration is measured on the PRE-reservation list, deliberately. A
     # reserved slot promotes a story the score did not earn, which drags the cut

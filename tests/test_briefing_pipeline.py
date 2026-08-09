@@ -1518,3 +1518,109 @@ class TestDuplicateArticlesDoNotDisableSemanticMatching:
         monkeypatch.setattr(llm, "embed", lambda t: [1.0, 0.0])
         partial = {items[0].hash: [1.0, 0.0]}        # 1 vector, 3 distinct items
         assert dedup.topic_relevance(items, ["Financial Markets"], vectors=partial) == {}
+
+
+class TestCategoryCap:
+    """MAX_PER_SOURCE bounds the outlet, not the subject. On 2026-08-09 a real
+    briefing came back with five of six slots on sport while no single outlet
+    exceeded its own cap — they simply outnumbered everything else."""
+
+    def _s(self, title, url, score, source, topic):
+        it = RawItem(url=url, title=title, source_name=source, topic=topic,
+                     summary=None, body=None, published_at=NOW, skipped_reason=None)
+        return ScoredItem(item=it, score=score, cluster_id=url, duplicates=[])
+
+    def test_one_subject_area_cannot_take_every_slot(self):
+        from briefing.dedup import diversify
+
+        ranked = [
+            self._s("S1", "https://a.example/1", 9.0, "ESPN", "sport"),
+            self._s("S2", "https://b.example/2", 8.0, "The Athletic", "sport"),
+            self._s("S3", "https://c.example/3", 7.0, "Dawg Sports", "sport"),
+            self._s("S4", "https://d.example/4", 6.0, "ESPN CFB", "sport"),
+            self._s("B1", "https://e.example/5", 5.0, "FT", "business"),
+            self._s("W1", "https://f.example/6", 4.0, "BBC", "world"),
+            self._s("T1", "https://g.example/7", 3.0, "Verge", "technology"),
+        ]
+        cats = {s.item.source_name: s.item.topic for s in ranked}
+        top = diversify(ranked, count=5, categories=cats, max_per_category=2)
+        sport = sum(1 for s in top if cats[s.item.source_name] == "sport")
+        assert sport == 2, f"sport took {sport} slots"
+        assert len(top) == 5
+
+    def test_cap_relaxes_rather_than_shrinking_the_briefing(self):
+        """Structure outranks balance: five items from one area beats four items."""
+        from briefing.dedup import diversify
+
+        ranked = [self._s(f"S{i}", f"https://a.example/{i}", 9.0 - i,
+                          f"Outlet{i}", "sport") for i in range(6)]
+        cats = {s.item.source_name: "sport" for s in ranked}
+        top = diversify(ranked, count=5, categories=cats, max_per_category=2)
+        assert len(top) == 5
+
+    def test_category_cap_never_causes_a_source_cap_violation(self):
+        """The regression that staged relaxation exists to prevent: a blocked
+        category slot backfilled with an outlet already at its limit."""
+        from briefing.dedup import diversify
+
+        ranked = [self._s(f"S{i}", f"https://big.example/{i}", 9.0 - i,
+                          "Big Outlet", "sport") for i in range(4)]
+        ranked += [self._s(f"B{i}", f"https://mid.example/{i}", 4.0 - i,
+                           f"Mid{i}", "business") for i in range(3)]
+        cats = {s.item.source_name: s.item.topic for s in ranked}
+        top = diversify(ranked, count=5, max_per_source=2, categories=cats,
+                        max_per_category=2)
+        big = sum(1 for s in top if s.item.source_name == "Big Outlet")
+        assert big <= 2, f"Big Outlet took {big} slots"
+
+
+class TestTopicInterpretation:
+    """A misspelled subject fails UPSTREAM of the judge: it embeds nowhere near a
+    relevant story and shares no token with one, so it surfaces no candidates and
+    the model is never asked about it. Interpretation has to run before matching."""
+
+    def test_corrects_a_typo_and_keeps_the_original_as_the_label(self, monkeypatch):
+        import briefing.topic_judge as tj
+
+        monkeypatch.setattr(tj, "generate_local", lambda *a, **k:
+            '{"Wall Streat": {"name": "Wall Street", "terms": ["stocks", "S&P 500"]}}')
+        resolved, stats = tj.interpret(["Wall Streat"])
+        assert resolved["Wall Streat"]["name"] == "Wall Street"
+        assert stats["corrected"] == {"Wall Streat": "Wall Street"}
+
+    def test_matching_uses_the_resolved_terms(self, monkeypatch):
+        from briefing.dedup import match_terms
+
+        resolved = {"Wall Streat": {"name": "Wall Street", "terms": ["stocks"]}}
+        assert match_terms("Wall Streat", resolved) == ["Wall Street", "stocks"]
+        assert match_terms("Unknown topic", resolved) == ["Unknown topic"]
+
+    def test_token_matching_fires_on_a_resolved_term(self, monkeypatch):
+        from briefing import dedup
+
+        it = item("Stocks climb as traders return", "https://x.example/1")
+        attribution = {}
+        resolved = {"Wall Streat": {"name": "Wall Street", "terms": ["stocks"]}}
+        dedup.add_token_hits([it], ["Wall Streat"], attribution, resolved)
+        assert "Wall Streat" in attribution[it.hash]   # labelled as typed
+
+    def test_fails_open_when_the_model_does_not_answer(self, monkeypatch):
+        import briefing.topic_judge as tj
+
+        def boom(*a, **k):
+            raise RuntimeError("unreachable")
+
+        monkeypatch.setattr(tj, "generate_local", boom)
+        resolved, stats = tj.interpret(["Wall Streat"])
+        assert resolved == {}
+        assert stats["interpreted"] is False
+
+    def test_never_reinterprets_into_a_different_subject(self, monkeypatch):
+        """A model returning something for a topic we did not ask about, or a
+        non-dict, must be ignored rather than trusted."""
+        import briefing.topic_judge as tj
+
+        monkeypatch.setattr(tj, "generate_local", lambda *a, **k:
+            '{"Something else": {"name": "Nonsense", "terms": []}, "AI": "not-a-dict"}')
+        resolved, _ = tj.interpret(["AI"])
+        assert resolved == {}
