@@ -125,6 +125,23 @@ LLM_TIMEOUT_S = float(os.environ.get("BRIEFING_LLM_TIMEOUT_S", "120"))
 DEFAULT_TIMEZONE = os.environ.get("BRIEFING_TIMEZONE", "America/Chicago")
 """Matches the platform default set on 2026-08-05."""
 
+LEAD_MINUTES = int(os.environ.get("BRIEFING_LEAD_MINUTES", "6"))
+"""Start generating this many minutes BEFORE the user's delivery time.
+
+`deliver_at` is what the user reads as "when the briefing arrives", but the job
+only ever asked whether that time had already *passed* — so the work started at
+the target and the email landed however long generation took after it. Measured
+on 2026-08-08: `deliver_at` 06:30, delivered 07:13.
+
+Generation took 3m56s and 6m06s on the two real runs before this was written, so
+6 minutes lands the email on the target rather than after it. Combined with a
+5-minute timer tick the arrival window is [deliver_at, deliver_at + ~5min]: the
+earliest a tick can fire is `deliver_at - LEAD`, which finishes no sooner than
+the target, so a briefing is never delivered EARLY.
+
+Raising this above the tick interval is what makes early delivery possible —
+that is the knob to be careful with, not the lower bound."""
+
 EMAIL_PROVIDER = os.environ.get("BRIEFING_EMAIL_PROVIDER", "file")
 """'file' writes rendered output to disk; 'resend' sends for real. Defaults to
 'file' so that a misconfigured environment cannot email anyone by accident."""

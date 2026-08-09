@@ -1141,3 +1141,58 @@ class TestRobotsWildcards:
         from briefing.sources import _Rules
 
         assert _Rules(deny_all=True).can_fetch("https://a.example/anything") is False
+
+
+class TestDeliveryLead:
+    """`deliver_at` is a DELIVERY time, not a start time.
+
+    Measured 2026-08-08: deliver_at 06:30, hourly tick at :05, generation 6m06s
+    -> delivered 07:13, 43 minutes late, every single day.
+    """
+
+    def test_generation_starts_before_the_delivery_time(self):
+        from briefing.schedule import start_time
+
+        assert start_time(dt.time(6, 30), 6) == dt.time(6, 24)
+        assert start_time(dt.time(9, 0), 6) == dt.time(8, 54)
+
+    def test_lead_is_dropped_rather_than_wrapped_past_midnight(self):
+        """Wrapping would make the user due on the PREVIOUS local date, and
+        briefing_date is derived from the current local date — so it would file
+        under yesterday and then generate a second briefing after midnight."""
+        from briefing.schedule import start_time
+
+        assert start_time(dt.time(0, 3), 6) == dt.time(0, 3)
+        assert start_time(dt.time(0, 0), 6) == dt.time(0, 0)
+        # exactly at the boundary the lead still applies
+        assert start_time(dt.time(0, 6), 6) == dt.time(0, 0)
+
+    def test_zero_lead_preserves_the_old_behaviour(self):
+        from briefing.schedule import start_time
+
+        assert start_time(dt.time(6, 30), 0) == dt.time(6, 30)
+
+    def test_user_is_due_before_their_delivery_time_but_not_too_early(self):
+        from zoneinfo import ZoneInfo
+
+        from briefing.schedule import is_due
+
+        prefs = {"timezone": "America/Chicago", "deliver_at": "06:30"}
+        tz = ZoneInfo("America/Chicago")
+
+        def at(h, m):
+            return dt.datetime(2026, 8, 10, h, m, tzinfo=tz)
+
+        assert is_due(prefs, existing_dates=set(), now=at(6, 24)) is True
+        assert is_due(prefs, existing_dates=set(), now=at(6, 30)) is True
+        assert is_due(prefs, existing_dates=set(), now=at(6, 23)) is False
+        assert is_due(prefs, existing_dates=set(), now=at(5, 0)) is False
+
+    def test_an_existing_ready_briefing_still_wins(self):
+        from zoneinfo import ZoneInfo
+
+        from briefing.schedule import is_due
+
+        prefs = {"timezone": "America/Chicago", "deliver_at": "06:30"}
+        now = dt.datetime(2026, 8, 10, 6, 24, tzinfo=ZoneInfo("America/Chicago"))
+        assert is_due(prefs, existing_dates={"2026-08-10"}, now=now) is False

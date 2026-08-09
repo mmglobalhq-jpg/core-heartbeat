@@ -55,11 +55,36 @@ def parse_time(value: str) -> dt.time:
         return dt.time(6, 30)
 
 
+def start_time(deliver_at: dt.time, lead_minutes: int | None = None) -> dt.time:
+    """When generation should BEGIN so delivery lands on ``deliver_at``.
+
+    ``deliver_at`` is what the user reads as "when it arrives", so the work has
+    to start before it, not at it.
+
+    THE LEAD IS DROPPED RATHER THAN WRAPPED when it would cross midnight. A
+    05-minute lead on a 00:03 delivery time would make the user due at 23:58 the
+    PREVIOUS day, and both ``due_users`` and ``build_briefing`` derive
+    ``briefing_date`` from the current local date — so it would file the briefing
+    under yesterday, then come due again after midnight and generate a second one
+    for today. The unique constraint would not catch that, because the two rows
+    have different dates. Nobody has a delivery time in that window today; this
+    is here so that nobody discovers it by receiving two briefings.
+    """
+    lead = config.LEAD_MINUTES if lead_minutes is None else lead_minutes
+    if lead <= 0:
+        return deliver_at
+    total = deliver_at.hour * 60 + deliver_at.minute
+    if total < lead:
+        return deliver_at
+    shifted = total - lead
+    return dt.time(shifted // 60, shifted % 60)
+
+
 def is_due(prefs: dict, *, existing_dates: set[str], now: dt.datetime | None = None) -> bool:
     """Should this user get a briefing on this tick?
 
-    Due when the user's local wall clock has passed their delivery time and no
-    briefing exists for their local date.
+    Due when the user's local wall clock has reached their delivery time MINUS
+    the generation lead, and no briefing exists for their local date.
 
     Note what is deliberately absent: any "did we already try recently" state.
     The only thing consulted is whether the briefing EXISTS. A failed attempt
@@ -68,7 +93,8 @@ def is_due(prefs: dict, *, existing_dates: set[str], now: dt.datetime | None = N
     """
     timezone = prefs.get("timezone")
     current = now.astimezone(zone(timezone)) if now else local_now(timezone)
-    if current.timetz().replace(tzinfo=None) < parse_time(prefs.get("deliver_at", "06:30")):
+    begin = start_time(parse_time(prefs.get("deliver_at", "06:30")))
+    if current.timetz().replace(tzinfo=None) < begin:
         return False
     return current.date().isoformat() not in existing_dates
 
