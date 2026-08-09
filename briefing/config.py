@@ -97,6 +97,19 @@ A PRECISION filter only — it can take a topic away from a story, never add one
 and it only sees candidates the embedding pass already surfaced. `0` disables it
 and returns selection to fully deterministic behaviour."""
 
+TOPIC_JUDGE_ESCALATIONS = int(os.environ.get("BRIEFING_TOPIC_JUDGE_ESCALATIONS", "1"))
+"""Hosted calls the topic judge may spend, on its OWN budget.
+
+Reversing an earlier decision, deliberately. The judge first shared the
+briefing's `EscalationBudget`, argued as a safety property: one ceiling, and
+adding topics could not raise it. Measurement changed the picture — the local
+model is not reliable enough for this task, so the hosted call is the normal
+path, not the exception. Sharing then means the judge spends budget that
+`compose_deep_dive` and the editorial pass need, and a real run already uses 2 of
+3. A separate budget of 1 keeps the judge from starving composition, and the
+combined single-call prompt keeps it at 1 regardless of how many topics a person
+follows."""
+
 TOPIC_JUDGE_CANDIDATES = int(os.environ.get("BRIEFING_TOPIC_JUDGE_CANDIDATES", "8"))
 """Stories per topic sent to the judge. Bounds cost: one local call per topic
 carrying at most this many headlines."""

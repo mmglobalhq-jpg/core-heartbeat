@@ -85,8 +85,12 @@ def build_briefing(
     weights = {s.name: s.weight for s in sources}
     count = top_count if top_count is not None else config.TOP_COUNT
     calibration: dict = {}
+    # Its own budget, not the composition one: the judge's hosted call is the
+    # normal path now, and a real run already spends 2 of 3 on the deep dive and
+    # the editorial pass. Sharing would let topic judging starve them.
+    judge_budget = EscalationBudget(limit=config.TOPIC_JUDGE_ESCALATIONS)
     top, deep = select(items, weights=weights, top_count=count, topics=topics,
-                       calibration=calibration, budget=budget)
+                       calibration=calibration, budget=judge_budget)
     if calibration:
         meta["topic_calibration"] = calibration
 
@@ -129,6 +133,7 @@ def build_briefing(
     validate_structure(sections, top_count=count)
 
     meta["escalations_used"] = budget.spent
+    meta["judge_escalations_used"] = judge_budget.spent
     meta["escalation_limit"] = budget.limit
     meta["finished_at"] = dt.datetime.now(dt.UTC).isoformat()
 

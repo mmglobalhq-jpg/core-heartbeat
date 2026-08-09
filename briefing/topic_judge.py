@@ -55,15 +55,32 @@ from briefing.untrusted import wrap
 
 logger = logging.getLogger(__name__)
 
+PROMPT_VERSION = "2026-08-09.3"
+"""Bumped whenever the wording below changes, and recorded in run_meta.
+
+v1 was too strict and it took a live run to see it: told to "be strict" and to
+include a story only if it was "really about" the subject, the model kept 3 of 8
+for "Financial Markets" and struck the Lisa Cook story from "Mortgages" even
+though the piece turned on mortgage-fraud allegations. Reading a subject as
+"the headline is exclusively this" throws away most of what a person following
+that subject actually wants. v2 asks the question the reader asks — would
+someone following this want to see it — while keeping the distinction that
+made the judge worth having: a shared word is not a shared subject."""
+
 SYSTEM = (
-    "You classify news stories by subject for a personal news briefing. "
-    "You are given one subject and a numbered list of story headlines. "
-    "Decide which stories are genuinely ABOUT that subject. "
-    "Use your knowledge of what the subject refers to: abbreviations, "
-    "institutions, people associated with it, and the difference between "
-    "sports, leagues and organisations that share a word. "
-    "Be strict. A story that merely shares a word with the subject is not about "
-    "it. Reply with JSON only, no prose."
+    "You curate a personal news briefing. You are given one subject and a "
+    "numbered list of story headlines. Decide which stories a person who follows "
+    "that subject would want to see. "
+    "Include a story when the subject is a real part of it — the main subject, a "
+    "significant element, or a direct cause or consequence of it. The story does "
+    "not have to be exclusively about the subject, and it does not have to use "
+    "the same words. "
+    "Exclude a story that shares only a word or a surface association. Different "
+    "sports, leagues, organisations, companies or senses of a word are different "
+    "subjects. "
+    "Use what you know about the subject: abbreviations, institutions, people, "
+    "teams, places and events associated with it. "
+    "Reply with JSON only, no prose."
 )
 
 _PROMPT = """Subject: {topic}
@@ -74,10 +91,14 @@ Below is a numbered list of candidate story headlines.
 
 For the subject "{topic}", return JSON of exactly this shape and nothing else:
 
-{{"relevant": [<numbers of the stories genuinely about the subject>]}}
+{{"relevant": [<numbers of the stories worth showing>]}}
 
-Include a number only if the story is really about that subject. If none of them
-are, return {{"relevant": []}}. Do not explain."""
+Include a story if someone following "{topic}" would want to read it — the
+subject can be the main story, a significant part of it, or a direct cause or
+consequence. Leave out stories that merely share a word with it, or that are
+about a different sport, league, organisation or sense of the word. When a story
+is genuinely borderline, include it. If none qualify, return {{"relevant": []}}.
+Do not explain."""
 
 
 def _candidates_block(items: list[RawItem]) -> str:
@@ -122,61 +143,118 @@ def _parse(reply: str, count: int) -> set[int] | None:
     return out
 
 
-def judge_topic(topic: str, items: list[RawItem], *,
-                budget: EscalationBudget | None = None) -> set[str] | None:
-    """Item hashes genuinely about ``topic``. None if the model did not answer."""
-    if not items:
-        return set()
-    prompt = _PROMPT.format(
-        topic=topic,
-        fenced=wrap(_candidates_block(items), label="CANDIDATE HEADLINES"),
-    )
-    reply = ""
-    try:
-        reply = generate_local(prompt, system=SYSTEM, temperature=0.0)
-    except Exception as exc:  # noqa: BLE001 — any local failure is escalatable
-        logger.warning("local topic judge failed for %r (%s)", topic, exc)
+def _combined_prompt(items_by_topic: dict[str, list[RawItem]]) -> str:
+    """One prompt covering every topic.
 
-    picked = _parse(reply, len(items))
-    if picked is None and budget is not None and budget.remaining > 0:
-        logger.info("local judge unusable for %r; escalating", topic)
-        try:
-            reply = generate_escalated(prompt, system=SYSTEM, budget=budget,
-                                       temperature=0.0)
-            picked = _parse(reply, len(items))
-        except EscalationExhausted:
-            logger.info("no escalation budget left for topic judging")
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("escalated topic judge failed for %r (%s)", topic, exc)
+    Deliberately not one call per topic. Measurement forced this: the local model
+    is not reliable enough for the task (it returned unparseable JSON for one
+    topic and wrongly kept zero for another, where the hosted model got both
+    right), so the hosted model has to be reachable in the normal path — and at
+    one call per topic that would cost an escalation per topic and scale with how
+    many subjects someone follows. Combined, the whole pass is ONE call however
+    many topics there are.
+    """
+    blocks = []
+    for topic, items in items_by_topic.items():
+        blocks.append(f"### Subject: {topic}\n{_candidates_block(items)}")
+    body = "\n\n".join(blocks)
+    return f"""You are given several subjects, each with its own numbered list of
+candidate story headlines.
 
-    if picked is None:
+{wrap(body, label="CANDIDATE HEADLINES")}
+
+Return JSON of exactly this shape and nothing else, with one key per subject
+exactly as written above:
+
+{{"<subject>": [<numbers worth showing for that subject>]}}
+
+Numbering restarts at 1 within each subject. Include a story if someone
+following that subject would want to read it — the subject can be the main
+story, a significant part of it, or a direct cause or consequence. Leave out
+stories that merely share a word, or that are about a different sport, league,
+organisation or sense of the word. When a story is genuinely borderline,
+include it. A subject with nothing relevant gets an empty list. Do not explain."""
+
+
+def _parse_combined(reply: str, items_by_topic: dict[str, list[RawItem]]
+                    ) -> dict[str, set[str]] | None:
+    """Topic -> confirmed item hashes, or None if the reply was unusable."""
+    if not reply:
         return None
-    return {items[n - 1].hash for n in picked}
+    match = re.search(r"\{.*\}", reply, re.S)
+    if not match:
+        return None
+    try:
+        data = json.loads(match.group(0))
+    except (ValueError, TypeError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    out: dict[str, set[str]] = {}
+    for topic, items in items_by_topic.items():
+        raw = data.get(topic)
+        if not isinstance(raw, list):
+            continue          # topic absent from the reply: leave it untouched
+        kept: set[str] = set()
+        for value in raw:
+            try:
+                n = int(value)
+            except (ValueError, TypeError):
+                continue
+            if 1 <= n <= len(items):
+                kept.add(items[n - 1].hash)
+        out[topic] = kept
+    return out or None
 
 
 def judge(items_by_topic: dict[str, list[RawItem]], *,
           budget: EscalationBudget | None = None) -> tuple[dict[str, set[str]], dict]:
-    """Confirm each topic's candidates.
+    """Confirm every topic's candidates in one pass.
 
-    Returns ``(confirmed, stats)`` where ``confirmed`` maps topic -> item hashes
-    the model kept. A topic missing from ``confirmed`` was not judged (model
-    unavailable) and its candidates must be left exactly as they were.
+    HOSTED FIRST, and that is a change of position made on measurement rather
+    than preference. The first version tried local and escalated only when the
+    reply would not parse. On real headlines the local model produced unparseable
+    JSON for one topic and confidently kept ZERO for another where the hosted
+    model kept the right story — and a confidently wrong answer never triggers
+    escalation, so the bad verdict simply stood. Local remains the fallback, so a
+    briefing still gets some judging with no hosted key or no budget left.
     """
-    confirmed: dict[str, set[str]] = {}
-    stats: dict[str, dict] = {}
-    for topic, candidates in items_by_topic.items():
-        kept = judge_topic(topic, candidates, budget=budget)
-        if kept is None:
-            stats[topic] = {"candidates": len(candidates), "judged": False}
-            continue
-        confirmed[topic] = kept
-        stats[topic] = {
-            "candidates": len(candidates),
-            "kept": len(kept),
-            "rejected": len(candidates) - len(kept),
-            "judged": True,
-        }
-    return confirmed, {"topics": stats, "enabled": True}
+    if not items_by_topic:
+        return {}, {}
+
+    prompt = _combined_prompt(items_by_topic)
+    stats: dict = {"prompt": PROMPT_VERSION, "enabled": True,
+                   "candidates": {t: len(v) for t, v in items_by_topic.items()}}
+    verdict = None
+
+    if budget is not None and budget.remaining > 0:
+        try:
+            verdict = _parse_combined(
+                generate_escalated(prompt, system=SYSTEM, budget=budget, temperature=0.0),
+                items_by_topic)
+            stats["model"] = "hosted"
+        except EscalationExhausted:
+            logger.info("no escalation budget for topic judging; using local")
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("hosted topic judge failed (%s); falling back to local", exc)
+
+    if verdict is None:
+        try:
+            verdict = _parse_combined(
+                generate_local(prompt, system=SYSTEM, temperature=0.0), items_by_topic)
+            stats["model"] = "local"
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("local topic judge failed (%s)", exc)
+
+    if verdict is None:
+        # Fail open: every candidate keeps the topic it already had.
+        stats["judged"] = False
+        stats["model"] = stats.get("model", "none")
+        return {}, stats
+
+    stats["judged"] = True
+    stats["kept"] = {t: len(v) for t, v in verdict.items()}
+    return verdict, stats
 
 
 def enabled() -> bool:
