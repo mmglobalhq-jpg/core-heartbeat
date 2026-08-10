@@ -8,15 +8,29 @@ tool touched ``briefing_prefs``, ``briefings`` or ``briefing_user_sources``, and
 those tables are not in the vault or the knowledge base either. This closes that
 gap and nothing else; the pipeline is untouched.
 
-READS ARE FREE; THE TWO WRITERS GO THROUGH THE CONFIRMATION GATE
-`add_briefing_topic` and `remove_briefing_topic` are registered in
-``WRITE_TOOLS``, so the supervisor proposes them and nothing happens until the
-user approves. That is not decoration — it is what makes "yes" work. The first
+READS ARE FREE; THE WRITERS ARE IN ``WRITE_TOOLS`` — WHICH IS NOT THE SAME AS
+"ALWAYS CONFIRMED", AND THE DIFFERENCE WAS MEASURED, NOT ASSUMED
+Membership gates a write through ``_needs_confirmation``, which proposes a batch
+only at ``WRITE_CONFIRM_THRESHOLD`` (3) or more writes, or for a tool in
+``ALWAYS_CONFIRM_TOOLS``. So a SINGLE "add baseball cards" runs immediately and
+answers in one turn — verified on the deployed build, where the trace read
+``gate.passthrough`` rather than ``gate.PROPOSE``. An earlier version of this
+docstring claimed nothing happens until the user approves; that was wrong for the
+one-topic case, which is the common one.
+
+That policy is right here rather than merely inherited: a topic add is undone by
+``remove_briefing_topic`` in one sentence, so proposing it would add a round trip
+to protect against something trivially reversible. Deleting a calendar event is
+in ``ALWAYS_CONFIRM_TOOLS`` because it is not. If topic writes ever become
+destructive — dropping every topic at once, say — they belong in that set too.
+
+WHAT THE WRITERS FIXED. The first
 version of this module was read-only, and when a user asked to add a topic the
 assistant offered to do it, no plan was ever proposed because no write tool
 existed, and the approval then found nothing to confirm: "I don't have a record
 of your previous request." The gate was right to refuse; the missing tool was the
-defect.
+defect. With a writer present the router now calls it on the first turn and the
+question never arises.
 
 Still deliberately absent: changing the delivery time, the timezone, the email
 address, or triggering a run. Those change WHEN and WHETHER a real person is
