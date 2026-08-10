@@ -46,6 +46,7 @@ from tools.web_tools import WEB_TOOL_REGISTRY, run_web_tool
 from tools.graphrag import GRAPHRAG_TOOL_REGISTRY, kb_configured, run_graphrag_tool
 from tools.google_calendar import CALENDAR_TOOL_REGISTRY, run_calendar_tool
 from tools.catalog import ALL_TOOLS, WRITE_TOOLS
+from tools.daily_briefing import BRIEFING_TOOL_REGISTRY, run_briefing_tool
 from tools.reit_research import (
     REIT_TOOL_REGISTRY,
     looks_like_reit_reference,
@@ -245,6 +246,7 @@ DISPATCHABLE_TOOLS = frozenset(
     | set(GRAPHRAG_TOOL_REGISTRY)
     | set(CALENDAR_TOOL_REGISTRY)
     | set(REIT_TOOL_REGISTRY)
+    | set(BRIEFING_TOOL_REGISTRY)
     | set(WEB_TOOL_REGISTRY)
 )
 
@@ -2044,6 +2046,11 @@ def _dispatch_tool(name: str, args: dict, user_id: str) -> tuple[str, list[str] 
     if name in REIT_TOOL_REGISTRY:
         # Read-only and global; user_id threaded only for a uniform signature.
         return run_reit_tool(name, user_id, args), None
+    if name in BRIEFING_TOOL_REGISTRY:
+        # Per-user, and unlike the REIT tools that is the security boundary:
+        # every query filters on this user_id. The service-role key bypasses RLS,
+        # so the filter IS the isolation.
+        return run_briefing_tool(name, user_id, args), None
     if name in TOOL_REGISTRY:
         return run_vault_tool(name, user_id, args), None
     if name in WEB_TOOL_REGISTRY:

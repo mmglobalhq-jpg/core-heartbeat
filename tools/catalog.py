@@ -34,6 +34,7 @@ from typing import Annotated
 from langchain_core.tools import tool
 from langgraph.prebuilt import InjectedState
 
+from tools.daily_briefing import run_briefing_tool
 from tools.google_calendar import run_calendar_tool
 from tools.graphrag import run_graphrag_tool
 from tools.reit_research import run_reit_tool
@@ -301,6 +302,59 @@ def fetch_url(url: str, state: Annotated[dict, InjectedState]) -> str:
 
 # --- the catalog ------------------------------------------------------------
 
+@tool
+def get_briefing_preferences(state: Annotated[dict, InjectedState]) -> str:
+    """The user's daily briefing settings: which topics they follow, what time it
+    is delivered, their timezone, and whether it is emailed. Takes no arguments.
+
+    Use for "what topics am I following", "what's on my daily brief", "when does
+    my briefing arrive". Read-only — it cannot change any setting.
+    """
+    return run_briefing_tool("get_briefing_preferences", _uid(state), {})
+
+
+@tool
+def list_briefing_sources(state: Annotated[dict, InjectedState]) -> str:
+    """List the news feeds the user added to their own daily briefing, on top of
+    the platform's default feeds. Takes no arguments.
+
+    Use for "what feeds do I have", "where does my briefing get news from".
+    """
+    return run_briefing_tool("list_briefing_sources", _uid(state), {})
+
+
+@tool
+def get_latest_briefing(
+    state: Annotated[dict, InjectedState],
+    briefing_date: str | None = None,
+) -> str:
+    """Read the user's most recent daily briefing in full — the Top stories and
+    the Deep Dive, with sources.
+
+    Pass briefing_date as YYYY-MM-DD for a specific day; omit it for the latest.
+    Use for "what was in my briefing", "what did my brief say today".
+    """
+    args = {"briefing_date": briefing_date} if briefing_date else {}
+    return run_briefing_tool("get_latest_briefing", _uid(state), args)
+
+
+@tool
+def search_briefings(
+    query: str,
+    state: Annotated[dict, InjectedState],
+    limit: int | None = None,
+) -> str:
+    """Search headlines across the user's past daily briefings.
+
+    Use for "did my briefing cover the Fed", "have I seen anything about Georgia
+    football lately". Matches on headline text only.
+    """
+    args: dict = {"query": query}
+    if limit is not None:
+        args["limit"] = limit
+    return run_briefing_tool("search_briefings", _uid(state), args)
+
+
 ALL_TOOLS = [
     read_user_note,
     search_user_vault,
@@ -314,6 +368,10 @@ ALL_TOOLS = [
     list_reit_reports,
     get_reit_report,
     get_latest_reit_report,
+    get_briefing_preferences,
+    list_briefing_sources,
+    get_latest_briefing,
+    search_briefings,
     search_web,
     fetch_url,
 ]
