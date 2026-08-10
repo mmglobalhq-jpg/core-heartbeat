@@ -56,11 +56,19 @@ def test_every_tool_has_a_description():
 
 
 def test_write_tools_are_exactly_the_mutating_ones():
+    # Deliberately an explicit literal, not derived. Adding a tool that changes
+    # something must be a conscious edit here, because membership is what puts it
+    # behind the confirmation gate — a mutating tool omitted from this set runs
+    # without ever asking.
     assert WRITE_TOOLS == {
         "write_user_note",
         "create_calendar_event",
         "update_calendar_event",
         "delete_calendar_event",
+        # Change what the briefing covers. Delivery time, timezone and email
+        # address are deliberately NOT writable by chat.
+        "add_briefing_topic",
+        "remove_briefing_topic",
     }
     assert WRITE_TOOLS <= CATALOG_TOOL_NAMES
 

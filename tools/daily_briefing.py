@@ -8,12 +8,20 @@ tool touched ``briefing_prefs``, ``briefings`` or ``briefing_user_sources``, and
 those tables are not in the vault or the knowledge base either. This closes that
 gap and nothing else; the pipeline is untouched.
 
-STRICTLY READ-ONLY, ON PURPOSE
-Nothing here edits a topic, adds a feed, changes a delivery time or triggers a
-run. Preferences are the input to a scheduled job that emails a real person, so
-changing them by conversation should be a deliberate act behind the write gate
-rather than a side effect of a chat turn. Adding writes later means adding them
-to ``WRITE_TOOLS`` as well — see doc 29 §3.
+READS ARE FREE; THE TWO WRITERS GO THROUGH THE CONFIRMATION GATE
+`add_briefing_topic` and `remove_briefing_topic` are registered in
+``WRITE_TOOLS``, so the supervisor proposes them and nothing happens until the
+user approves. That is not decoration — it is what makes "yes" work. The first
+version of this module was read-only, and when a user asked to add a topic the
+assistant offered to do it, no plan was ever proposed because no write tool
+existed, and the approval then found nothing to confirm: "I don't have a record
+of your previous request." The gate was right to refuse; the missing tool was the
+defect.
+
+Still deliberately absent: changing the delivery time, the timezone, the email
+address, or triggering a run. Those change WHEN and WHETHER a real person is
+emailed, rather than what the briefing is about, and belong in settings where
+they are seen rather than in a sentence.
 
 BRIEFINGS ARE PER USER, UNLIKE REIT REPORTS
 ``tools/reit_research.py`` accepts ``user_id`` for a uniform dispatch signature
@@ -96,6 +104,24 @@ def _uid(user_id: str) -> str:
     if not _UUID.match(value):
         raise _BriefingError("no valid user id in session")
     return value
+
+
+def _topics(uid: str) -> list[str]:
+    rows = _get("/briefing_prefs", {"user_id": f"eq.{uid}", "select": "topics"})
+    if not rows:
+        raise _BriefingError("you have no daily briefing preferences yet")
+    return list(rows[0].get("topics") or [])
+
+
+def _write_topics(uid: str, topics: list[str]) -> None:
+    with _client() as client:
+        response = client.patch(
+            "/briefing_prefs", params={"user_id": f"eq.{uid}"},
+            json={"topics": topics},
+            headers={"Content-Type": "application/json", "Prefer": "return=minimal"},
+        )
+    if response.status_code >= 400:
+        raise _BriefingError(f"could not save topics (HTTP {response.status_code})")
 
 
 def _get(path: str, params: dict) -> list[dict]:
@@ -232,6 +258,49 @@ def search_briefings(user_id: str, args: dict) -> str:
     return "\n".join(out)
 
 
+# --- writers (confirmation-gated) -------------------------------------------
+
+MAX_TOPICS = 40
+"""A ceiling, not a preference. Every topic costs candidate selection work and
+enlarges the judge prompt; at 11 topics the model already began omitting keys
+from its reply. Refusing at a limit is better than degrading silently."""
+
+
+def add_briefing_topic(user_id: str, args: dict) -> str:
+    """Add one topic. Idempotent, case-insensitive, order preserved."""
+    uid = _uid(user_id)
+    topic = ((args or {}).get("topic") or "").strip()
+    if not topic:
+        return "error: topic is required"
+    if len(topic) > 60:
+        return "error: that topic is too long (60 characters max)"
+    current = _topics(uid)
+    if any(t.strip().lower() == topic.lower() for t in current):
+        return f"{topic!r} is already on your briefing. Nothing changed."
+    if len(current) >= MAX_TOPICS:
+        return (f"You already follow {len(current)} topics, which is the maximum. "
+                "Remove one first.")
+    _write_topics(uid, current + [topic])
+    return (f"Added {topic!r} to your daily briefing. You now follow "
+            f"{len(current) + 1} topics; it will be used from the next briefing.")
+
+
+def remove_briefing_topic(user_id: str, args: dict) -> str:
+    """Remove one topic, matched case-insensitively."""
+    uid = _uid(user_id)
+    topic = ((args or {}).get("topic") or "").strip()
+    if not topic:
+        return "error: topic is required"
+    current = _topics(uid)
+    kept = [t for t in current if t.strip().lower() != topic.lower()]
+    if len(kept) == len(current):
+        return (f"{topic!r} is not on your briefing, so nothing changed. "
+                f"You follow: {', '.join(current) or '(none)'}.")
+    _write_topics(uid, kept)
+    return (f"Removed {topic!r} from your daily briefing. You now follow "
+            f"{len(kept)} topics.")
+
+
 # --- dispatch (name -> callable(user_id, args) -> str) ----------------------
 
 _DISPATCH = {
@@ -239,7 +308,13 @@ _DISPATCH = {
     "list_briefing_sources": list_briefing_sources,
     "get_latest_briefing": get_latest_briefing,
     "search_briefings": search_briefings,
+    "add_briefing_topic": add_briefing_topic,
+    "remove_briefing_topic": remove_briefing_topic,
 }
+
+BRIEFING_WRITE_TOOLS = frozenset({"add_briefing_topic", "remove_briefing_topic"})
+"""Declared here, next to the implementations, and imported by tools/catalog.py.
+A write tool that is not in WRITE_TOOLS runs without confirmation."""
 
 BRIEFING_TOOL_REGISTRY = frozenset(_DISPATCH)
 

@@ -34,7 +34,7 @@ from typing import Annotated
 from langchain_core.tools import tool
 from langgraph.prebuilt import InjectedState
 
-from tools.daily_briefing import run_briefing_tool
+from tools.daily_briefing import BRIEFING_WRITE_TOOLS, run_briefing_tool
 from tools.google_calendar import run_calendar_tool
 from tools.graphrag import run_graphrag_tool
 from tools.reit_research import run_reit_tool
@@ -355,6 +355,28 @@ def search_briefings(
     return run_briefing_tool("search_briefings", _uid(state), args)
 
 
+@tool
+def add_briefing_topic(topic: str, state: Annotated[dict, InjectedState]) -> str:
+    """Add a topic to the user's daily briefing so future briefings cover it.
+
+    Use whenever the user asks to add, follow, track or start covering something
+    in their brief — "add baseball cards", "follow the Fed", "I want more about
+    Georgia football". One topic per call; call it repeatedly for several.
+    This CHANGES a setting, so it is proposed for confirmation before it runs.
+    """
+    return run_briefing_tool("add_briefing_topic", _uid(state), {"topic": topic})
+
+
+@tool
+def remove_briefing_topic(topic: str, state: Annotated[dict, InjectedState]) -> str:
+    """Remove a topic from the user's daily briefing.
+
+    Use for "stop covering X", "drop X from my brief", "I don't care about X any
+    more". This CHANGES a setting, so it is proposed for confirmation first.
+    """
+    return run_briefing_tool("remove_briefing_topic", _uid(state), {"topic": topic})
+
+
 ALL_TOOLS = [
     read_user_note,
     search_user_vault,
@@ -372,6 +394,8 @@ ALL_TOOLS = [
     list_briefing_sources,
     get_latest_briefing,
     search_briefings,
+    add_briefing_topic,
+    remove_briefing_topic,
     search_web,
     fetch_url,
 ]
@@ -382,6 +406,7 @@ CATALOG_TOOL_NAMES = frozenset(TOOLS_BY_NAME)
 # Tools that CHANGE something. Used to gate confirmation/batching policy — a plan
 # that only reads can run freely; one that writes should be shown to the user first.
 WRITE_TOOLS = frozenset({
+    *BRIEFING_WRITE_TOOLS,
     "write_user_note",
     "create_calendar_event",
     "update_calendar_event",

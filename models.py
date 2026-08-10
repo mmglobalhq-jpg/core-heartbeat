@@ -177,6 +177,7 @@ class RoutingDecision(BaseModel):
         # daily briefing (per-user, read-only)
         "get_briefing_preferences", "list_briefing_sources",
         "get_latest_briefing", "search_briefings",
+        "add_briefing_topic", "remove_briefing_topic",
     ] | None = None
     tool_args: ToolArgs = Field(default_factory=ToolArgs)
 
