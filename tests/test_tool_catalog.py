@@ -481,3 +481,74 @@ def test_native_prompt_tells_the_router_what_to_do_when_nothing_fits():
     prompt = orchestrator._build_native_prompt(state)
     assert "no tool can do it, call NOTHING" in prompt
     assert "Never promise an action you did not call a tool for" in prompt
+
+
+def test_capabilities_block_lists_every_tool_family():
+    """Hand-written, this list silently omitted the daily briefing after those
+    tools shipped, so the composer promised to change the delivery time — which
+    no tool does."""
+    import orchestrator
+    from tools.catalog import ALL_TOOLS
+
+    block = orchestrator.capabilities_block()
+    for tool in ALL_TOOLS:
+        assert tool.name in block, f"{tool.name} missing from the capabilities block"
+
+
+def test_capabilities_block_states_the_briefing_limits():
+    """A family appearing as a capability is exactly what let it over-promise."""
+    import orchestrator
+
+    block = orchestrator.capabilities_block()
+    assert "CANNOT change the daily briefing's delivery time" in block
+    assert "Topics you CAN add and remove" in block
+
+
+class TestMemoryRefusesToolOwnedState:
+    """A user was told "your daily brief is sent at 5 AM" when it was 06:30.
+    Nothing hallucinated: the extractor had stored `briefing delivery time: 5 AM`
+    at confidence 0.90, and the profile block injects such entries as durable
+    ground truth that must NOT be checked with a tool. A stale cache outranked
+    the system of record permanently."""
+
+    def test_rejects_settings_a_tool_owns(self):
+        from orchestrator import is_tool_owned_state
+
+        for key, value in [
+            ("briefing delivery time", "5 AM"),
+            ("Daily brief send time", "5 AM"),
+            ("daily_brief_topic", "card collecting"),
+            ("daily brief topics", "AI, Memphis"),
+            ("briefing topics", "Wall Street"),
+            ("next meeting", "Tuesday 9am"),
+            ("calendar event", "dentist"),
+        ]:
+            assert is_tool_owned_state(key, value), f"{key} was not refused"
+
+    def test_keeps_genuine_durable_preferences(self):
+        from orchestrator import is_tool_owned_state
+
+        for key, value in [
+            ("Favorite Sports Team", "UGA football"),
+            ("preferred tone", "concise"),
+            ("tech stack", "Python and Postgres"),
+            ("timezone", "America/Chicago"),
+            ("likes", "reading about baseball cards"),
+        ]:
+            assert not is_tool_owned_state(key, value), f"{key} was wrongly refused"
+
+    def test_the_filter_runs_after_the_confidence_check(self):
+        """Confidence is no protection: the entry that misinformed the user
+        scored 0.90, above the threshold."""
+        import inspect
+
+        import orchestrator
+
+        src = inspect.getsource(orchestrator.maybe_record_preference) \
+            if hasattr(orchestrator, "maybe_record_preference") else ""
+        if not src:
+            import re
+            whole = inspect.getsource(orchestrator)
+            m = re.search(r"MEMORY_CONFIDENCE_THRESHOLD\n\s*\):.*?is_tool_owned_state",
+                          whole, re.S)
+            assert m, "the guard does not follow the confidence check"

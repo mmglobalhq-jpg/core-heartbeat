@@ -475,34 +475,34 @@ def _now_context(intent) -> str:
     )
 
 
-_FAMILY_NOTES: tuple[tuple[str, str, str], ...] = (
-    ("vault", "Personal Markdown vault (this user's private notes)",
+_FAMILY_NOTES: tuple[tuple[str, str, str, str], ...] = (
+    ("vault", "Notes", "Personal Markdown vault (this user's private notes)",
      "Already scoped to THIS user — never put a user id or an absolute/`..` path "
      "in a filename."),
-    ("kb", "Personal knowledge base (saved documents plus shared/global docs — the "
+    ("kb", "Knowledge base", "Personal knowledge base (saved documents plus shared/global docs — the "
            "user's \"core knowledge\", which persists across chats)",
      "Query it AT MOST ONCE per turn. Once any result appears for this turn — "
      "including \"no relevant information found\" — compose from it rather than "
      "re-querying with reworded terms."),
-    ("calendar", "Google Calendar (this user's own calendar)",
+    ("calendar", "Google Calendar", "Google Calendar (this user's own calendar)",
      "Use when the user asks about their schedule or wants to add, change or cancel "
      "something. List first when changing or removing, because update and delete "
      "need the event id. Emit NAIVE local datetimes (2026-07-20T09:00:00 — no "
      "offset, no Z); the calendar applies the user's timezone and DST. Resolve dates "
      "against the current date/time below, and ask if one is genuinely ambiguous."),
-    ("reit", "REIT research reports (read-only, global)",
+    ("reit", "REIT research", "REIT research reports (read-only, global)",
      "Use these and NOT query_knowledge_base for anything about a REIT's research "
      "reports. \"ARR\", \"ARMOUR\" and \"ARMOUR Residential REIT\" are one issuer "
      "(ARR); \"ORC\", \"Orchid\", \"Orchid Island\" and \"Orchid Island Capital\" are "
      "one issuer (ORC). Report ids may be namespaced (arr:<uuid>, orc:<uuid>). Never "
      "claim a report exists unless a tool returned it."),
-    ("briefing", "The user's DAILY BRIEFING (their personal morning news digest)",
+    ("briefing", "Daily briefing", "The user's DAILY BRIEFING (their personal morning news digest)",
      "Use these — NOT query_knowledge_base or the vault, which do not contain the "
      "briefing — for anything about the user's own briefing, its topics, its feeds "
      "or what it said. When the user asks to CHANGE what it covers, call the writer; "
      "do not answer in prose that you will. Delivery time, timezone and email "
      "address are NOT changeable here: say so and point to briefing settings."),
-    ("web", "The live internet", ""),
+    ("web", "The live internet", "The live internet", ""),
 )
 """Cross-tool guidance, hand-written because it belongs to no single tool.
 
@@ -551,7 +551,7 @@ def _tool_catalogue_block() -> str:
     from tools.catalog import TOOLS_BY_NAME, WRITE_TOOLS
 
     out: list[str] = []
-    for family, heading, note in _FAMILY_NOTES:
+    for family, _label, heading, note in _FAMILY_NOTES:
         names = [n for n in _family_members(family) if n in TOOLS_BY_NAME]
         if not names:
             continue
@@ -1043,36 +1043,64 @@ def build_ollama_client() -> httpx.AsyncClient:
 # It must NOT claim the composer can act, because it cannot. The correct behaviour
 # is to OFFER; the user's confirmation becomes the next turn, which the Supervisor
 # routes to the real tool. That also gives writes a natural confirm step.
-CAPABILITIES_BLOCK = (
-    "\nWhat this assistant can do (via its tools, on the user's confirmation):\n"
-    "  - Google Calendar: view, create, update and delete the user's events.\n"
-    "  - Knowledge base: search the user's curated documents.\n"
-    "  - REIT research: list issuers and read ARMOUR/Orchid research reports.\n"
-    "  - Notes: read, search and write the user's personal notes.\n"
-    "  - Attachments: read documents and SEE images the user attaches.\n"
-    "  - The live internet: search the web for current information, and read a\n"
-    "    specific page when given its URL.\n"
-    "That list is COMPLETE. Those tools are the only actions available — there is "
-    "nothing else. You cannot send email or text messages, make calls, place orders "
-    "or bookings, move money, post anywhere, or reach any other app, account or "
-    "device. If asked for something not on the list, say plainly that you can't do "
-    "it. Do not imply an action is possible because it sounds like something an "
-    "assistant would do.\n"
-    "Where a listed capability gets genuinely close, offer that instead — but name "
-    "the boundary. \"I can draft the email for you to copy and send, though I can't "
-    "send it myself\" is honest; \"I can help you with that email\" is not, because "
-    "the user will reasonably expect it to arrive.\n"
-    "NEVER tell the user you are unable to do one of the things listed above, and "
-    "never tell them to do it manually. Instead, offer concretely and ask them to "
-    "confirm — e.g. \"I can add these 12 games to your calendar. Want me to go "
-    "ahead?\" — then the next turn performs it. If a request needs details you do not "
-    "have, ask for exactly those.\n"
-    "You do NOT run tools in this step. Unless a tool result appears above, never "
-    "state or imply that an action happened or is happening — no \"proceeding to "
-    "add\", \"I'm adding\", \"adding now\", \"done\", \"added\", \"scheduled\". Said "
-    "of work that was never dispatched, those are false, and the user stops checking. "
-    "Either ask for confirmation, or report what a tool result above actually says.\n\n"
+def _capability_lines() -> str:
+    """The "what this assistant can do" list, GENERATED from the tool families.
+
+    Hand-written, this list silently omitted the daily briefing after those tools
+    shipped — so asked to change the briefing delivery time the composer treated
+    it as "something an assistant would do" and answered "Yes, I can change the
+    delivery time", which it cannot. Same drift as the routing prompt, same fix:
+    derive it.
+    """
+    from tools.catalog import TOOLS_BY_NAME
+
+    out = []
+    for family, label, _heading, _note in _FAMILY_NOTES:
+        names = [n for n in _family_members(family) if n in TOOLS_BY_NAME]
+        if names:
+            out.append(f"  - {label}: {', '.join(names)}.")
+    return "\n".join(out) + "\n"
+
+
+# Things NO tool does, stated so the composer cannot infer them from a family it
+# CAN see. A capability list alone is not enough: "the briefing" appearing as a
+# capability is exactly what let it promise to change the delivery time.
+_EXPLICIT_NON_CAPABILITIES = (
+    "  - You CANNOT change the daily briefing's delivery time, timezone, email\n"
+    "    address, or whether it is enabled, and you cannot trigger a briefing run.\n"
+    "    Topics you CAN add and remove. If asked for the others, say so plainly and\n"
+    "    point the user at their briefing settings.\n"
 )
+
+
+def capabilities_block() -> str:
+    return (
+        "\nWhat this assistant can do (via its tools, on the user's confirmation):\n"
+        + _capability_lines()
+        + "  - Attachments: read documents and SEE images the user attaches.\n"
+        + "Within those, specific limits:\n"
+        + _EXPLICIT_NON_CAPABILITIES
+        + "That list is COMPLETE. Those tools are the only actions available — there is "
+        "nothing else. You cannot send email or text messages, make calls, place orders "
+        "or bookings, move money, post anywhere, or reach any other app, account or "
+        "device. If asked for something not on the list, say plainly that you can't do "
+        "it. Do not imply an action is possible because it sounds like something an "
+        "assistant would do.\n"
+        "Where a listed capability gets genuinely close, offer that instead — but name "
+        "the boundary. \"I can draft the email for you to copy and send, though I can't "
+        "send it myself\" is honest; \"I can help you with that email\" is not, because "
+        "the user will reasonably expect it to arrive.\n"
+        "NEVER tell the user you are unable to do one of the things listed above, and "
+        "never tell them to do it manually. Instead, offer concretely and ask them to "
+        "confirm — e.g. \"I can add these 12 games to your calendar. Want me to go "
+        "ahead?\" — then the next turn performs it. If a request needs details you do not "
+        "have, ask for exactly those.\n"
+        "You do NOT run tools in this step. Unless a tool result appears above, never "
+        "state or imply that an action happened or is happening — no \"proceeding to "
+        "add\", \"I'm adding\", \"adding now\", \"done\", \"added\", \"scheduled\". Said "
+        "of work that was never dispatched, those are false, and the user stops checking. "
+        "Either ask for confirmation, or report what a tool result above actually says.\n\n"
+    )
 
 
 def _describe_call(call: dict) -> str:
@@ -1176,7 +1204,7 @@ def _build_local_prompt(state: GraphState) -> str:
         f"Conversation so far:\n{history or '(none)'}\n"
         f"{_pending_plan_block(state)}"
         f"{_truncation_block(state)}"
-        f"{CAPABILITIES_BLOCK}"
+        f"{capabilities_block()}"
         "Answer the user's request above directly, and stay strictly on its "
         "specific subject — do NOT drift onto related-but-different topics or list "
         "things the user didn't ask about. If retrieved knowledge-base or tool "
@@ -2256,6 +2284,42 @@ def _latest_local_reply(messages: list[Message]) -> str:
     return ""
 
 
+# Facts a TOOL owns. Memory must never record these, however confidently the
+# extractor reports them.
+#
+# On 2026-08-10 a user was told "your daily brief is sent at 5 AM" when it was
+# 06:30. Nothing hallucinated: test turns had been run against that account, the
+# extractor stored `tool_setting | briefing delivery time: 5 AM` at confidence
+# 0.90, and the profile block injects such entries as "PERMANENT ... durable
+# ground truth ... do NOT call a tool to fetch it". So a stale cache silently
+# outranked the system of record, permanently, and forbade the check that would
+# have caught it.
+#
+# The rule is NEVER MEMORIZE WHAT A TOOL CAN ANSWER. Durable *preferences* are
+# memory's job ("favourite team: UGA football"); *state* belongs to whatever owns
+# it. Briefing settings, calendar contents and vault contents all have tools.
+#
+# This is a deterministic filter and not only a prompt line, because the failure
+# mode is a model doing the wrong thing — instructing that same model not to is
+# the identical class of guarantee that already failed.
+_TOOL_OWNED_STATE = re.compile(
+    r"\b("
+    r"brief(?:ing)?\s+(?:delivery|send|deliver)\s*time"
+    r"|(?:delivery|send)\s*time\s*(?:for|of)?\s*(?:the\s+)?brief(?:ing)?"
+    r"|daily[_\s]?brief(?:ing)?[_\s]?(?:topic|topics|time|schedule|source|sources|feed|feeds)"
+    r"|brief(?:ing)?\s+topics?"
+    r"|calendar\s+event"
+    r"|(?:next|upcoming)\s+(?:meeting|appointment)"
+    r")\b",
+    re.I,
+)
+
+
+def is_tool_owned_state(key_insight: str, value: str) -> bool:
+    """True if this 'preference' is really live state some tool owns."""
+    return bool(_TOOL_OWNED_STATE.search(f"{key_insight or ''} {value or ''}"))
+
+
 def _build_memory_prompt(user_message: str, assistant_reply: str) -> str:
     """Prompt the silent profile builder to extract at most one durable preference."""
     return (
@@ -2264,8 +2328,16 @@ def _build_memory_prompt(user_message: str, assistant_reply: str) -> str:
         "cross-session fact about the user worth remembering long-term — e.g. a "
         "favorite thing, a project/tech-stack choice, a tool or workflow setting, "
         "or a stable personal fact. IGNORE transient chat, one-off questions, the "
-        "task's subject matter, and generic conversation. If nothing durable is "
-        "present, return preference_type=\"none\" with confidence_score 0.0.\n"
+        "task's subject matter, and generic conversation.\n"
+        "NEVER record something a tool can look up. Settings and contents that a "
+        "system of record owns — the delivery time or topic list of the daily "
+        "briefing, what is on the calendar, what a note contains — are STATE, not "
+        "preferences. They change without you, and a remembered copy becomes a "
+        "confident wrong answer that stops anyone checking the real thing. Record "
+        "durable tastes and choices instead (\"prefers UGA football\"), never the "
+        "current value of a setting.\n"
+        "If nothing durable is present, return preference_type=\"none\" with "
+        "confidence_score 0.0.\n"
         f"User said: {user_message}\n"
         f"Assistant replied: {assistant_reply}\n"
         "Return the fields: preference_type, key_insight (a short stable label), "
@@ -2401,6 +2473,15 @@ async def extract_and_record_preference(
             or pref.preference_type == "none"
             or pref.confidence_score < MEMORY_CONFIDENCE_THRESHOLD
         ):
+            return None
+        if is_tool_owned_state(pref.key_insight, pref.value):
+            # Deliberately AFTER the confidence check, because confidence is no
+            # protection here: the "briefing delivery time: 5 AM" entry that told a
+            # user the wrong time for their own briefing scored 0.90.
+            logger.info(
+                "memory: refused tool-owned state (%s) for user_id=%s",
+                pref.key_insight, user_id,
+            )
             return None
         # C-4: hold the per-user vault lock across the local write + S3 mirror so a
         # concurrent request's vault reset can't clobber this profile update.

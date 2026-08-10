@@ -453,7 +453,7 @@ def test_capabilities_block_states_the_list_is_exhaustive():
     compose the email to your boss", and later "Would you like me to try searching
     the web?" before any web tool existed. Nothing told it the list was complete, so
     anything assistant-shaped seemed plausible."""
-    block = orchestrator.CAPABILITIES_BLOCK
+    block = orchestrator.capabilities_block()
     assert "That list is COMPLETE" in block
     for absent in ("send email", "text messages", "make calls", "place orders"):
         assert absent.split()[0] in block.lower(), f"{absent} not ruled out"
@@ -462,7 +462,7 @@ def test_capabilities_block_states_the_list_is_exhaustive():
 def test_capabilities_block_requires_naming_the_boundary():
     """Offering an adjacent capability is fine; blurring it is not. "I can help you
     with that email" reads as though it will arrive."""
-    block = orchestrator.CAPABILITIES_BLOCK
+    block = orchestrator.capabilities_block()
     assert "name the boundary" in block
     assert "can't send it myself" in block
 
@@ -470,7 +470,7 @@ def test_capabilities_block_requires_naming_the_boundary():
 def test_capabilities_block_still_lists_what_is_real():
     """The closed-world statement must not cost the in-scope offers — refusing a
     calendar add would be a worse regression than over-offering."""
-    block = orchestrator.CAPABILITIES_BLOCK
+    block = orchestrator.capabilities_block()
     for capability in ("Google Calendar", "Knowledge base", "Notes", "live internet"):
         assert capability in block
     assert "NEVER tell the user you are unable to do one of the things listed above" in block
