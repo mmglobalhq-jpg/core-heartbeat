@@ -46,7 +46,11 @@ from tools.web_tools import WEB_TOOL_REGISTRY, run_web_tool
 from tools.graphrag import GRAPHRAG_TOOL_REGISTRY, kb_configured, run_graphrag_tool
 from tools.google_calendar import CALENDAR_TOOL_REGISTRY, run_calendar_tool
 from tools.catalog import ALL_TOOLS, WRITE_TOOLS
-from tools.daily_briefing import BRIEFING_TOOL_REGISTRY, run_briefing_tool
+from tools.daily_briefing import (
+    BRIEFING_TOOL_REGISTRY,
+    looks_like_briefing_reference,
+    run_briefing_tool,
+)
 from tools.reit_research import (
     REIT_TOOL_REGISTRY,
     looks_like_reit_reference,
@@ -1730,6 +1734,15 @@ def _finish_routing(
         # (the prompt steers the model to a REIT tool; this is the deterministic
         # backstop for the case where it routed straight to local_llm).
         and not looks_like_reit_reference(raw)
+        # Same reasoning for the user's daily briefing: it lives in its own
+        # tables and the KB does not contain it, so a forced retrieval returns
+        # whatever is nearest in vector space and the composer answers from it.
+        # Measured: "change my briefing delivery time to 5am" came back as "I can
+        # change your briefing delivery time if it's an event on your Google
+        # Calendar." The router had correctly called nothing; this backstop
+        # overrode that decision. A decline only means "say we cannot" if nothing
+        # downstream reinterprets it as "go searching".
+        and not looks_like_briefing_reference(raw)
         # A question ABOUT AN ATTACHMENT is self-contained — the answer comes from the
         # document/image the user just supplied, not from the curated KB. Forcing a
         # retrieval here searched the KB for things like "can you see this schedule?",
