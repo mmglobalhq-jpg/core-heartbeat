@@ -23,6 +23,7 @@ execute is as much a defect as the reverse.
 
 import orchestrator
 from models import RoutingDecision, ToolArgs
+from tools.daily_briefing import BRIEFING_TOOL_REGISTRY
 from tools.google_calendar import CALENDAR_TOOL_REGISTRY
 from tools.graphrag import GRAPHRAG_TOOL_REGISTRY
 from tools.reit_research import REIT_TOOL_REGISTRY
@@ -37,8 +38,22 @@ def dispatchable_tools() -> set[str]:
         | set(GRAPHRAG_TOOL_REGISTRY)
         | set(CALENDAR_TOOL_REGISTRY)
         | set(REIT_TOOL_REGISTRY)
+        | set(BRIEFING_TOOL_REGISTRY)
         | set(WEB_TOOL_REGISTRY)
     )
+
+
+def test_this_files_mirror_matches_the_orchestrator():
+    """This helper is itself a hand-maintained copy of orchestrator.py's union —
+    a FIFTH place a tool name has to be written.
+
+    That is not theoretical. On 2026-08-10 four briefing tools were added to the
+    catalog, the dispatcher and the model, and both equality tests below kept
+    passing because this helper had not been updated either: 14 == 14 on both
+    sides while production returned "No reply produced (status: error)". A guard
+    with its own private copy of the truth can go blind exactly when it matters.
+    """
+    assert dispatchable_tools() == set(orchestrator.DISPATCHABLE_TOOLS)
 
 
 def schema_tool_names() -> set[str]:

@@ -389,3 +389,38 @@ def test_no_images_still_returns_a_bare_string_for_every_provider():
     must produce exactly what it always did."""
     for provider in ("langchain", "anthropic", "gemini", "unknown"):
         assert orchestrator._as_content_parts("hi", [], provider) == "hi"
+
+
+def test_routing_literal_matches_the_catalog_exactly():
+    """The FOURTH place a tool name lives.
+
+    Doc 29 says the catalog rework ended the four-places drift — registry,
+    RoutingDecision Literal, ROUTING_JSON_SCHEMA enum, prompt prose — by making
+    the catalog the single declaration. It removed three of the four. This
+    Literal stayed hand-maintained, and on 2026-08-10 four briefing tools were
+    added to the catalog and the dispatcher, the router happily selected
+    get_briefing_preferences, and re-validating its own decision then raised
+    ValidationError. Chat returned "No reply produced (status: error)" for every
+    question that routed to one — a runtime failure, in production, from a
+    mismatch that is knowable at import time.
+
+    The existing coverage test compared the catalog to DISPATCHABLE_TOOLS only,
+    so it passed throughout.
+    """
+    import typing
+
+    from models import RoutingDecision
+    from tools.catalog import CATALOG_TOOL_NAMES
+
+    annotation = RoutingDecision.model_fields["tool_name"].annotation
+    allowed = {
+        value
+        for arg in typing.get_args(annotation)
+        for value in typing.get_args(arg)
+        if isinstance(value, str)
+    }
+    assert allowed == set(CATALOG_TOOL_NAMES), (
+        "RoutingDecision.tool_name and the catalog disagree; "
+        f"only in Literal: {allowed - set(CATALOG_TOOL_NAMES)}, "
+        f"only in catalog: {set(CATALOG_TOOL_NAMES) - allowed}"
+    )

@@ -174,6 +174,9 @@ class RoutingDecision(BaseModel):
         # REIT research reports (read-only, global)
         "list_reit_issuers", "list_reit_reports",
         "get_reit_report", "get_latest_reit_report",
+        # daily briefing (per-user, read-only)
+        "get_briefing_preferences", "list_briefing_sources",
+        "get_latest_briefing", "search_briefings",
     ] | None = None
     tool_args: ToolArgs = Field(default_factory=ToolArgs)
 
