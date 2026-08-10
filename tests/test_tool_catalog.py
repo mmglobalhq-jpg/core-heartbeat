@@ -432,3 +432,52 @@ def test_routing_literal_matches_the_catalog_exactly():
         f"only in Literal: {allowed - set(CATALOG_TOOL_NAMES)}, "
         f"only in catalog: {set(CATALOG_TOOL_NAMES) - allowed}"
     )
+
+
+def test_prompt_tool_descriptions_come_from_the_catalog():
+    """The prompt's per-tool text is GENERATED, not written twice.
+
+    Each tool used to have two independent descriptions — its catalog docstring,
+    which bind_tools sends on the native path, and hand-written prose in
+    _build_prompt. That is the duplication doc 29 blames for the calendar tools
+    going stale, and it recurred on 2026-08-10 when four briefing tools reached
+    the catalog and never reached the prompt.
+    """
+    import orchestrator
+    from tools.catalog import ALL_TOOLS
+
+    block = orchestrator._tool_catalogue_block()
+    for tool in ALL_TOOLS:
+        assert f"* {tool.name}" in block, f"{tool.name} missing from the prompt"
+        # A distinctive slice of the real docstring, so paraphrasing it back into
+        # the prompt by hand would fail here rather than drift quietly.
+        head = " ".join((tool.description or "").split())[:40]
+        assert head in block, f"{tool.name}'s prompt text is not its docstring"
+
+
+def test_write_tools_are_marked_in_the_prompt():
+    """The model should see which options change something before it picks one."""
+    import orchestrator
+    from tools.catalog import WRITE_TOOLS
+
+    block = orchestrator._tool_catalogue_block()
+    for name in WRITE_TOOLS:
+        line = next(l for l in block.splitlines() if l.strip().startswith(f"* {name}"))
+        assert "[CHANGES DATA]" in line, f"{name} is not marked as mutating"
+
+
+def test_native_prompt_tells_the_router_what_to_do_when_nothing_fits():
+    """"can you add baseball cards?" routed to query_knowledge_base because no
+    write tool existed and nothing told the router that calling nothing was the
+    better move. A near-miss tool answers a question nobody asked."""
+    import orchestrator
+    from models import IntentPayload
+
+    state = {
+        "intent": IntentPayload(intent="general", raw_input="hello",
+                                confidence=0.9, source="test"),
+        "messages": [], "prior_context": [], "user_id": orchestrator.SANDBOX_USER_ID,
+    }
+    prompt = orchestrator._build_native_prompt(state)
+    assert "no tool can do it, call NOTHING" in prompt
+    assert "Never promise an action you did not call a tool for" in prompt

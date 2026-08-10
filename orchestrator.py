@@ -471,6 +471,96 @@ def _now_context(intent) -> str:
     )
 
 
+_FAMILY_NOTES: tuple[tuple[str, str, str], ...] = (
+    ("vault", "Personal Markdown vault (this user's private notes)",
+     "Already scoped to THIS user — never put a user id or an absolute/`..` path "
+     "in a filename."),
+    ("kb", "Personal knowledge base (saved documents plus shared/global docs — the "
+           "user's \"core knowledge\", which persists across chats)",
+     "Query it AT MOST ONCE per turn. Once any result appears for this turn — "
+     "including \"no relevant information found\" — compose from it rather than "
+     "re-querying with reworded terms."),
+    ("calendar", "Google Calendar (this user's own calendar)",
+     "Use when the user asks about their schedule or wants to add, change or cancel "
+     "something. List first when changing or removing, because update and delete "
+     "need the event id. Emit NAIVE local datetimes (2026-07-20T09:00:00 — no "
+     "offset, no Z); the calendar applies the user's timezone and DST. Resolve dates "
+     "against the current date/time below, and ask if one is genuinely ambiguous."),
+    ("reit", "REIT research reports (read-only, global)",
+     "Use these and NOT query_knowledge_base for anything about a REIT's research "
+     "reports. \"ARR\", \"ARMOUR\" and \"ARMOUR Residential REIT\" are one issuer "
+     "(ARR); \"ORC\", \"Orchid\", \"Orchid Island\" and \"Orchid Island Capital\" are "
+     "one issuer (ORC). Report ids may be namespaced (arr:<uuid>, orc:<uuid>). Never "
+     "claim a report exists unless a tool returned it."),
+    ("briefing", "The user's DAILY BRIEFING (their personal morning news digest)",
+     "Use these — NOT query_knowledge_base or the vault, which do not contain the "
+     "briefing — for anything about the user's own briefing, its topics, its feeds "
+     "or what it said. When the user asks to CHANGE what it covers, call the writer; "
+     "do not answer in prose that you will. Delivery time, timezone and email "
+     "address are NOT changeable here: say so and point to briefing settings."),
+    ("web", "The live internet", ""),
+)
+"""Cross-tool guidance, hand-written because it belongs to no single tool.
+
+Per-tool wording is NOT here — it is generated from the catalog docstrings by
+``_tool_catalogue_block``. Anything that describes one tool belongs in that
+tool's docstring, which is also what ``bind_tools`` sends on the native path.
+"""
+
+
+def _family_members(family: str) -> list[str]:
+    """Tool names in one family, read from the registries rather than listed here."""
+    from tools.daily_briefing import BRIEFING_TOOL_REGISTRY
+    from tools.google_calendar import CALENDAR_TOOL_REGISTRY
+    from tools.graphrag import GRAPHRAG_TOOL_REGISTRY
+    from tools.reit_research import REIT_TOOL_REGISTRY
+    from tools.user_vault import USER_VAULT_TOOLS
+    from tools.web_tools import WEB_TOOL_REGISTRY
+
+    return {
+        "vault": [t.name for t in USER_VAULT_TOOLS],
+        "kb": sorted(GRAPHRAG_TOOL_REGISTRY),
+        "calendar": sorted(CALENDAR_TOOL_REGISTRY),
+        "reit": sorted(REIT_TOOL_REGISTRY),
+        "briefing": sorted(BRIEFING_TOOL_REGISTRY),
+        "web": sorted(WEB_TOOL_REGISTRY),
+    }[family]
+
+
+def _tool_catalogue_block() -> str:
+    """The tool catalogue for the routing prompt, GENERATED from tools/catalog.py.
+
+    Per-tool descriptions used to be written out here by hand, so each tool had
+    two independent descriptions — its catalog docstring and this prose. That is
+    the duplication doc 29 blames for the calendar tools going stale, and it
+    recurred on 2026-08-10: four briefing tools were added to the catalog and
+    this prompt was not, so the fallback router was never told they existed.
+
+    The native path never carried the copy — ``bind_tools`` sends the docstrings
+    — so only this structured-output fallback could drift. Now neither can, and
+    the test asserting every dispatchable tool appears is satisfied by
+    construction rather than by vigilance.
+
+    Write tools are marked so the model can see which of its options change
+    something before it picks one.
+    """
+    from tools.catalog import TOOLS_BY_NAME, WRITE_TOOLS
+
+    out: list[str] = []
+    for family, heading, note in _FAMILY_NOTES:
+        names = [n for n in _family_members(family) if n in TOOLS_BY_NAME]
+        if not names:
+            continue
+        out.append(f"  {heading}:")
+        for name in names:
+            summary = " ".join((TOOLS_BY_NAME[name].description or "").split())
+            mark = " [CHANGES DATA]" if name in WRITE_TOOLS else ""
+            out.append(f"    * {name}{mark} — {summary}")
+        if note:
+            out.append(f"    {note}")
+    return "\n".join(out) + "\n"
+
+
 def _build_prompt(state: GraphState) -> str:
     """Deterministic routing prompt derived from the intent + message history.
 
@@ -513,107 +603,7 @@ def _build_prompt(state: GraphState) -> str:
         "- Route to local_llm to generate a conversational or reasoned reply.\n"
         "- Route to tool_execution to run a tool. You then MUST set tool_name and "
         "tool_args (only the fields that tool needs). Three tool families:\n"
-        "  Personal Markdown vault (this user's private notes):\n"
-        "    * read_user_note — read one note. tool_args: {\"filename\": <path>}.\n"
-        "    * search_user_vault — case-insensitive text/regex search across the "
-        "vault's notes. tool_args: {\"query\": <text>}.\n"
-        "    * write_user_note — create/update a note. tool_args: "
-        "{\"filename\": <path>, \"content\": <text>}.\n"
-        "  The vault tools are already scoped to THIS user — never put a user id "
-        "or absolute/`..` path in a filename.\n"
-        "  Personal knowledge base (this user's saved documents plus shared/global "
-        "docs — their \"core knowledge\" that persists across all chats):\n"
-        "    * query_knowledge_base — semantic search over the user's knowledge base. "
-        "tool_args: {\"query\": <what to look up>}. Returns cited context; already "
-        "scoped to THIS user + global docs. Consult it ONCE at the start of a "
-        "substantive or topical turn — the user curated this knowledge because they "
-        "consider it important, so it should be checked even when you could answer "
-        "from general knowledge. This includes FOLLOW-UP turns on an ongoing topic "
-        "(e.g. \"give me other options\", \"what about X instead\", \"tell me more\"): "
-        "query with terms built from the follow-up PLUS the topic in the conversation "
-        "so far. Skip it ONLY for pure small-talk/greetings or a request with no "
-        "topical content.\n"
-        "    CRITICAL — query the KB AT MOST ONCE per turn. The moment a "
-        "query_knowledge_base result already appears in the history for THIS turn "
-        "(including a \"No relevant information found\" result), you MUST route to "
-        "local_llm to compose the answer — do NOT call query_knowledge_base again, do "
-        "NOT re-query with reworded terms. A single retrieval is enough; local_llm "
-        "will use that context plus general knowledge to answer.\n"
-        "  Google Calendar (this user's own calendar). Use these when the user asks "
-        "about their schedule/events/meetings/appointments or wants to add, change, "
-        "or cancel something:\n"
-        "    * list_calendar_events — view events. tool_args: optional {\"time_min\", "
-        "\"time_max\"} (ISO 8601; defaults to the next 7 days), \"query\" (text "
-        "search), \"max_results\". Returns events each ending with [id: <event_id>].\n"
-        "    * create_calendar_event — add an event. tool_args: {\"summary\", "
-        "\"start\", \"end\"} (start/end ISO 8601 datetime, or YYYY-MM-DD for all-day) "
-        "plus optional \"description\", \"location\".\n"
-        "    * update_calendar_event — change an event. tool_args: {\"event_id\"} plus "
-        "the field(s) to change (summary/start/end/location/description).\n"
-        "    * delete_calendar_event — remove an event. tool_args: {\"event_id\"}.\n"
-        "    To update or delete, you usually must FIRST list_calendar_events to find "
-        "the event_id, then call update/delete with that id. Ask the user to confirm "
-        "before deleting. For start/end and time_min/time_max emit NAIVE local "
-        "datetimes (e.g. 2026-07-20T09:00:00 — NO timezone offset/Z); the calendar "
-        "applies the user's timezone and DST. Resolve dates against the current "
-        "date/time given below. If a date/time is genuinely ambiguous, ask.\n"
-        "  REIT research reports (read-only). Use these — NOT query_knowledge_base — "
-        "for any question about a REIT's research reports (what changed, summaries, "
-        "which reports exist). \"ARR\", \"ARMOUR\", and \"ARMOUR Residential REIT\" all "
-        "mean the same issuer (symbol ARR); \"ORC\", \"Orchid\", \"Orchid Island\", and "
-        "\"Orchid Island Capital\" all mean the same issuer (symbol ORC). Pass the issuer "
-        "name/symbol as reit_symbol; report ids may be namespaced (e.g. arr:<uuid> or "
-        "orc:<uuid>):\n"
-        "    * list_reit_issuers — which REITs are covered. tool_args: {} (none).\n"
-        "    * list_reit_reports — the reports that exist for a REIT (metadata only, "
-        "newest first). Use for \"what reports are available\" or an ambiguous period. "
-        "tool_args: {\"reit_symbol\": <e.g. ARR>, optional \"limit\"}. Each line begins "
-        "with the report's [id].\n"
-        "    * get_latest_reit_report — the newest/current/most-recent report for a "
-        "REIT. Use for \"latest\", \"current\", \"most recent\", or \"summarize ARR's "
-        "monthly report\". tool_args: {\"reit_symbol\": <e.g. ARR>}.\n"
-        "    * get_reit_report — a specific report when you already have its id. "
-        "tool_args: {\"report_id\": <id from list_reit_reports>}.\n"
-        "    Do NOT claim a report exists unless a tool returned it, and never generate "
-        "or alter a report — these tools only read.\n"
-        "  The user's DAILY BRIEFING (read-only). A personal news digest built each "
-        "morning from feeds the user chose, delivered by email and readable at "
-        "/briefing. Use these — NOT query_knowledge_base or the vault, which do not "
-        "contain it — for anything about the user's own briefing, topics, feeds or "
-        "what it said:\n"
-        "    * get_briefing_preferences — the topics they follow, delivery time, "
-        "timezone and whether it is emailed. Use for \"what topics am I following\", "
-        "\"what is on my daily brief\", \"when does my briefing arrive\". "
-        "tool_args: {} (none).\n"
-        "    * list_briefing_sources — the feeds the user added themselves, on top "
-        "of the platform defaults. tool_args: {} (none).\n"
-        "    * get_latest_briefing — the most recent briefing in full, or one day. "
-        "tool_args: {} for the latest, or {\"briefing_date\": <YYYY-MM-DD>}.\n"
-        "    * search_briefings — find past briefing items by headline. tool_args: "
-        "{\"query\": <words>, optional \"limit\"}.\n"
-        "    * add_briefing_topic — add a topic so future briefings cover it. Use "
-        "whenever the user asks to ADD, follow, track or start covering something "
-        "in their brief (\"add baseball cards\", \"follow the Fed\"). One topic per "
-        "call. tool_args: {\"topic\": <the topic>}.\n"
-        "    * remove_briefing_topic — stop covering a topic. tool_args: "
-        "{\"topic\": <the topic>}.\n"
-        "    The two writers CHANGE a setting, so they are proposed and only run "
-        "after the user approves. When the user asks to change their briefing, call "
-        "the writer — do NOT answer in prose that you will do it, and do NOT search "
-        "the knowledge base or the vault, which do not contain the briefing. "
-        "Delivery time, timezone and email address are NOT changeable here: say so "
-        "plainly and point to briefing settings.\n"
-        "  The live internet:\n"
-        "    * search_web — search the web and get an answer grounded in current "
-        "results, with sources. tool_args: {\"query\": <natural-language question>}. "
-        "Use for anything current, local, niche, or outside the knowledge base — "
-        "sports rosters, prices, news, opening hours, recent events. If a "
-        "query_knowledge_base result already said nothing relevant was found and the "
-        "question is about the outside world, search instead of answering from "
-        "memory or saying you don't know.\n"
-        "    * fetch_url — read ONE specific public page. tool_args: {\"url\": <http(s) "
-        "URL>}. Use when the user supplies a URL. It does not find pages; use "
-        "search_web for that. Private/local addresses are refused.\n"
+        f"{_tool_catalogue_block()}"
         "- A tool result is raw DATA, not an answer. After a tool result appears in "
         "the history you MUST either issue another tool call or route to local_llm "
         "to compose the answer from it — NEVER choose finish directly after a "
@@ -758,6 +748,15 @@ def _build_native_prompt(state: GraphState) -> str:
         "it.\n"
         "- If no tool applies — general knowledge, chit-chat, or a question about an "
         "attachment — call nothing.\n"
+        "- If the user asks you to DO something and no tool can do it, call NOTHING. "
+        "Do not substitute a tool that merely looks related — searching the "
+        "knowledge base for a request to change a setting answers nothing and "
+        "wastes the turn. The next step will say plainly that it cannot be done "
+        "and where the user can do it themselves. A near-miss tool is worse than "
+        "no tool: it produces a confident answer to a question nobody asked.\n"
+        "- Never promise an action you did not call a tool for. If you can act, "
+        "call the tool now; a later \"yes\" cannot rescue a promise that was never "
+        "a plan.\n"
         "- Never invent ids or dates. Ambiguous ones get resolved against the current "
         "date above; if genuinely unclear, call nothing so the next step can ask.\n"
     )

@@ -362,7 +362,8 @@ def add_briefing_topic(topic: str, state: Annotated[dict, InjectedState]) -> str
     Use whenever the user asks to add, follow, track or start covering something
     in their brief — "add baseball cards", "follow the Fed", "I want more about
     Georgia football". One topic per call; call it repeatedly for several.
-    This CHANGES a setting, so it is proposed for confirmation before it runs.
+    This CHANGES a setting. A single change runs straight away and is undone with
+    remove_briefing_topic; several at once are proposed for confirmation first.
     """
     return run_briefing_tool("add_briefing_topic", _uid(state), {"topic": topic})
 
@@ -372,7 +373,8 @@ def remove_briefing_topic(topic: str, state: Annotated[dict, InjectedState]) -> 
     """Remove a topic from the user's daily briefing.
 
     Use for "stop covering X", "drop X from my brief", "I don't care about X any
-    more". This CHANGES a setting, so it is proposed for confirmation first.
+    more". This CHANGES a setting. A single change runs straight away and is undone
+    by adding the topic back; several at once are proposed for confirmation first.
     """
     return run_briefing_tool("remove_briefing_topic", _uid(state), {"topic": topic})
 
