@@ -2491,12 +2491,35 @@ async def extract_and_record_preference(
             # Durability: mirror the updated profile back to S3 immediately, in a
             # worker thread (blocking boto3). Best-effort and isolated — a write-back
             # failure keeps the successful local write and never fails the task.
-            try:
-                await asyncio.to_thread(upload_user_file, user_id, PREFERENCES_FILE)
-                logger.info("memory: wrote profile back to S3 for user_id=%s", user_id)
-            except Exception:
+            # Bounded retry, then a warning that actually says what happened.
+            #
+            # This used to log "S3 write-back failed ... (local copy kept)" with no
+            # exception at all, so a recurring failure was undiagnosable from the
+            # logs — the one thing needed to fix it was the one thing discarded.
+            # A manual upload of the same user and file succeeded, which is what a
+            # transient error looks like; a permanent one (missing bucket, bad
+            # credential) fails identically every time and now says so by name.
+            last_exc: Exception | None = None
+            for attempt in (1, 2):
+                try:
+                    await asyncio.to_thread(upload_user_file, user_id, PREFERENCES_FILE)
+                    if attempt > 1:
+                        logger.info(
+                            "memory: S3 write-back succeeded on retry for user_id=%s", user_id
+                        )
+                    else:
+                        logger.info("memory: wrote profile back to S3 for user_id=%s", user_id)
+                    last_exc = None
+                    break
+                except Exception as exc:  # noqa: BLE001 — durability is best-effort
+                    last_exc = exc
+                    if attempt == 1:
+                        await asyncio.sleep(0.5)
+            if last_exc is not None:
                 logger.warning(
-                    "memory: S3 write-back failed for user_id=%s (local copy kept)", user_id
+                    "memory: S3 write-back failed for user_id=%s after 2 attempts "
+                    "(%s: %s) — local copy kept",
+                    user_id, type(last_exc).__name__, str(last_exc)[:300],
                 )
         return line
     except Exception:  # best-effort; a profile-building failure is never fatal
