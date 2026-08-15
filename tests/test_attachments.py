@@ -267,3 +267,91 @@ def test_manifest_is_capped(monkeypatch):
     monkeypatch.setattr(docstore, "list_chat_documents", lambda uid, cid: rows)
     got = asyncio.run(orchestrator._load_attachment_manifest(UID, _payload(chat_id="c1")))
     assert len(got) == orchestrator.MAX_ATTACHMENTS_LISTED
+
+
+def test_exif_orientation_is_applied_so_the_page_is_upright():
+    """A phone photo stores raw sensor framing plus an orientation flag.
+
+    Photos and browsers honour the flag; PIL does not. Skipping it hands the model
+    a page rotated 90 degrees, which is where row/label misreading on dense
+    documents comes from. Asserted on the SHAPE: a landscape image tagged
+    "rotate 90" must come back portrait.
+    """
+    from PIL import Image
+
+    buf = BytesIO()
+    im = Image.new("RGB", (400, 200), (255, 255, 255))
+    exif = im.getexif()
+    exif[274] = 6  # Orientation: rotate 90 CW
+    im.save(buf, format="JPEG", exif=exif)
+
+    out = images.downscale_for_model(buf.getvalue())
+    assert out is not None
+    with Image.open(BytesIO(out[0])) as got:
+        assert got.size == (200, 400), f"expected portrait after transpose, got {got.size}"
+
+
+def test_an_image_without_exif_is_left_alone():
+    from PIL import Image
+
+    out = images.downscale_for_model(_png(400, 200))
+    assert out is not None
+    with Image.open(BytesIO(out[0])) as got:
+        assert got.size == (400, 200)
+
+
+def _mpo(w=400, h=300) -> bytes:
+    """A genuine Multi-Picture Object, the container an iPhone saves photos in.
+
+    Written by Pillow with the real MPF/APP2 marker rather than by concatenating
+    JPEGs — concatenation does not make PIL report format == "MPO", so a fixture
+    built that way would pass this test while proving nothing.
+    """
+    from PIL import Image
+
+    primary = Image.new("RGB", (w, h), (240, 240, 240))
+    extra = Image.new("RGB", (w, h), (10, 10, 10))
+    buf = BytesIO()
+    primary.save(buf, format="MPO", save_all=True, append_images=[extra])
+    return buf.getvalue()
+
+
+def test_an_iphone_mpo_photo_is_accepted():
+    """THE bug behind the 2026-08-15 calendar failure.
+
+    An iPhone saves photos as MPO — a JPEG container with a primary frame plus
+    depth/gain-map extras — and PIL reports the format as "MPO", not "JPEG". The
+    original check was `fmt not in ("PNG", "JPEG")`, so EVERY iPhone photo was
+    silently refused and never reached the model, while the documents row said
+    image/jpeg and the media-type gate waved it through. The assistant answered
+    entirely from OCR text and nothing reported that vision had not happened.
+    """
+    from PIL import Image
+
+    raw = _mpo()
+    with Image.open(BytesIO(raw)) as probe:
+        assert probe.format == "MPO", "fixture is not an MPO; the test proves nothing"
+
+    out = images.downscale_for_model(raw)
+    assert out is not None, "an iPhone photo must reach the model"
+    assert out[1] == "image/jpeg", "MPO is re-encoded as a plain JPEG"
+
+
+def test_mpo_is_reencoded_as_a_single_frame():
+    """The extra frames are depth and gain-map data no model reads."""
+    from PIL import Image
+
+    out = images.downscale_for_model(_mpo())
+    assert out is not None
+    with Image.open(BytesIO(out[0])) as got:
+        assert got.format == "JPEG"
+        assert getattr(got, "n_frames", 1) == 1
+
+
+def test_a_format_we_cannot_decode_is_still_refused():
+    """Widening the allow-list must not turn it into 'accept anything'."""
+    from PIL import Image
+
+    buf = BytesIO()
+    Image.new("RGB", (20, 20)).save(buf, format="BMP")
+    assert images.downscale_for_model(buf.getvalue()) is None

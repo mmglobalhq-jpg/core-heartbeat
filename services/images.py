@@ -29,6 +29,24 @@ KNOWN_UNVIEWABLE_MEDIA_TYPES = frozenset(
     {"image/webp", "image/heic", "image/heif", "image/avif", "image/gif", "image/tiff"}
 )
 
+# PIL format names we can decode. MPO is the one that matters and the one that was
+# missing: an iPhone saves photos as a Multi-Picture Object — a JPEG container
+# holding a primary frame plus extras (depth, HDR gain map) — and PIL reports its
+# format as "MPO", not "JPEG".
+#
+# The original check was `fmt not in ("PNG", "JPEG")`, so every iPhone photo was
+# silently refused and NEVER reached the model. The `documents` row says
+# `image/jpeg`, so it passed the media-type gate and then failed here, returning
+# None with no signal. That is why the 2026-08-15 school calendar was answered
+# entirely from OCR text: not because vision was weak, but because vision never
+# happened. Pillow decodes the primary frame, which is the photograph.
+DECODABLE_FORMATS = frozenset({"PNG", "JPEG", "MPO"})
+
+# What each decoded format is re-encoded as on the way out.
+_OUTPUT_FORMAT = {"PNG": ("PNG", "image/png"),
+                  "JPEG": ("JPEG", "image/jpeg"),
+                  "MPO": ("JPEG", "image/jpeg")}
+
 MAX_IMAGE_EDGE_PX = 1568     # Anthropic's recommended long edge; larger is downscaled
 MAX_IMAGE_BYTES = 4_000_000  # skip anything still over this AFTER downscaling
 
@@ -49,14 +67,15 @@ def downscale_for_model(data: bytes) -> tuple[bytes, str] | None:
     """
     from io import BytesIO
 
-    from PIL import Image
+    from PIL import Image, ImageOps
 
     previous_limit = Image.MAX_IMAGE_PIXELS
     Image.MAX_IMAGE_PIXELS = MAX_IMAGE_PIXELS
     try:
         with Image.open(BytesIO(data)) as im:
             fmt = (im.format or "").upper()
-            if fmt not in ("PNG", "JPEG"):
+            if fmt not in DECODABLE_FORMATS:
+                logger.info("image format %r cannot be prepared for the model", fmt)
                 return None
             # Check the declared dimensions BEFORE decoding. Setting
             # Image.MAX_IMAGE_PIXELS is not sufficient on its own: Pillow only
@@ -69,6 +88,16 @@ def downscale_for_model(data: bytes) -> tuple[bytes, str] | None:
                 logger.info("refusing image: %dx%d exceeds the pixel budget", w, h)
                 return None
             im.load()
+            # Apply EXIF orientation. A phone stores the sensor's raw framing plus
+            # an orientation flag; Photos and browsers honour the flag, PIL does
+            # not. Without this the model is handed a page rotated 90 degrees.
+            #
+            # This is not hypothetical. The 2026-08-15 school-calendar photo
+            # (iPhone 16 Pro, orientation=upper-right) reached the model on its
+            # side, and the dates it returned were read off adjacent rows of a
+            # dotted-leader layout. Rotated dense text is exactly where that kind
+            # of row/label misalignment comes from.
+            im = ImageOps.exif_transpose(im) or im
             longest = max(im.size)
             if longest > MAX_IMAGE_EDGE_PX:
                 scale = MAX_IMAGE_EDGE_PX / longest
@@ -76,16 +105,18 @@ def downscale_for_model(data: bytes) -> tuple[bytes, str] | None:
                     (max(1, int(im.width * scale)), max(1, int(im.height * scale))),
                     Image.LANCZOS,
                 )
+            out_fmt, media = _OUTPUT_FORMAT[fmt]
             buf = BytesIO()
-            if fmt == "PNG":
+            if out_fmt == "PNG":
                 im.save(buf, format="PNG", optimize=True)
-                media = "image/png"
             else:
                 # JPEG cannot carry alpha; convert so an RGBA source can't fail here.
                 if im.mode not in ("RGB", "L"):
                     im = im.convert("RGB")
+                # An MPO is re-encoded as a plain single-frame JPEG: the extra
+                # frames are depth and gain-map data no model reads, and sending
+                # them would just cost bytes.
                 im.save(buf, format="JPEG", quality=85, optimize=True)
-                media = "image/jpeg"
             out = buf.getvalue()
     except Exception as exc:
         logger.info("image could not be prepared for the model: %s", type(exc).__name__)
