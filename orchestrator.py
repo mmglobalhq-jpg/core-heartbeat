@@ -1121,6 +1121,42 @@ def capabilities_block() -> str:
     )
 
 
+def _describe_when(args: dict) -> str:
+    """Render a proposed event's start/end for a human to check.
+
+    This line previously showed the START ONLY. A five-day holiday was therefore
+    proposed as "Add "Faculty In-Service Week" — 2026-08-03", the composer
+    faithfully wrote "on August 3, 2026", and the user approved what looked like a
+    one-day event. The write was correct all along — Aug 3–7 reached the calendar —
+    but the confirmation under-described it, which is its own defect: an approval
+    step you cannot trust is worse than a clear one, and it made a correct result
+    look wrong.
+
+    All-day ranges are INCLUSIVE here, matching create_calendar_event's contract
+    (tools/google_calendar.py converts to Google's exclusive end on the way out).
+    The day count is spelled out because that is what makes an off-by-one visible.
+    """
+    start, end = str(args.get("start") or "?"), str(args.get("end") or "")
+    if start == "?":
+        return "?"
+    if not end or end == start:
+        return start
+    # All-day: both bare YYYY-MM-DD.
+    if len(start) == 10 and len(end) == 10 and start[4] == "-" and end[4] == "-":
+        try:
+            from datetime import date
+
+            days = (date.fromisoformat(end) - date.fromisoformat(start)).days + 1
+        except ValueError:
+            return f"{start} to {end}"
+        if days < 1:
+            # end before start — surface it rather than rendering a tidy phrase
+            return f"{start} to {end} (⚠ end is before start)"
+        return f"{start} to {end} ({days} days)"
+    # Timed: keep both endpoints; the date is usually shared, the times are not.
+    return f"{start} to {end}"
+
+
 def _describe_call(call: dict) -> str:
     """One human-readable line for a proposed tool call.
 
@@ -1130,8 +1166,7 @@ def _describe_call(call: dict) -> str:
     """
     name, args = call.get("name", "?"), call.get("args") or {}
     if name == "create_calendar_event":
-        when = args.get("start", "?")
-        return f"Add \"{args.get('summary', 'Untitled')}\" — {when}"
+        return f"Add \"{args.get('summary', 'Untitled')}\" — {_describe_when(args)}"
     if name == "update_calendar_event":
         # Show the new VALUES, not just which fields move. "start" tells the user
         # nothing about whether the change is right.
@@ -1165,6 +1200,11 @@ def _pending_plan_block(state: GraphState) -> str:
         "carry them out. Do NOT say the actions are done, scheduled, or added — "
         "nothing has happened yet. If any detail looks wrong or ambiguous, point it "
         "out and ask.\n"
+        "Repeat each date span EXACTLY as shown. Where a line gives a range, say the "
+        "range — \"August 3-7\", not \"August 3\". Collapsing a multi-day event to its "
+        "first day asks the user to approve something different from what will "
+        "actually be created, and they cannot catch the mistake because the correct "
+        "dates were never shown to them.\n"
         "Where an action shows [id: ...], that is an internal calendar id and means "
         "nothing to the user — find that id in the calendar listing above and name "
         "the event by its title, date and time instead. NEVER ask someone to approve "

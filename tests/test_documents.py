@@ -227,3 +227,58 @@ def test_no_documents_still_returns_empty_string(monkeypatch):
     monkeypatch.setattr(docstore, "fetch_extracted", lambda uid, did: "")
     assert asyncio.run(orchestrator._load_documents("u", ["d1"])) == ""
     assert asyncio.run(orchestrator._load_documents("u", [])) == ""
+
+
+# --- proposal text must show the full span --------------------------------------
+#
+# _describe_call showed the START ONLY for create_calendar_event. A five-day
+# holiday was proposed as "— 2026-08-03", the composer wrote "on August 3, 2026",
+# and the user approved what looked like a one-day event. The WRITE was correct
+# (Aug 3-7 reached the calendar); the confirmation under-described it, which made
+# a correct result look wrong and left the approval step untrustworthy.
+
+def _line(**args):
+    return orchestrator._describe_call({"name": "create_calendar_event", "args": args})
+
+
+def test_a_multi_day_event_is_proposed_as_a_range():
+    out = _line(summary="Faculty In-Service Week", start="2026-08-03", end="2026-08-07")
+    assert "2026-08-03 to 2026-08-07" in out
+    assert "5 days" in out, "the day count is what makes an off-by-one visible"
+
+
+def test_a_single_day_event_stays_a_single_date():
+    out = _line(summary="Labor Day", start="2026-09-07", end="2026-09-07")
+    assert "2026-09-07" in out
+    assert " to " not in out, "a one-day event must not read as a range"
+
+
+def test_a_missing_end_does_not_invent_one():
+    assert _line(summary="x", start="2026-09-07") .endswith("2026-09-07")
+
+
+def test_a_timed_event_keeps_both_endpoints():
+    out = _line(summary="Lunch", start="2026-07-14T12:00:00", end="2026-07-14T13:00:00")
+    assert "12:00:00" in out and "13:00:00" in out
+
+
+def test_an_inverted_range_is_flagged_not_tidied():
+    """end < start is a bug upstream; the proposal must not render it as prose."""
+    out = _line(summary="x", start="2026-08-07", end="2026-08-03")
+    assert "end is before start" in out
+
+
+def test_a_malformed_date_falls_back_rather_than_raising():
+    out = _line(summary="x", start="2026-13-45", end="2026-13-46")
+    assert "2026-13-45 to 2026-13-46" in out
+
+
+def test_the_plan_block_tells_the_model_not_to_collapse_ranges():
+    block = orchestrator._pending_plan_block({
+        "pending_plan": [{"name": "create_calendar_event",
+                          "args": {"summary": "Fall Break", "start": "2026-10-05",
+                                   "end": "2026-10-09"}}]
+    })
+    assert "2026-10-05 to 2026-10-09" in block
+    assert "5 days" in block
+    assert "Collapsing a multi-day event" in block
