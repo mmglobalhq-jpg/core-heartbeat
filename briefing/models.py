@@ -124,6 +124,16 @@ class BriefingDraft:
     briefing_date: dt.date
     sections: list[Section] = field(default_factory=list)
     run_meta: dict = field(default_factory=dict)
+    # Market snapshot and research-report links. Not Sections: neither has a
+    # headline, a body or a single source URL, and Section requires all three so
+    # that every editorial claim is traceable. Relaxing that to fit a table of
+    # numbers in would weaken the guarantee for the parts that need it.
+    #
+    # Typed loosely (``object``/``list``) so this module keeps no import of
+    # briefing.market — which pulls yfinance, and therefore pandas — into every
+    # consumer of the data shapes. models.py is imported by nearly everything.
+    market: object | None = None
+    reports: list = field(default_factory=list)
 
     @property
     def top(self) -> list[Section]:

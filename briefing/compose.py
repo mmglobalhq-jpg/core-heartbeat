@@ -179,7 +179,14 @@ def compose_deep_dive(
 
 
 def validate_structure(sections: list[Section], *, top_count: int | None = None) -> None:
-    """Refuse to persist a briefing that is not the shape it claims to be."""
+    """Refuse to persist a briefing that is not the shape it claims to be.
+
+    ``top_count`` is the number of items ACTUALLY composed, which since the move
+    to a 10-item list may legitimately be fewer than ``config.TOP_COUNT`` on a
+    thin news day. The floor is enforced upstream in ``run.build_briefing``; what
+    is checked here is internal consistency — ranks are contiguous from 1, every
+    section is complete, and nothing is silently missing.
+    """
     expected = config.TOP_COUNT if top_count is None else top_count
     top = [s for s in sections if s.kind == "top"]
     deep = [s for s in sections if s.kind == "deep_dive"]
@@ -187,7 +194,9 @@ def validate_structure(sections: list[Section], *, top_count: int | None = None)
     if len(top) != expected:
         raise CompositionError(f"expected {expected} top items, got {len(top)}")
     if len(deep) != config.DEEP_DIVE_COUNT:
-        raise CompositionError(f"expected exactly one deep dive, got {len(deep)}")
+        raise CompositionError(
+            f"expected {config.DEEP_DIVE_COUNT} deep dive(s), got {len(deep)}"
+        )
     if sorted(s.rank for s in top) != list(range(1, expected + 1)):
         raise CompositionError(f"top ranks must be 1..{expected}, got {sorted(s.rank for s in top)}")
     for section in sections:

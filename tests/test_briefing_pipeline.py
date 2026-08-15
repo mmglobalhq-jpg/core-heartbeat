@@ -245,7 +245,7 @@ class TestCompose:
 
 
 class TestValidateStructure:
-    def _sections(self, n=5, deep=True):
+    def _sections(self, n=5, deep=False):
         out = [Section("top", i, f"H{i}", "body", f"https://x.example/{i}") for i in range(1, n + 1)]
         if deep:
             out.append(Section("deep_dive", 1, "D", "body", "https://x.example/d"))
@@ -254,18 +254,28 @@ class TestValidateStructure:
     def test_accepts_a_correct_briefing(self):
         validate_structure(self._sections(), top_count=5)
 
+    def test_accepts_a_ten_item_list(self):
+        """The list went 5 -> 10 on 2026-08-15."""
+        validate_structure(self._sections(10), top_count=10)
+
     def test_rejects_four_items(self):
         with pytest.raises(CompositionError, match="expected 5 top"):
             validate_structure(self._sections(4), top_count=5)
 
-    def test_rejects_a_missing_deep_dive(self):
-        with pytest.raises(CompositionError, match="exactly one deep dive"):
-            validate_structure(self._sections(deep=False), top_count=5)
+    def test_a_briefing_with_no_deep_dive_is_correct_now(self):
+        """The Deep Dive was removed 2026-08-15; its ABSENCE is the spec."""
+        validate_structure(self._sections(deep=False), top_count=5)
 
-    def test_rejects_two_deep_dives(self):
+    def test_rejects_an_unexpected_deep_dive(self):
+        """DEEP_DIVE_COUNT is 0, so a stray deep dive is a shape error.
+
+        Kept rather than deleted: it is what catches the section coming back by
+        accident, and it is the test that must flip if it is ever restored on
+        purpose.
+        """
         sections = self._sections()
-        sections.append(Section("deep_dive", 2, "D2", "body", "https://x.example/d2"))
-        with pytest.raises(CompositionError, match="exactly one deep dive"):
+        sections.append(Section("deep_dive", 1, "D", "body", "https://x.example/d"))
+        with pytest.raises(CompositionError, match="deep dive"):
             validate_structure(sections, top_count=5)
 
     def test_rejects_a_section_with_no_source_url(self):
@@ -376,24 +386,26 @@ class TestBudget:
 # --- rendering ---------------------------------------------------------------
 
 
-def draft():
+def draft(n=10, market=None, reports=None):
     return BriefingDraft(
         user_id="u1",
         briefing_date=dt.date(2026, 8, 6),
         sections=[Section("top", i, f"Headline {i}", f"Body {i}.", f"https://x.example/{i}",
-                          source_name="Outlet") for i in range(1, 6)]
-        + [Section("deep_dive", 1, "Deep headline", "Para one.\n\nPara two.",
-                   "https://x.example/deep", source_name="Outlet")],
+                          source_name="Outlet") for i in range(1, n + 1)],
         run_meta={"sources_ok": 4},
+        market=market,
+        reports=reports or [],
     )
 
 
 class TestRender:
     def test_html_contains_every_section(self):
         html = render_html(draft())
-        for i in range(1, 6):
+        for i in range(1, 11):
             assert f"Headline {i}" in html
-        assert "Deep headline" in html
+
+    def test_no_deep_dive_block_is_rendered(self):
+        assert "Deep Dive" not in render_html(draft())
 
     def test_headlines_are_escaped(self):
         # A headline is attacker-controlled text off the public web.
@@ -497,6 +509,20 @@ class TestFeedparserIsAProductionDependency:
 
     def test_feedparser_is_importable(self):
         import feedparser  # noqa: F401
+
+    def test_yfinance_is_pinned_in_requirements(self):
+        """Same trap as feedparser, same guard.
+
+        The market section fetches index closes through yfinance. Importable in
+        the dev venv is exactly what feedparser was while being absent from the
+        image, and the failure mode is the same shape: the briefing still sends,
+        with the data section quietly missing.
+        """
+        import pathlib
+
+        req = pathlib.Path(__file__).parent.parent / "requirements.txt"
+        assert any(line.startswith("yfinance==")
+                   for line in req.read_text().splitlines())
 
 
 class TestDedupThresholdIsInTheMeasuredBand:

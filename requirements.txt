@@ -19,6 +19,17 @@ distro==1.9.0
 # image doesn't carry the multi-GB CUDA build (this box has no GPU). Transitive deps
 # are resolved by docling's own pins rather than fully pinned here.
 docling==2.111.0
+# Market data for the daily briefing's data section (equity index closes).
+# Treasury yields come from FRED, which needs no client library. yfinance pulls
+# pandas + numpy; that is the cost of the section and is why it is pinned here
+# rather than left implicit — feedparser was "installed in the dev venv" and
+# absent from the image for the whole of the briefing's first day.
+#
+# yfinance reads Yahoo's undocumented endpoints and states its data is for
+# personal use. This is a single-user personal briefing, which is that use, but
+# it is a departure from the news pipeline's documented-sources-only rule and is
+# recorded in briefing/market.py.
+yfinance==1.6.0
 fastapi==0.139.0
 feedparser==6.0.14
 google-auth==2.55.1

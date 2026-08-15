@@ -25,6 +25,7 @@ import sys
 from zoneinfo import ZoneInfo
 
 from briefing import config
+from briefing import market, reports
 from briefing.compose import compose_deep_dive, compose_top, validate_structure
 from briefing.dedup import select
 from briefing.delivery import sender_for
@@ -107,10 +108,19 @@ def build_briefing(
         # token matcher reported a different number from the one the ranker used
         # — the same drift that made `in_top` read 1 when the answer was 2.
         meta["topics_matched"] = calibration.get("matched_by_topic", {})
-    if len(top) < count:
+    # A 10-item target can genuinely outrun a quiet news day, so a shortfall
+    # shortens the briefing rather than failing it. The floor is what separates
+    # "slow news" from "ingestion or clustering is broken" — below it, something
+    # upstream is wrong and a stub email would hide that.
+    if len(top) < config.MIN_TOP_COUNT:
         raise RuntimeError(
-            f"only {len(top)} distinct stories after clustering; need {count}"
+            f"only {len(top)} distinct stories after clustering; "
+            f"need at least {config.MIN_TOP_COUNT}"
         )
+    if len(top) < count:
+        logger.warning("thin day: %d stories available, wanted %d", len(top), count)
+        meta["short_list"] = {"wanted": count, "got": len(top)}
+        count = len(top)
     meta["clusters"] = len(top) + (1 if deep else 0)
 
     logger.info("enriching %d selected stories", len(top) + (1 if deep else 0))
@@ -121,7 +131,10 @@ def build_briefing(
     logger.info("composing")
     sections, top_meta = compose_top(top, budget=budget)
     meta["compose"] = top_meta
-    if deep is not None:
+    # The Deep Dive was removed on 2026-08-15 in favour of a longer list.
+    # compose_deep_dive is still imported and tested; setting DEEP_DIVE_COUNT
+    # back to 1 is all that is needed to restore the section.
+    if config.DEEP_DIVE_COUNT and deep is not None:
         deep_section, deep_meta = compose_deep_dive(deep, budget=budget)
         sections.append(deep_section)
         meta.update(deep_meta)
@@ -130,6 +143,20 @@ def build_briefing(
         logger.info("editorial pass")
         sections, editorial_meta = polish_sections(sections, budget=budget)
         meta["editorial"] = editorial_meta
+
+    # Data section and report links. Deliberately AFTER composition: both are
+    # best-effort, and fetching them first would put a slow external call in
+    # front of the work that actually produces the briefing. Neither can raise —
+    # see the module docstrings — so no try/except is needed here, and adding one
+    # would hide a contract violation rather than handle it.
+    market_snapshot = market.market_snapshot()
+    if market_snapshot is not None:
+        meta["market"] = market_snapshot.meta()
+        if not market_snapshot.has_data:
+            logger.warning("market data unavailable: %s", market_snapshot.errors)
+
+    report_links = reports.recent_reports()
+    meta["reports"] = reports.reports_meta(report_links)
 
     # Before persistence, not after.
     validate_structure(sections, top_count=count)
@@ -144,6 +171,8 @@ def build_briefing(
         briefing_date=local_date(timezone),
         sections=sections,
         run_meta=meta,
+        market=market_snapshot,
+        reports=report_links,
     )
 
 

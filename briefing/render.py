@@ -39,6 +39,73 @@ HTML_TEMPLATE = """\
     <div style="font-size:22px;font-weight:700;margin-top:4px;">{{ date_label }}</div>
   </div>
 
+  {% if market and market.has_data %}
+  <div style="margin-top:20px;padding:14px 16px;background:#ffffff;border:1px solid #e3e5e9;border-radius:8px;">
+    {% if market.indices %}
+    <div style="font-size:11px;letter-spacing:.08em;text-transform:uppercase;color:#5b6270;">
+      Markets &middot; close {{ market.indices[0].as_of.strftime('%a %-d %b') }}
+    </div>
+    <table role="presentation" cellpadding="0" cellspacing="0" style="width:100%;margin-top:8px;font-size:14px;">
+      {% for q in market.indices %}
+      <tr>
+        <td style="padding:3px 0;color:#2c3038;">{{ q.label }}</td>
+        <td style="padding:3px 0;text-align:right;font-variant-numeric:tabular-nums;">{{ '{:,.2f}'.format(q.close) }}</td>
+        <td style="padding:3px 0 3px 12px;text-align:right;font-variant-numeric:tabular-nums;
+                   color:{{ '#1a7f4b' if q.change >= 0 else '#b3261e' }};">
+          {{ '{:+,.2f}'.format(q.change) }}
+        </td>
+        <td style="padding:3px 0 3px 10px;text-align:right;font-variant-numeric:tabular-nums;
+                   color:{{ '#1a7f4b' if q.change >= 0 else '#b3261e' }};">
+          {{ '{:+.2f}%'.format(q.pct_change) }}
+        </td>
+      </tr>
+      {% endfor %}
+    </table>
+    {% endif %}
+
+    {% if market.yields %}
+    <div style="font-size:11px;letter-spacing:.08em;text-transform:uppercase;color:#5b6270;
+                margin-top:14px;padding-top:12px;border-top:1px solid #eceef1;">
+      Treasuries &middot; {{ market.yields[0].as_of.strftime('%a %-d %b') }}
+    </div>
+    <table role="presentation" cellpadding="0" cellspacing="0" style="width:100%;margin-top:8px;font-size:14px;">
+      {% for y in market.yields %}
+      <tr>
+        <td style="padding:3px 0;color:#2c3038;">{{ y.label }}</td>
+        <td style="padding:3px 0;text-align:right;font-variant-numeric:tabular-nums;">{{ '{:.2f}%'.format(y.yield_pct) }}</td>
+        <td style="padding:3px 0 3px 12px;text-align:right;font-variant-numeric:tabular-nums;
+                   color:{{ '#1a7f4b' if y.change_bps >= 0 else '#b3261e' }};">
+          {{ '{:+.0f} bps'.format(y.change_bps) }}
+        </td>
+      </tr>
+      {% endfor %}
+      {% if market.spreads %}
+      <tr><td colspan="3" style="padding:8px 0 0;font-size:13px;color:#5b6270;
+                                 font-variant-numeric:tabular-nums;">
+        {% for sp in market.spreads %}{{ sp.label }} {{ '{:+.0f}'.format(sp.value_bps) }} bps{% if not loop.last %} &middot; {% endif %}{% endfor %}
+      </td></tr>
+      {% endif %}
+    </table>
+    {% endif %}
+  </div>
+  {% endif %}
+
+  {% if reports %}
+  <div style="margin-top:20px;padding:14px 16px;background:#ffffff;border:1px solid #e3e5e9;border-radius:8px;">
+    <div style="font-size:11px;letter-spacing:.08em;text-transform:uppercase;color:#5b6270;">
+      Research
+    </div>
+    <ul style="margin:8px 0 0;padding-left:18px;font-size:14px;color:#2c3038;">
+      {% for r in reports %}
+      <li style="margin:0 0 6px;">
+        <a href="{{ r.url }}" style="color:#16181d;">{{ r.title }}</a>
+        <span style="color:#8a90a0;">&mdash; {{ r.issuer_code }}, {{ r.published_on.strftime('%-d %b') }}</span>
+      </li>
+      {% endfor %}
+    </ul>
+  </div>
+  {% endif %}
+
   <div style="font-size:12px;letter-spacing:.08em;text-transform:uppercase;
               color:#5b6270;margin:24px 0 8px;">Top {{ top|length }}</div>
 
@@ -56,19 +123,6 @@ HTML_TEMPLATE = """\
   </div>
   {% endfor %}
 
-  {% if deep_dive %}
-  <div style="margin-top:28px;padding:18px;background:#ffffff;border:1px solid #e3e5e9;border-radius:8px;">
-    <div style="font-size:12px;letter-spacing:.08em;text-transform:uppercase;
-                color:#5b6270;margin-bottom:8px;">Deep Dive</div>
-    <div style="font-size:18px;font-weight:650;margin-bottom:10px;">
-      <a href="{{ deep_dive.url }}" style="color:#16181d;text-decoration:none;">{{ deep_dive.headline }}</a>
-    </div>
-    {% for para in deep_dive_paragraphs %}
-    <p style="font-size:15px;color:#2c3038;margin:0 0 12px;">{{ para }}</p>
-    {% endfor %}
-    <div style="font-size:12px;color:#8a90a0;">{{ deep_dive.source_name or 'source' }}</div>
-  </div>
-  {% endif %}
 
   <div style="margin-top:28px;font-size:11px;color:#8a90a0;line-height:1.5;">
     Assembled from {{ meta.sources_ok|default(0) }} sources.
@@ -84,20 +138,34 @@ HTML_TEMPLATE = """\
 
 TEXT_TEMPLATE = """\
 DAILY BRIEFING — {{ date_label }}
-
+{% if market and market.indices %}
+MARKETS — close {{ market.indices[0].as_of.strftime('%a %-d %b') }}
+{% for q in market.indices %}
+  {{ '%-10s'|format(q.label) }} {{ '{:>12,.2f}'.format(q.close) }}  {{ '{:>+9,.2f}'.format(q.change) }}  {{ '{:>+7.2f}%'.format(q.pct_change) }}
+{%- endfor %}
+{% endif %}
+{%- if market and market.yields %}
+TREASURIES — {{ market.yields[0].as_of.strftime('%a %-d %b') }}
+{% for y in market.yields %}
+  {{ '%-10s'|format(y.label) }} {{ '{:>7.2f}%'.format(y.yield_pct) }}  {{ '{:>+5.0f} bps'.format(y.change_bps) }}
+{%- endfor %}
+{% if market.spreads %}
+  {% for sp in market.spreads %}{{ sp.label }} {{ '{:+.0f}'.format(sp.value_bps) }} bps{% if not loop.last %} · {% endif %}{% endfor %}
+{% endif %}
+{% endif %}
+{%- if reports %}
+RESEARCH
+{% for r in reports %}
+  * {{ r.title }}
+    {{ r.issuer_code }}, {{ r.published_on.strftime('%-d %b') }} — {{ r.url }}
+{%- endfor %}
+{% endif %}
 TOP {{ top|length }}
 {% for section in top %}
 {{ section.rank }}. {{ section.headline }}
    {{ section.body }}
    {{ section.source_name or 'source' }} — {{ section.url }}
 {% endfor %}
-{% if deep_dive %}
-DEEP DIVE — {{ deep_dive.headline }}
-
-{{ deep_dive.body }}
-
-{{ deep_dive.source_name or 'source' }} — {{ deep_dive.url }}
-{% endif %}
 --
 Assembled from {{ meta.sources_ok|default(0) }} sources.
 """
@@ -108,10 +176,14 @@ def _context(draft: BriefingDraft) -> dict:
     return {
         "date_label": draft.briefing_date.strftime("%A, %-d %B %Y"),
         "top": draft.top,
+        # The Deep Dive was removed on 2026-08-15. These stay in the context so
+        # a historical briefing — which still has its deep_dive row — renders
+        # unchanged if it is ever re-rendered, and so restoring the section is a
+        # template change rather than a plumbing change.
         "deep_dive": deep,
-        # Split for HTML only. The plain-text version keeps the original blank
-        # lines, so it does not need this.
         "deep_dive_paragraphs": [p.strip() for p in (deep.body if deep else "").split("\n") if p.strip()],
+        "market": draft.market,
+        "reports": draft.reports or [],
         "meta": draft.run_meta,
     }
 

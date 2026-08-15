@@ -65,6 +65,49 @@ def _section_row(briefing_id: str, section: Section) -> dict[str, Any]:
 # --- SQL (development / end-to-end) ------------------------------------------
 
 
+def _market_json(draft) -> str | None:
+    """The market snapshot as stored jsonb, or None.
+
+    Denormalized on purpose, for the same reason section bodies are: FRED
+    restates H.15 series, and a briefing whose numbers silently changed after
+    the fact would be worse than one that is plainly a snapshot of what was sent.
+
+    Shared by both repositories so the two storage paths cannot drift — the
+    PostgREST one is the production path and was, for a long time, covered only
+    by mock-transport tests.
+    """
+    snap = getattr(draft, "market", None)
+    if snap is None or not getattr(snap, "has_data", False):
+        return None
+    return json.dumps({
+        "indices": [
+            {"label": q.label, "close": q.close, "change": q.change,
+             "pct_change": q.pct_change, "as_of": q.as_of.isoformat()}
+            for q in snap.indices
+        ],
+        "yields": [
+            {"label": y.label, "yield_pct": y.yield_pct, "change_bps": y.change_bps,
+             "as_of": y.as_of.isoformat()}
+            for y in snap.yields
+        ],
+        "spreads": [
+            {"label": sp.label, "value_bps": sp.value_bps, "as_of": sp.as_of.isoformat()}
+            for sp in snap.spreads
+        ],
+    })
+
+
+def _reports_json(draft) -> str | None:
+    links = getattr(draft, "reports", None) or []
+    if not links:
+        return None
+    return json.dumps([
+        {"issuer_code": r.issuer_code, "issuer_name": r.issuer_name, "title": r.title,
+         "url": r.url, "published_on": r.published_on.isoformat()}
+        for r in links
+    ])
+
+
 class PostgresRepository:
     """Direct SQL. Used against the isolated test database."""
 
@@ -108,16 +151,20 @@ class PostgresRepository:
             cur.execute(
                 """
                 insert into public.briefings
-                    (user_id, briefing_date, status, timezone, generated_at, run_meta)
-                values (%s, %s, 'ready', %s, now(), %s)
+                    (user_id, briefing_date, status, timezone, generated_at, run_meta,
+                     market_data, report_links)
+                values (%s, %s, 'ready', %s, now(), %s, %s, %s)
                 on conflict (user_id, briefing_date) do update
                     set status = 'ready', generated_at = now(),
-                        run_meta = excluded.run_meta
+                        run_meta = excluded.run_meta,
+                        market_data = excluded.market_data,
+                        report_links = excluded.report_links
                 returning id
                 """,
                 (draft.user_id, draft.briefing_date,
                  draft.run_meta.get("timezone", "America/Chicago"),
-                 json.dumps(draft.run_meta)),
+                 json.dumps(draft.run_meta),
+                 _market_json(draft), _reports_json(draft)),
             )
             return str(cur.fetchone()[0])
 
@@ -258,6 +305,9 @@ class PostgrestRepository:
             "timezone": draft.run_meta.get("timezone", "America/Chicago"),
             "generated_at": dt.datetime.now(dt.UTC).isoformat(),
             "run_meta": draft.run_meta,
+            # json.loads because PostgREST takes a JSON body, not a jsonb literal.
+            "market_data": json.loads(_market_json(draft) or "null"),
+            "report_links": json.loads(_reports_json(draft) or "null"),
         }
         with self._client() as client:
             response = client.post(

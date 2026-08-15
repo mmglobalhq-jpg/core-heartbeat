@@ -12,13 +12,34 @@ from urllib.parse import urlsplit
 
 # --- structure ---------------------------------------------------------------
 
-TOP_COUNT = int(os.environ.get("BRIEFING_TOP_COUNT", "5"))
-"""Always this many. A briefing that sometimes has four items trains the reader
-to wonder whether something was dropped."""
+TOP_COUNT = int(os.environ.get("BRIEFING_TOP_COUNT", "10"))
+"""Target length of the list. Raised 5 -> 10 on 2026-08-15.
 
-DEEP_DIVE_COUNT = 1
-"""Structural, not configurable. 'Exactly one Deep Dive' is part of what the
-product is; making it a knob would let a bad config produce a shapeless email."""
+Still "always this many" when the day supplies it — a briefing that silently
+varies trains the reader to wonder what was dropped. But at 10 the list can
+genuinely outrun a thin news day, so a shortfall now renders a shorter briefing
+rather than raising. See MIN_TOP_COUNT."""
+
+MIN_TOP_COUNT = int(os.environ.get("BRIEFING_MIN_TOP_COUNT", "6"))
+"""Below this, the run fails rather than sending a stub.
+
+At 5 items the old pipeline raised on a shortfall, which was right: five was the
+product, and four meant something had gone wrong upstream. At 10 that logic
+inverts — demanding 10 every day would turn an ordinary quiet Sunday into a
+failed briefing and no email at all. So a shortfall degrades, with a floor: fewer
+than MIN_TOP_COUNT distinct stories means clustering or ingestion is broken, not
+that the news was slow, and that should still fail loudly."""
+
+DEEP_DIVE_COUNT = 0
+"""Removed 2026-08-15 (was 1).
+
+The Deep Dive was the one section where a hosted model was worth paying for, and
+it is where MAX_ESCALATIONS was mostly spent. With a 10-item list the reader gets
+breadth instead; the freed escalation budget goes to the summaries.
+
+Left as a constant rather than deleted: `validate_structure` still checks against
+it, historical briefings still contain deep_dive rows, and the database still
+enforces "at most one". Setting this back to 1 restores the section."""
 
 # --- ingestion ---------------------------------------------------------------
 
@@ -80,7 +101,7 @@ The original 0.86 came with a comment justifying it as deliberately cautious.
 That reasoning was sound and the number was still wrong: nothing had measured
 where real duplicates actually score."""
 
-MAX_PER_CATEGORY = int(os.environ.get("BRIEFING_MAX_PER_CATEGORY", "2"))
+MAX_PER_CATEGORY = int(os.environ.get("BRIEFING_MAX_PER_CATEGORY", "3"))
 """Ceiling on Top-N slots one SUBJECT AREA may hold, using each source's declared
 topic (sport, business, technology, world, science, local).
 
@@ -92,7 +113,14 @@ else. Capping the outlet is not the same as capping the subject.
 The cap is per category rather than a special case for sport, because the same
 thing happens to whichever area gets the most feeds. Relaxed rather than enforced
 when there are too few categories to fill the list, exactly like MAX_PER_SOURCE:
-the fixed structure outranks the balance preference."""
+the fixed structure outranks the balance preference.
+
+Raised 2 -> 3 on 2026-08-15 with the move to a 10-item list. There are five
+configured categories, so a cap of 2 put a hard ceiling of exactly 10 on the
+list — no headroom at all, and any category short of two usable clusters made a
+full list unreachable. 3 gives a ceiling of 15. The balance preference is
+weakened slightly and deliberately: a ceiling equal to the target is not a
+preference, it is a constraint that fails."""
 
 MAX_PER_SOURCE = int(os.environ.get("BRIEFING_MAX_PER_SOURCE", "2"))
 """Ceiling on Top-N slots one outlet may hold.
