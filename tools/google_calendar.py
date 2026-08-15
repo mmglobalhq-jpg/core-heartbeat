@@ -248,19 +248,61 @@ def _calendar_tz(token: str) -> str:
         return "UTC"
 
 
-def _time_field(value: str, tz: str) -> dict:
-    """Build a Calendar start/end object. A bare YYYY-MM-DD is an all-day date;
-    anything else is treated as a dateTime interpreted in the calendar's timezone."""
+def _is_all_day(value: str) -> bool:
+    """True for a bare ``YYYY-MM-DD`` (no time component)."""
+    return len(value) == 10 and value[4] == "-" and value[7] == "-"
+
+
+def _time_field(value: str, tz: str, *, is_end: bool = False) -> dict:
+    """Build a Calendar start/end object.
+
+    A bare ``YYYY-MM-DD`` is an all-day date; anything else is a dateTime
+    interpreted in the calendar's timezone.
+
+    **Google treats all-day ``end.date`` as EXCLUSIVE.** This tool's own contract
+    is INCLUSIVE — ``start=2026-08-03, end=2026-08-07`` means "Monday through
+    Friday", which is what both a person and a model mean by that range — so the
+    end date is advanced by one day on the way out.
+
+    Without this, every multi-day all-day event landed a day short and a
+    single-day one (start == end) produced a zero-length range Google rejects.
+    It went unnoticed because the whole all-day path had no test coverage: the
+    suite only ever asserted ``dateTime`` events.
+    """
     v = (value or "").strip()
-    if len(v) == 10 and v[4] == "-" and v[7] == "-":
+    if _is_all_day(v):
+        if is_end:
+            try:
+                exclusive = datetime.strptime(v, "%Y-%m-%d").date() + timedelta(days=1)
+                return {"date": exclusive.isoformat()}
+            except ValueError:
+                # Malformed date that still matched the shape check: hand it to
+                # Google unchanged and let its 400 be the error, rather than
+                # silently inventing a different day.
+                return {"date": v}
         return {"date": v}
     return {"dateTime": v, "timeZone": tz}
 
 
 def _fmt_event(e: dict) -> str:
+    """Render one event for the model.
+
+    All-day ends are converted back from Google's EXCLUSIVE ``end.date`` to the
+    inclusive last day, so read and write use the same convention. Without this,
+    listing a Mon–Fri event reported it ending Saturday, and asking the model to
+    recreate or amend it would walk the end date forward by a day each round trip.
+    """
     summary = e.get("summary") or "(no title)"
-    start = (e.get("start") or {}).get("dateTime") or (e.get("start") or {}).get("date") or "?"
-    end = (e.get("end") or {}).get("dateTime") or (e.get("end") or {}).get("date") or "?"
+    start_o, end_o = e.get("start") or {}, e.get("end") or {}
+    start = start_o.get("dateTime") or start_o.get("date") or "?"
+    end = end_o.get("dateTime") or end_o.get("date") or "?"
+    if not end_o.get("dateTime") and end_o.get("date") and _is_all_day(end):
+        try:
+            end = (
+                datetime.strptime(end, "%Y-%m-%d").date() - timedelta(days=1)
+            ).isoformat()
+        except ValueError:
+            pass  # leave it as Google sent it rather than guess
     loc = e.get("location")
     tail = f" @ {loc}" if loc else ""
     return f"• {summary} — {start} to {end}{tail}  [id: {e.get('id')}]"
@@ -325,7 +367,11 @@ def create_event(user_id: str, args: dict) -> str:
     if not summary or not start or not end:
         return "error: create_calendar_event needs summary, start, and end (ISO 8601)."
     tz = _calendar_tz(token)
-    body: dict = {"summary": summary, "start": _time_field(start, tz), "end": _time_field(end, tz)}
+    body: dict = {
+        "summary": summary,
+        "start": _time_field(start, tz),
+        "end": _time_field(end, tz, is_end=True),
+    }
     if args.get("description"):
         body["description"] = args["description"]
     if args.get("location"):
@@ -351,7 +397,7 @@ def update_event(user_id: str, args: dict) -> str:
         if args.get("start"):
             body["start"] = _time_field(args["start"], tz)
         if args.get("end"):
-            body["end"] = _time_field(args["end"], tz)
+            body["end"] = _time_field(args["end"], tz, is_end=True)
     if not body:
         return "error: nothing to update — provide a field to change (summary/start/end/location/description)."
     e = _cal("PATCH", f"/calendars/primary/events/{event_id}", token, json_body=body).json()

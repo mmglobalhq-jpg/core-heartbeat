@@ -34,6 +34,7 @@ from typing import Annotated
 from langchain_core.tools import tool
 from langgraph.prebuilt import InjectedState
 
+from tools.attachments import run_attachment_tool
 from tools.daily_briefing import BRIEFING_WRITE_TOOLS, run_briefing_tool
 from tools.google_calendar import run_calendar_tool
 from tools.graphrag import run_graphrag_tool
@@ -166,6 +167,12 @@ def create_calendar_event(
     "2026-08-21T19:00:00"), or "YYYY-MM-DD" for an all-day event. Resolve relative
     dates ("next Friday") against the current date given in the prompt; if a date or
     time is genuinely ambiguous, ask rather than guessing.
+
+    All-day date ranges are INCLUSIVE of both ends. A holiday running Monday to
+    Friday 3-7 August is start="2026-08-03", end="2026-08-07" — one call, not five.
+    A single all-day event repeats the date: start=end="2026-08-03". Never collapse
+    a multi-day range to its first day, and never split one into separate events
+    per day.
 
     To add several events, emit one call per event in the same response — they run
     together. Confirm with the user before creating a large batch.
@@ -379,7 +386,33 @@ def remove_briefing_topic(topic: str, state: Annotated[dict, InjectedState]) -> 
     return run_briefing_tool("remove_briefing_topic", _uid(state), {"topic": topic})
 
 
+@tool
+def reread_attachment(
+    doc_id: str,
+    question: str,
+    state: Annotated[dict, InjectedState],
+) -> str:
+    """Look again at an image the user attached EARLIER in this conversation.
+
+    You are shown an attached image only on the turn it is sent. On any later turn
+    you cannot see it. If the user refers back to an image — "check the image
+    again", "what about X on the schedule", "you got that date wrong" — you MUST
+    call this rather than answering from memory or from the extracted text. Recalling
+    what an image said is how wrong dates and figures get invented.
+
+    doc_id comes from the attachment list given in the prompt. Ask one specific
+    question: "what dates are listed for Fall Break?" beats "what does this say".
+
+    If it reports that the image cannot be viewed or read, tell the user that
+    plainly. Never fill the gap with a plausible answer.
+    """
+    return run_attachment_tool(
+        "reread_attachment", _uid(state), {"doc_id": doc_id, "question": question}
+    )
+
+
 ALL_TOOLS = [
+    reread_attachment,
     read_user_note,
     search_user_vault,
     write_user_note,

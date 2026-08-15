@@ -23,6 +23,7 @@ execute is as much a defect as the reverse.
 
 import orchestrator
 from models import RoutingDecision, ToolArgs
+from tools.attachments import ATTACHMENT_TOOL_REGISTRY
 from tools.daily_briefing import BRIEFING_TOOL_REGISTRY
 from tools.google_calendar import CALENDAR_TOOL_REGISTRY
 from tools.graphrag import GRAPHRAG_TOOL_REGISTRY
@@ -40,6 +41,7 @@ def dispatchable_tools() -> set[str]:
         | set(REIT_TOOL_REGISTRY)
         | set(BRIEFING_TOOL_REGISTRY)
         | set(WEB_TOOL_REGISTRY)
+        | set(ATTACHMENT_TOOL_REGISTRY)
     )
 
 

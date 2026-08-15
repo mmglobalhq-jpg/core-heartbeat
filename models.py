@@ -178,6 +178,8 @@ class RoutingDecision(BaseModel):
         "get_briefing_preferences", "list_briefing_sources",
         "get_latest_briefing", "search_briefings",
         "add_briefing_topic", "remove_briefing_topic",
+        # attachments (per-user): re-open an image sent earlier in the chat
+        "reread_attachment",
     ] | None = None
     tool_args: ToolArgs = Field(default_factory=ToolArgs)
 

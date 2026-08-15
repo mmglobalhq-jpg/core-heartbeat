@@ -237,3 +237,119 @@ def test_an_unparsable_body_does_not_crash_the_explanation():
 def test_oauth_style_string_error_is_handled():
     r = _resp(400, {"error": "invalid_grant"})
     assert _google_error(r) == ("invalid_grant", "")
+
+
+# --- all-day events -----------------------------------------------------------
+#
+# Google treats all-day `end.date` as EXCLUSIVE. The tool's own contract is
+# INCLUSIVE, so the adapter shifts on the way out and back on the way in. None of
+# this had any coverage before 2026-08-15 — the suite only ever asserted dateTime
+# events — which is why every multi-day all-day event silently landed a day short.
+
+
+def _capture_handler(creds_row, sent):
+    """Like _handler but records the exact JSON body sent to Google."""
+    def h(request: httpx.Request) -> httpx.Response:
+        url, method = str(request.url), request.method
+        base = url.split("?")[0]
+        if "/rest/v1/google_credentials" in url:
+            return httpx.Response(200, json=[creds_row]) if method == "GET" else httpx.Response(204)
+        if base == gc.GOOGLE_TOKEN_URL:
+            return httpx.Response(200, json={"access_token": "at", "expires_in": 3600})
+        if base.endswith("/calendars/primary"):
+            return httpx.Response(200, json={"timeZone": "America/Chicago"})
+        if base.endswith("/calendars/primary/events") and method == "POST":
+            body = json.loads(request.content)
+            sent.append(body)
+            return httpx.Response(200, json={"id": "new1", **body})
+        if "/calendars/primary/events/" in base and method == "PATCH":
+            body = json.loads(request.content)
+            sent.append(body)
+            return httpx.Response(200, json={"id": "ev1", **body})
+        return httpx.Response(404, json={"error": "unhandled"})
+    return h
+
+
+def _create(args, sent):
+    _install(_capture_handler(_creds(datetime.now(timezone.utc) + timedelta(hours=1)), sent))
+    try:
+        return gc.run_calendar_tool("create_calendar_event", UID, args)
+    finally:
+        _reset()
+
+
+def test_multi_day_all_day_range_sends_exclusive_end_to_google(env):
+    """Mon-Fri 3-7 Aug must reach Google as end.date = the 8th.
+
+    This is the regression: sending the 7th made Google render Mon-Thu, quietly
+    dropping the last day of every multi-day holiday.
+    """
+    sent = []
+    _create({"summary": "Fall Break", "start": "2026-08-03", "end": "2026-08-07"}, sent)
+    assert sent[0]["start"] == {"date": "2026-08-03"}
+    assert sent[0]["end"] == {"date": "2026-08-08"}
+
+
+def test_single_day_all_day_event_is_not_zero_length(env):
+    """start == end is one day, and Google needs end = the following day.
+
+    Sent unchanged it is an empty range, which Google rejects outright.
+    """
+    sent = []
+    _create({"summary": "Labor Day", "start": "2026-09-07", "end": "2026-09-07"}, sent)
+    assert sent[0]["start"] == {"date": "2026-09-07"}
+    assert sent[0]["end"] == {"date": "2026-09-08"}
+
+
+def test_month_and_year_boundaries_roll_correctly(env):
+    for start, end, expect in (
+        ("2026-08-30", "2026-08-31", "2026-09-01"),
+        ("2026-12-30", "2026-12-31", "2027-01-01"),
+        ("2028-02-28", "2028-02-29", "2028-03-01"),   # leap year
+    ):
+        sent = []
+        _create({"summary": "x", "start": start, "end": end}, sent)
+        assert sent[0]["end"] == {"date": expect}, f"{end} -> {expect}"
+
+
+def test_timed_events_are_untouched_by_the_all_day_shift(env):
+    """The exclusive-end rule applies ONLY to all-day dates."""
+    sent = []
+    _create({"summary": "Lunch", "start": "2026-07-14T12:00:00",
+             "end": "2026-07-14T13:00:00"}, sent)
+    assert sent[0]["end"] == {"dateTime": "2026-07-14T13:00:00", "timeZone": "America/Chicago"}
+
+
+def test_update_event_also_shifts_an_all_day_end(env):
+    sent = []
+    _install(_capture_handler(_creds(datetime.now(timezone.utc) + timedelta(hours=1)), sent))
+    try:
+        gc.run_calendar_tool("update_calendar_event", UID, {
+            "event_id": "ev1", "start": "2026-08-03", "end": "2026-08-07"})
+    finally:
+        _reset()
+    assert sent[0]["end"] == {"date": "2026-08-08"}
+
+
+def test_listing_an_all_day_event_shows_the_inclusive_last_day(env):
+    """Read and write must use one convention, or a round trip walks the date."""
+    out = gc._fmt_event({
+        "id": "ev1", "summary": "Fall Break",
+        "start": {"date": "2026-08-03"}, "end": {"date": "2026-08-08"},
+    })
+    assert "2026-08-03 to 2026-08-07" in out, out
+
+
+def test_all_day_round_trip_is_stable(env):
+    """Create Mon-Fri, read it back, and get Mon-Fri — not Mon-Sat."""
+    sent = []
+    _create({"summary": "Fall Break", "start": "2026-10-12", "end": "2026-10-16"}, sent)
+    rendered = gc._fmt_event({"id": "e", "summary": "Fall Break", **sent[0]})
+    assert "2026-10-12 to 2026-10-16" in rendered, rendered
+
+
+def test_a_malformed_date_is_passed_through_rather_than_invented(env):
+    """Shape-matches YYYY-MM-DD but isn't a real date: let Google 400 it."""
+    sent = []
+    _create({"summary": "x", "start": "2026-13-45", "end": "2026-13-45"}, sent)
+    assert sent[0]["end"] == {"date": "2026-13-45"}

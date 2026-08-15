@@ -63,6 +63,42 @@ def fetch_content_types(user_id: str, doc_ids: list[str]) -> dict[str, str]:
         return {}
 
 
+def list_chat_documents(user_id: str, chat_id: str) -> list[dict]:
+    """Every document attached anywhere in one conversation, oldest first.
+
+    The chat turn only ever carries the CURRENT message's ``document_ids``, so on
+    a follow-up ("check the image again") the model has no image and, worse, no
+    way to know one exists. This is the lookup that lets it be told what it can
+    re-open, and lets ``reread_attachment`` name a real id.
+
+    Scoped by ``user_id`` as well as ``chat_id`` so a forged chat id cannot list
+    another user's attachments. Best-effort: any failure returns ``[]``, which
+    degrades to today's behaviour rather than breaking the turn.
+    """
+    if not chat_id:
+        return []
+    url = (os.environ.get(SUPABASE_URL_ENV) or "").rstrip("/")
+    key = read_secret(SERVICE_ROLE_ENV)
+    if not url or not key:
+        return []
+    try:
+        with httpx.Client(timeout=METADATA_TIMEOUT_S) as c:
+            r = c.get(
+                f"{url}/rest/v1/documents",
+                params={
+                    "select": "id,filename,content_type,status,created_at",
+                    "user_id": f"eq.{user_id}",
+                    "chat_id": f"eq.{chat_id}",
+                    "order": "created_at.asc",
+                },
+                headers={"apikey": key, "Authorization": f"Bearer {key}"},
+            )
+        r.raise_for_status()
+        return [row for row in r.json() if row.get("id")]
+    except Exception:
+        return []
+
+
 def fetch_original(user_id: str, doc_id: str) -> bytes:
     """Read the uploaded original bytes. Raises if the object is missing."""
     client = build_s3_client()
