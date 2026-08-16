@@ -454,6 +454,16 @@ list — MAX_PER_SOURCE still caps any single source."""
 #   AP News       apnews.com/robots.txt has `Disallow: /*.rss`
 #   MarketWatch   robots.txt returns 403 even to an honest agent, on both hosts
 #
+# Checked and REJECTED 2026-08-15, verified through this module's own
+# robots_allows() rather than assumed:
+#   WSJ Markets / WSJ World News   robots.txt disallows this crawler
+#   MarketWatch (dowjones.io host) robots.txt disallows this crawler
+#   BBC World, Guardian International, NPR World   permitted and working, but
+#     each duplicates an outlet already in the list; a second feed from the same
+#     outlet competes for the same MAX_PER_SOURCE slots without adding a view
+#   Investing.com, Seeking Alpha   permitted and working; held back to avoid
+#     adding six business feeds at once. Revisit if markets coverage is still thin
+#
 # Re-check with tests/check_feeds.py rather than assuming; feeds rot quietly.
 DEFAULT_SOURCES: tuple[SourceSpec, ...] = (
     # --- world & general ---
@@ -463,6 +473,17 @@ DEFAULT_SOURCES: tuple[SourceSpec, ...] = (
                "https://feeds.npr.org/1001/rss.xml", weight=1.1),
     SourceSpec("rss", "Guardian World", "world",
                "https://www.theguardian.com/world/rss", weight=1.05),
+    # Added 2026-08-15 to widen world coverage. Three distinct outlets rather
+    # than more feeds from the two already here: BBC World and Guardian
+    # International were both verified working and both rejected, because a
+    # second feed from an outlet already present competes with itself for the
+    # same MAX_PER_SOURCE slots without adding a viewpoint.
+    SourceSpec("rss", "Al Jazeera", "world",
+               "https://www.aljazeera.com/xml/rss/all.xml", weight=1.05),
+    SourceSpec("rss", "DW World", "world",
+               "https://rss.dw.com/rdf/rss-en-world", weight=1.0),
+    SourceSpec("rss", "France 24", "world",
+               "https://www.france24.com/en/rss", weight=1.0),
     # --- business & economy ---
     SourceSpec("rss", "FT Home", "business",
                "https://www.ft.com/rss/home", weight=1.1),
@@ -477,6 +498,15 @@ DEFAULT_SOURCES: tuple[SourceSpec, ...] = (
     # useful analysis, but it would otherwise flood the pool on volume alone.
     SourceSpec("rss", "The Economist", "business",
                "https://www.economist.com/latest/rss.xml", weight=0.85),
+    # Added 2026-08-15. Markets-weighted on purpose: the briefing now opens with
+    # index closes and Treasury yields, and the news underneath it was thin on
+    # anything that explains them.
+    SourceSpec("rss", "Yahoo Finance", "business",
+               "https://finance.yahoo.com/news/rssindex", weight=1.05),
+    SourceSpec("rss", "Guardian Business", "business",
+               "https://www.theguardian.com/uk/business/rss", weight=1.0),
+    SourceSpec("rss", "Fortune", "business",
+               "https://fortune.com/feed/", weight=0.95),
     # --- technology ---
     SourceSpec("rss", "Ars Technica", "technology",
                "https://feeds.arstechnica.com/arstechnica/index"),

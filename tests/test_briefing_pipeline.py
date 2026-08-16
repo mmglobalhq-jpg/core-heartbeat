@@ -1754,3 +1754,62 @@ class TestNonNewsFilter:
         items = [item("How to watch A vs B: TV channel", "https://x.example/1")]
         kept, counts = filter_items(items)
         assert len(kept) == 1 and counts == {}
+
+
+class TestDefaultSourceList:
+    """Invariants on the shipped feed list. Offline — no network here.
+
+    Live reachability is tests/check_feeds.py, which is a manual runner because
+    it makes real requests and honours robots.txt. These are the properties that
+    can rot without anyone fetching anything.
+    """
+
+    def test_every_source_has_a_url_and_a_topic(self):
+        from briefing.sources import DEFAULT_SOURCES
+
+        for s in DEFAULT_SOURCES:
+            assert s.url and s.url.startswith("http"), s.name
+            assert s.topic.strip(), s.name
+            assert s.kind == "rss", s.name
+
+    def test_no_duplicate_urls(self):
+        """The same feed twice would double an outlet's weight in the pool."""
+        from briefing.sources import DEFAULT_SOURCES
+
+        urls = [s.url for s in DEFAULT_SOURCES]
+        assert len(urls) == len(set(urls))
+
+    def test_enough_categories_to_fill_the_list_under_the_cap(self):
+        """categories x MAX_PER_CATEGORY must EXCEED TOP_COUNT, not equal it.
+
+        On 2026-08-15 the list went to 10 while five categories at a cap of 2
+        gave a ceiling of exactly 10 — no headroom, so any thin category made a
+        full briefing unreachable. A ceiling equal to the target is not a
+        balance preference, it is a constraint that fails.
+        """
+        from briefing import config
+        from briefing.sources import DEFAULT_SOURCES
+
+        categories = {s.topic for s in DEFAULT_SOURCES}
+        ceiling = len(categories) * config.MAX_PER_CATEGORY
+        assert ceiling > config.TOP_COUNT, (
+            f"{len(categories)} categories x {config.MAX_PER_CATEGORY} = {ceiling}, "
+            f"which does not exceed TOP_COUNT={config.TOP_COUNT}"
+        )
+
+    def test_business_and_world_are_the_deepest_categories(self):
+        """They carry the briefing. Sport and local arrive as USER feeds at a
+        higher weight (1.2), so the defaults have to be deep enough to compete."""
+        from briefing.sources import DEFAULT_SOURCES
+        import collections
+
+        by_topic = collections.Counter(s.topic for s in DEFAULT_SOURCES)
+        assert by_topic["business"] >= 6, by_topic
+        assert by_topic["world"] >= 4, by_topic
+
+    def test_no_default_source_outweighs_a_user_feed(self):
+        """A user's own feed is their explicit request and should not be
+        outranked by a default. 1.2 is the weight user_sources are given."""
+        from briefing.sources import DEFAULT_SOURCES
+
+        assert max(s.weight for s in DEFAULT_SOURCES) < 1.2
