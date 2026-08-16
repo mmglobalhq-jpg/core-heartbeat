@@ -133,6 +133,9 @@ class BriefingDraft:
     # briefing.market — which pulls yfinance, and therefore pandas — into every
     # consumer of the data shapes. models.py is imported by nearly everything.
     market: object | None = None
+    # Weekend edition: scores instead of markets. Exactly one of market/sports is
+    # ever populated — the run fetches only the one the day calls for.
+    sports: object | None = None
     reports: list = field(default_factory=list)
 
     @property

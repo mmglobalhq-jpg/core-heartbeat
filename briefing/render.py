@@ -90,6 +90,24 @@ HTML_TEMPLATE = """\
   </div>
   {% endif %}
 
+  {% if sports and sports.has_data %}
+  <div style="margin-top:20px;padding:14px 16px;background:#ffffff;border:1px solid #e3e5e9;border-radius:8px;">
+    <div style="font-size:11px;letter-spacing:.08em;text-transform:uppercase;color:#5b6270;">
+      Scores &middot; {{ sports.date.strftime('%a %-d %b') }}
+    </div>
+    {% for league, games in sports.leagues.items() %}
+    <div style="margin-top:12px;">
+      <div style="font-size:13px;font-weight:650;color:#2c3038;">{{ league }}</div>
+      {% for g in games %}
+      <div style="font-size:14px;color:#2c3038;padding:2px 0;">
+        {{ g.line }}{% if g.featured %} <span style="color:#8a90a0;font-size:12px;">&middot; SEC</span>{% endif %}
+      </div>
+      {% endfor %}
+    </div>
+    {% endfor %}
+  </div>
+  {% endif %}
+
   {% if reports %}
   <div style="margin-top:20px;padding:14px 16px;background:#ffffff;border:1px solid #e3e5e9;border-radius:8px;">
     <div style="font-size:11px;letter-spacing:.08em;text-transform:uppercase;color:#5b6270;">
@@ -153,6 +171,15 @@ TREASURIES — {{ market.yields[0].as_of.strftime('%a %-d %b') }}
   {% for sp in market.spreads %}{{ sp.label }} {{ '{:+.0f}'.format(sp.value_bps) }} bps{% if not loop.last %} · {% endif %}{% endfor %}
 {% endif %}
 {% endif %}
+{%- if sports and sports.has_data %}
+SCORES — {{ sports.date.strftime('%a %-d %b') }}
+{% for league, games in sports.leagues.items() %}
+  {{ league }}
+{%- for g in games %}
+    {{ g.line }}{% if g.featured %}  (SEC){% endif %}
+{%- endfor %}
+{% endfor %}
+{%- endif %}
 {%- if reports %}
 RESEARCH
 {% for r in reports %}
@@ -183,6 +210,7 @@ def _context(draft: BriefingDraft) -> dict:
         "deep_dive": deep,
         "deep_dive_paragraphs": [p.strip() for p in (deep.body if deep else "").split("\n") if p.strip()],
         "market": draft.market,
+        "sports": draft.sports,
         "reports": draft.reports or [],
         "meta": draft.run_meta,
     }

@@ -25,7 +25,7 @@ import sys
 from zoneinfo import ZoneInfo
 
 from briefing import config
-from briefing import market, reports
+from briefing import market, reports, sports
 from briefing.compose import compose_deep_dive, compose_top, validate_structure
 from briefing.dedup import select
 from briefing.delivery import sender_for
@@ -149,11 +149,32 @@ def build_briefing(
     # front of the work that actually produces the briefing. Neither can raise —
     # see the module docstrings — so no try/except is needed here, and adding one
     # would hide a contract violation rather than handle it.
-    market_snapshot = market.market_snapshot()
-    if market_snapshot is not None:
-        meta["market"] = market_snapshot.meta()
-        if not market_snapshot.has_data:
-            logger.warning("market data unavailable: %s", market_snapshot.errors)
+    # WEEKDAY vs WEEKEND: markets Monday-Friday, scores Saturday and Sunday.
+    #
+    # Gated on the BRIEFING's local date, not the data's. Sunday's briefing
+    # therefore carries Saturday's college football, which is the point of the
+    # split — and Monday's briefing goes back to markets showing Friday's close,
+    # because Monday is a weekday even though the data is three days old.
+    #
+    # Only one of the two is fetched. Fetching both and choosing at render time
+    # would double the outbound calls every day to display half of them.
+    today = local_date(timezone)
+    market_snapshot = None
+    sports_snapshot = None
+    if sports.is_weekend(today):
+        # Yesterday's games: Saturday's brief covers Friday, Sunday's covers
+        # Saturday.
+        sports_snapshot = sports.scores_for(today - dt.timedelta(days=1))
+        meta["sports"] = sports_snapshot.meta()
+        if not sports_snapshot.has_data:
+            logger.info("no scores for %s (out of season, or nothing played)",
+                        today - dt.timedelta(days=1))
+    else:
+        market_snapshot = market.market_snapshot()
+        if market_snapshot is not None:
+            meta["market"] = market_snapshot.meta()
+            if not market_snapshot.has_data:
+                logger.warning("market data unavailable: %s", market_snapshot.errors)
 
     report_links = reports.recent_reports()
     meta["reports"] = reports.reports_meta(report_links)
@@ -172,6 +193,7 @@ def build_briefing(
         sections=sections,
         run_meta=meta,
         market=market_snapshot,
+        sports=sports_snapshot,
         reports=report_links,
     )
 
