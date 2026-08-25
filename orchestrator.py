@@ -513,7 +513,18 @@ _FAMILY_NOTES: tuple[tuple[str, str, str, str], ...] = (
      "user asks to change any of them, SAY SO plainly rather than promising to; there is "
      "no tool that does it and answering in prose that you will is the failure this "
      "instruction exists to prevent."),
-    ("web", "The live internet", "The live internet", ""),
+    ("web", "The live internet", "The live internet",
+     "search_web returns a PROSE SUMMARY of what a search engine surfaced. It is not "
+     "a database: it does not return live flight schedules, seat availability, fares, "
+     "stock quotes, inventory or anything else that changes by the minute. When the "
+     "result says the specific data was not available — or gives only general trends, "
+     "or tells the user to check a booking site — SAY THAT PLAINLY as the answer. Do "
+     "NOT quietly substitute the nearest thing you do have: asked for flight options "
+     "and given none, the honest reply is that the schedules could not be retrieved "
+     "and here is what would need checking, NOT a paragraph about drive times that "
+     "looks like an answer to a question nobody asked. Never present a general trend "
+     "(\"Delta generally operates this route\") as though it were a specific "
+     "departure. Cite the source URLs the tool returns."),
     ("attachments", "Attachments", "Images the user attached earlier in this chat",
      "You are shown an attached image ONLY on the turn it is sent. On any later "
      "turn you cannot see it, and the extracted text is not a substitute — it is a "
@@ -1095,7 +1106,7 @@ _EXPLICIT_NON_CAPABILITIES = (
 
 def capabilities_block() -> str:
     return (
-        "\nWhat this assistant can do (via its tools, on the user's confirmation):\n"
+        "\nWhat this assistant can do (via its tools):\n"
         + _capability_lines()
         + "  - Attachments: read documents and SEE images the user attaches.\n"
         + "Within those, specific limits:\n"
@@ -1111,10 +1122,21 @@ def capabilities_block() -> str:
         "send it myself\" is honest; \"I can help you with that email\" is not, because "
         "the user will reasonably expect it to arrive.\n"
         "NEVER tell the user you are unable to do one of the things listed above, and "
-        "never tell them to do it manually. Instead, offer concretely and ask them to "
-        "confirm — e.g. \"I can add these 12 games to your calendar. Want me to go "
-        "ahead?\" — then the next turn performs it. If a request needs details you do not "
-        "have, ask for exactly those.\n"
+        "never tell them to do it manually.\n"
+        "READS versus CHANGES — these are handled differently and confusing them is a "
+        "defect in both directions:\n"
+        "  * A READ (searching the web, querying the knowledge base, listing the "
+        "calendar, reading a note or a briefing) needs NO permission. NEVER ask "
+        "\"would you like me to search?\" or \"shall I look that up?\". If the answer "
+        "depends on information you do not have, the search should already have "
+        "happened — asking first costs the user a whole turn to say \"yes\" and "
+        "produces nothing. If a search result appears above, answer from it. If none "
+        "does and the request plainly needed one, say what you do and do not know "
+        "rather than offering to go and find out.\n"
+        "  * A CHANGE (creating, editing or deleting a calendar event, writing a note) "
+        "IS confirmed first. Offer it concretely — e.g. \"I can add these 12 games to "
+        "your calendar. Want me to go ahead?\" — and the next turn performs it.\n"
+        "If a request needs details you do not have, ask for exactly those.\n"
         "You do NOT run tools in this step. Unless a tool result appears above, never "
         "state or imply that an action happened or is happening — no \"proceeding to "
         "add\", \"I'm adding\", \"adding now\", \"done\", \"added\", \"scheduled\". Said "
@@ -1273,7 +1295,19 @@ def _build_local_prompt(state: GraphState) -> str:
         "things the user didn't ask about. If retrieved knowledge-base or tool "
         "context appears above, ground your answer in it and prefer it over guessing; "
         "you may extend it with general knowledge only when that stays directly on "
-        "topic. Keep it focused and concise, with no unrelated filler."
+        "topic. Keep it focused and concise, with no unrelated filler.\n\n"
+        "Formatting — the reply is rendered as Markdown, so use it:\n"
+        "- When the answer is a set of OPTIONS or items (flights, dates, choices), "
+        "give one bullet per option with its label in **bold**, then the details on "
+        "the same line. Comparable facts across options belong in the same order "
+        "every time so they can be read down the list.\n"
+        "- Prose answers stay prose. Do not bullet a single fact, and do not add "
+        "headings to a two-sentence reply.\n"
+        "- No preamble restating the question, and no closing filler — no \"let me "
+        "know if you need anything else\", no \"please note that\", no \"I hope this "
+        "helps\". Lead with the answer.\n"
+        "- Bold sparingly: labels and the single number that answers the question. "
+        "Bolding whole sentences makes the reply harder to scan, not easier."
     )
 
 
