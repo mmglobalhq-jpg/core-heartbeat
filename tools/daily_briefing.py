@@ -177,6 +177,41 @@ def _get(path: str, params: dict) -> list[dict]:
     return payload if isinstance(payload, list) else []
 
 
+
+# --- the NEW brief (briefing-agent), reached over its integration surface ------
+#
+# READS GO THROUGH HTTP, NOT THE DATABASE, and that is the boundary rather than a
+# preference. Two systems reading one schema means every migration over there becomes a
+# coordinated deploy over here, and the one that forgets is the one that breaks at 06:00.
+# briefing-agent owns brief_*; this asks it questions.
+#
+# The token is required. brief-web sits on heartbeat-net so cloudflared can serve it, which
+# means this call never passes Cloudflare Access — the surface fails closed without it.
+
+BRIEF_API_BASE_ENV = "BRIEF_API_BASE_URL"
+BRIEF_API_TOKEN_ENV = "BRIEF_API_TOKEN"
+
+
+def _brief_api(path: str, params: dict | None = None) -> dict:
+    base = (os.environ.get(BRIEF_API_BASE_ENV) or "").strip().rstrip("/")
+    token = (os.environ.get(BRIEF_API_TOKEN_ENV) or "").strip()
+    if not base or not token:
+        raise _BriefingError("the daily brief integration is not configured")
+    with httpx.Client(timeout=20.0, transport=_transport) as client:
+        response = client.get(
+            f"{base}{path}",
+            params=params or {},
+            headers={"Authorization": f"Bearer {token}", "Accept": "application/json"},
+        )
+    if response.status_code == 404:
+        return {}
+    if response.status_code >= 400:
+        # Never echo the token, and never the body — it may carry the brief itself.
+        raise _BriefingError(f"the daily brief service returned HTTP {response.status_code}")
+    payload = response.json()
+    return payload if isinstance(payload, dict) else {}
+
+
 # --- tools -------------------------------------------------------------------
 
 
@@ -225,39 +260,55 @@ def list_briefing_sources(user_id: str, args: dict) -> str:
 
 
 def get_latest_briefing(user_id: str, args: dict) -> str:
-    """The most recent briefing, or one specific date (YYYY-MM-DD)."""
-    uid = _uid(user_id)
-    params = {
-        "user_id": f"eq.{uid}",
-        "select": "id,briefing_date,status,briefing_sections(kind,rank,headline,body,url,source_name)",
-        "order": "briefing_date.desc",
-        "limit": "1",
-    }
+    """Today's daily brief, or one specific date (YYYY-MM-DD)."""
+    _uid(user_id)  # the isolation boundary still has to hold before any call goes out
     wanted = (args or {}).get("briefing_date")
+    params: dict = {}
     if wanted:
         try:
             dt.date.fromisoformat(str(wanted))
         except ValueError:
             return "error: briefing_date must be YYYY-MM-DD"
-        params["briefing_date"] = f"eq.{wanted}"
-    rows = _get("/briefings", params)
-    if not rows:
-        return ("No briefing found for that date." if wanted
-                else "You have no briefings yet.")
-    b = rows[0]
-    sections = sorted(
-        b.get("briefing_sections") or [],
-        key=lambda s: (0 if s.get("kind") == "top" else 1, s.get("rank") or 0),
-    )
-    out = [f"Briefing for {b.get('briefing_date')} (status: {b.get('status')})", ""]
-    for s in sections:
-        label = f"Top {s.get('rank')}" if s.get("kind") == "top" else "Deep Dive"
-        out.append(f"{label}: {s.get('headline')}  [{s.get('source_name')}]")
-        if s.get("body"):
-            out.append(f"  {s['body']}")
-        if s.get("url"):
-            out.append(f"  {s['url']}")
+        params["date"] = str(wanted)
+
+    # REPOINTED 2026-08-25 at briefing-agent (ROADMAP Phase 12). The old reader queried
+    # briefing_* directly; that schema is being retired and this one is not ours to read.
+    payload = _brief_api("/api/brief/today", params)
+    if not payload or not payload.get("ok"):
+        return ("No brief found for that date." if wanted
+                else "There is no brief for today yet.")
+
+    out = [f"Brief for {payload.get('displayDate') or payload.get('date')}", ""]
+    if payload.get("summary"):
+        out += [str(payload["summary"]), ""]
+
+    # The opening: markets on a weekday, yesterday's scores at the weekend, and a STATED
+    # absence when there is neither (spec §2 — silence is a confident false statement).
+    for row in payload.get("dataRows") or []:
+        change = f"  {row.get('change')}" if row.get("change") else ""
+        out.append(f"{row.get('label')}: {row.get('value')}{change}")
+    for group in payload.get("scoreGroups") or []:
+        out.append(str(group.get("league")))
+        out += [f"  {line}" for line in group.get("lines") or []]
+    if payload.get("openingAbsence"):
+        out.append(str(payload["openingAbsence"]))
+    if payload.get("dataRows") or payload.get("scoreGroups") or payload.get("openingAbsence"):
         out.append("")
+
+    for section in payload.get("sections") or []:
+        out.append(f"{section.get('title')}:")
+        if section.get("emptyReason"):
+            out.append(f"  {section['emptyReason']}")
+        for bullet in section.get("bullets") or []:
+            out.append(f"  - {bullet.get('text')}")
+            if bullet.get("url"):
+                out.append(f"    {bullet['url']}")
+        out.append("")
+
+    notes = payload.get("degradationNotes") or []
+    if payload.get("degradationTier") and payload["degradationTier"] != "full":
+        out.append(f"[This brief ran {payload['degradationTier']}.]")
+        out += [f"  - {n}" for n in notes]
     return "\n".join(out).rstrip()
 
 

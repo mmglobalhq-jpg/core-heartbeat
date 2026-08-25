@@ -27,6 +27,11 @@ def _creds(monkeypatch):
     monkeypatch.setenv(db.SUPABASE_URL_ENV, "https://example.supabase.co")
     monkeypatch.setenv(db.SERVICE_ROLE_ENV, "test-key")
     monkeypatch.delenv(db.SERVICE_ROLE_FILE_ENV, raising=False)
+    # The repointed reader (2026-08-25) talks to briefing-agent over HTTP and FAILS CLOSED
+    # without both of these. Set here so the tests below exercise the behaviour under test
+    # rather than the unconfigured path — two of them were passing on "error:" either way.
+    monkeypatch.setenv(db.BRIEF_API_BASE_ENV, "http://brief-web.test:3100")
+    monkeypatch.setenv(db.BRIEF_API_TOKEN_ENV, "t" * 48)
     yield
     db._transport = None
 
@@ -48,8 +53,12 @@ def test_preferences_render_topics(monkeypatch):
     assert "06:30" in out and "America/Chicago" in out
 
 
-def test_every_query_is_scoped_to_the_caller():
-    """The filter is the isolation. It must be present on every request."""
+def test_every_postgrest_query_is_scoped_to_the_caller():
+    """The filter is the isolation. It must be present on every request.
+
+    Applies to the tools still reading ``briefing_*`` directly: the service-role key
+    bypasses RLS, so ``user_id=eq.<uid>`` is the ONLY thing standing between two users.
+    """
     seen = []
 
     def handler(request):
@@ -57,11 +66,37 @@ def test_every_query_is_scoped_to_the_caller():
         return httpx.Response(200, json=[])
 
     _mock(handler)
-    for name in ("get_briefing_preferences", "list_briefing_sources", "get_latest_briefing"):
+    for name in ("get_briefing_preferences", "list_briefing_sources"):
         db.run_briefing_tool(name, UID)
     assert seen, "no requests made"
     for params in seen:
         assert params.get("user_id") == f"eq.{UID}"
+
+
+def test_the_repointed_reader_sends_a_token_and_NO_user_id():
+    """The new surface isolates differently, and this pins the difference.
+
+    ``get_latest_briefing`` was repointed at briefing-agent on 2026-08-25. That service is
+    single-owner: it resolves the reader from its own ``BRIEF_USER_ID`` and never accepts one
+    from a caller. Passing a user id would be strictly WORSE — it would turn a service that
+    can only answer for its owner into one that answers for whoever is named.
+
+    So isolation here is (a) the token, and (b) the service having exactly one owner. The
+    caller's id is still validated first, so a blank session cannot reach the network at all.
+    """
+    seen = []
+
+    def handler(request):
+        seen.append(request)
+        return httpx.Response(200, json={})
+
+    _mock(handler)
+    db.run_briefing_tool("get_latest_briefing", UID)
+    assert seen, "no request made"
+    request = seen[0]
+    assert request.headers.get("authorization", "").startswith("Bearer ")
+    assert "user_id" not in dict(request.url.params)
+    assert UID not in str(request.url)
 
 
 def test_a_blank_or_malformed_user_id_fails_closed():
@@ -100,6 +135,7 @@ def test_missing_credentials_degrade_to_an_error_string(monkeypatch):
 
 
 def test_http_failure_never_raises():
+    # 500 from the brief service, not from PostgREST — same requirement either way.
     _mock(lambda r: httpx.Response(500, json={}))
     out = db.run_briefing_tool("get_latest_briefing", UID)
     assert out.startswith("error:")
@@ -110,12 +146,19 @@ def test_unknown_tool_is_reported_not_raised():
 
 
 def test_no_briefing_yet_is_a_sentence_not_an_error():
-    _mock(lambda r: httpx.Response(200, json=[]))
-    assert "no briefings" in db.run_briefing_tool("get_latest_briefing", UID).lower()
+    # The CLAIM is that absence reads as a sentence rather than an error string, which is
+    # what the assistant needs in order to say "there isn't one yet" instead of apologising
+    # for a failure. The old wording was "you have no briefings yet"; repointing at
+    # briefing-agent (2026-08-25) made the noun singular. Asserted on the property, not the
+    # phrasing, so a future rewording cannot fail this for the wrong reason.
+    _mock(lambda r: httpx.Response(200, json={}))
+    out = db.run_briefing_tool("get_latest_briefing", UID)
+    assert not out.startswith("error:")
+    assert "no brief" in out.lower()
 
 
 def test_bad_date_is_rejected():
-    _mock(lambda r: httpx.Response(200, json=[]))
+    _mock(lambda r: httpx.Response(200, json={}))
     out = db.run_briefing_tool("get_latest_briefing", UID, {"briefing_date": "yesterday"})
     assert out.startswith("error:")
 
