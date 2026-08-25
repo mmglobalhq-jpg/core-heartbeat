@@ -12,6 +12,7 @@ import json
 import logging
 from collections.abc import Mapping
 from os import environ
+from urllib.parse import unquote
 
 from fastapi import APIRouter, Depends, Request
 from fastapi.responses import JSONResponse, StreamingResponse
@@ -32,6 +33,7 @@ from orchestrator import astream_run, build_ollama_client, generate_title
 from orchestrator import run as run_orchestration
 from services import documents as docstore
 from services import kb as kbstore
+from services import uploads as upstore
 from services.document_parser import parse_document
 
 logger = logging.getLogger(__name__)
@@ -285,6 +287,103 @@ async def kb_delete_document(
     if not ok:
         return JSONResponse(status_code=404, content={"detail": "document not found or not permitted"})
     return JSONResponse(status_code=200, content={"deleted": doc_id})
+
+
+# --- file uploads to the mini PC ------------------------------------------
+#
+# ADMIN ONLY, enforced here and not merely hidden in the UI. These three routes
+# are the platform's only path that writes caller-supplied bytes to local disk,
+# and core-chat proxies to them from `chat.mmglobal.us`, which has NO Cloudflare
+# Access in front of it (10-network-and-trust-boundaries.md). The profiles.is_admin
+# check below is therefore the whole boundary between the open internet and the
+# Windows filesystem. Fail closed on every error path.
+
+
+async def _require_admin(user_id: str) -> JSONResponse | None:
+    """None when the caller may use the upload folder, else the refusal to return."""
+    if user_id == SANDBOX_USER_ID:
+        return JSONResponse(
+            status_code=401, content={"detail": "authentication required for file uploads"}
+        )
+    try:
+        admin = await kbstore.is_admin(user_id)
+    except Exception:
+        admin = False  # fail closed: an unreachable profiles table is not a pass
+    if not admin:
+        return JSONResponse(status_code=403, content={"detail": "admin required for file uploads"})
+    return None
+
+
+@router.post("/uploads", response_model=None)
+async def upload_file(
+    request: Request,
+    user_id: str = Depends(resolve_user_id),
+) -> JSONResponse:
+    """Stream a raw request body to the mini PC's Windows upload folder.
+
+    The body is the file's bytes (``application/octet-stream``) and the name comes
+    from the ``X-Upload-Filename`` header, percent-encoded so a UTF-8 name survives
+    a header round-trip. Deliberately NOT multipart: Starlette would spool the whole
+    body before the handler sees a byte, and it would add a python-multipart
+    dependency to parse a form that only ever has one part.
+    """
+    refusal = await _require_admin(user_id)
+    if refusal is not None:
+        return refusal
+
+    raw_name = unquote(request.headers.get("X-Upload-Filename", "") or "")
+    if not raw_name.strip():
+        return JSONResponse(status_code=400, content={"detail": "X-Upload-Filename is required"})
+
+    try:
+        result = await upstore.store_stream(request.stream(), raw_name)
+    except upstore.UploadError as exc:
+        return JSONResponse(status_code=exc.status, content={"detail": exc.detail})
+    except Exception as exc:  # never 500 on an upload — surface it on the file row
+        logger.warning("upload failed: %s", exc)
+        return JSONResponse(status_code=500, content={"detail": "upload failed"})
+    logger.info("upload stored: %s (%d bytes)", result["stored_as"], result["size_bytes"])
+    return JSONResponse(status_code=200, content=result)
+
+
+@router.get("/uploads", response_model=None)
+async def list_uploads(user_id: str = Depends(resolve_user_id)) -> JSONResponse:
+    """List the upload folder — including files put there from Windows."""
+    refusal = await _require_admin(user_id)
+    if refusal is not None:
+        return refusal
+    try:
+        files = await asyncio.to_thread(upstore.list_uploads)
+    except upstore.UploadError as exc:
+        return JSONResponse(status_code=exc.status, content={"detail": exc.detail})
+    except Exception as exc:
+        logger.warning("upload listing failed: %s", exc)
+        return JSONResponse(status_code=500, content={"detail": "could not read the upload folder"})
+    return JSONResponse(status_code=200, content={"files": files})
+
+
+@router.delete("/uploads/{name:path}", response_model=None)
+async def delete_upload(
+    name: str,
+    user_id: str = Depends(resolve_user_id),
+) -> JSONResponse:
+    """Delete one file from the upload folder.
+
+    ``{name:path}`` accepts a slash so a traversal attempt reaches the service's
+    containment check and is refused there, rather than 404-ing at the router and
+    leaving the real behaviour untested.
+    """
+    refusal = await _require_admin(user_id)
+    if refusal is not None:
+        return refusal
+    try:
+        await asyncio.to_thread(upstore.delete_upload, unquote(name))
+    except upstore.UploadError as exc:
+        return JSONResponse(status_code=exc.status, content={"detail": exc.detail})
+    except Exception as exc:
+        logger.warning("upload delete failed: %s", exc)
+        return JSONResponse(status_code=500, content={"detail": "delete failed"})
+    return JSONResponse(status_code=200, content={"deleted": name})
 
 
 @router.api_route("/health", methods=["GET", "HEAD"])

@@ -347,3 +347,34 @@ class DocumentParseResult(BaseModel):
     status: str  # "ready" | "error"
     char_count: int = 0
     error: str | None = None
+
+
+class UploadStored(BaseModel):
+    """POST /uploads — one file written to the mini PC's Windows upload folder.
+
+    ``rewritten`` is True when the stored name differs from the one the client
+    sent (Windows-illegal characters, a reserved device name like ``CON.txt``, or
+    a collision resolved to ``name (2).ext``). The UI surfaces it so a renamed
+    file is never a silent surprise.
+    """
+
+    stored_as: str
+    original_name: str
+    rewritten: bool = False
+    size_bytes: int = 0
+    windows_path: str
+
+
+class UploadEntry(BaseModel):
+    """One file in the upload folder. ``modified`` is a Unix timestamp."""
+
+    name: str
+    size_bytes: int = 0
+    modified: int = 0
+
+
+class UploadListing(BaseModel):
+    """GET /uploads — everything in the folder, including files dropped in from
+    Windows: the directory is the source of truth, not a database."""
+
+    files: list[UploadEntry] = Field(default_factory=list)
