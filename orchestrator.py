@@ -42,6 +42,7 @@ from auth import SANDBOX_USER_ID
 from services import pending_plans
 from services.storage_sync import sync_user_vault, upload_user_file
 from tools.user_vault import USER_VAULT_TOOLS, read_note, run_vault_tool, write_note
+from tools.flights import FLIGHT_TOOL_REGISTRY, run_flight_tool
 from tools.web_tools import WEB_TOOL_REGISTRY, run_web_tool
 from tools.graphrag import GRAPHRAG_TOOL_REGISTRY, kb_configured, run_graphrag_tool
 from tools.attachments import ATTACHMENT_TOOL_REGISTRY, run_attachment_tool
@@ -254,6 +255,7 @@ DISPATCHABLE_TOOLS = frozenset(
     | set(REIT_TOOL_REGISTRY)
     | set(BRIEFING_TOOL_REGISTRY)
     | set(WEB_TOOL_REGISTRY)
+    | set(FLIGHT_TOOL_REGISTRY)
     | set(ATTACHMENT_TOOL_REGISTRY)
 )
 
@@ -525,6 +527,18 @@ _FAMILY_NOTES: tuple[tuple[str, str, str, str], ...] = (
      "looks like an answer to a question nobody asked. Never present a general trend "
      "(\"Delta generally operates this route\") as though it were a specific "
      "departure. Cite the source URLs the tool returns."),
+    ("travel", "Flights", "Live flight search (real bookable itineraries)",
+     "Use search_flights — NOT search_web — for any question about catching a "
+     "flight. Pass EVERY airport within a reasonable drive as origins, not just the "
+     "nearest: a small field an exit away often has three departures a day while "
+     "the one an hour off has full service, and the ranking should be decided by "
+     "the itineraries that come back rather than by distance. When the user has a "
+     "commitment to finish first, work out when they can realistically be at the "
+     "airport — event end, drive time, and time to check in — and pass that as "
+     "earliest_departure_time rather than filtering by eye afterwards. State the "
+     "assumptions you made about all three, because the answer is only as good as "
+     "they are. If it returns nothing, say so; never substitute which airlines "
+     "'generally' serve a route."),
     ("attachments", "Attachments", "Images the user attached earlier in this chat",
      "You are shown an attached image ONLY on the turn it is sent. On any later "
      "turn you cannot see it, and the extracted text is not a substitute — it is a "
@@ -558,6 +572,7 @@ def _family_members(family: str) -> list[str]:
         "reit": sorted(REIT_TOOL_REGISTRY),
         "briefing": sorted(BRIEFING_TOOL_REGISTRY),
         "web": sorted(WEB_TOOL_REGISTRY),
+        "travel": sorted(FLIGHT_TOOL_REGISTRY),
         "attachments": sorted(ATTACHMENT_TOOL_REGISTRY),
     }[family]
 
@@ -2225,6 +2240,10 @@ def _dispatch_tool(name: str, args: dict, user_id: str) -> tuple[str, list[str] 
         # Not per-user: the public web is the same for everyone. user_id is threaded
         # only to keep one dispatch signature.
         return run_web_tool(name, user_id, args), None
+    if name in FLIGHT_TOOL_REGISTRY:
+        # Not per-user either: an airline schedule is the same for everyone. The
+        # Amadeus credential is the server's, never the caller's.
+        return run_flight_tool(name, user_id, args), None
     return f"error: unknown tool {name!r}", None
 
 

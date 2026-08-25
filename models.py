@@ -124,6 +124,7 @@ class ToolArgs(BaseModel):
       ``write_user_note(filename, content)``.
     * Knowledge-base tool: ``query_knowledge_base(query)``.
     * Google Calendar tools — see the per-user fields below.
+    * Flight search: ``search_flights(origins, destination, departure_date, ...)``.
     """
 
     filename: str | None = None
@@ -145,6 +146,14 @@ class ToolArgs(BaseModel):
     reit_symbol: str | None = None    # issuer symbol/alias, e.g. "ARR" / "ARMOUR"
     report_id: str | None = None      # a specific report's id (from list_reit_reports)
     limit: int | None = None          # bounded result count for list_reit_reports
+    # Flight search. `origins` is plural on purpose: the nearest airport is often
+    # the wrong one, so the model passes every field within a reasonable drive and
+    # the ranking is decided by the itineraries that come back.
+    origins: str | None = None        # IATA codes, space/comma separated ("SAV CHS")
+    destination: str | None = None    # one IATA code ("MEM")
+    departure_date: str | None = None  # YYYY-MM-DD
+    earliest_departure_time: str | None = None  # local clock time ("13:30")
+    adults: int | None = None
 
 
 class RoutingDecision(BaseModel):
@@ -171,6 +180,8 @@ class RoutingDecision(BaseModel):
         "update_calendar_event", "delete_calendar_event",
         # web (public internet)
         "search_web", "fetch_url",
+        # travel: real bookable itineraries (search_web cannot answer these)
+        "search_flights",
         # REIT research reports (read-only, global)
         "list_reit_issuers", "list_reit_reports",
         "get_reit_report", "get_latest_reit_report",

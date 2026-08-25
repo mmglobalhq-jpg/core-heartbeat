@@ -40,6 +40,7 @@ from tools.google_calendar import run_calendar_tool
 from tools.graphrag import run_graphrag_tool
 from tools.reit_research import run_reit_tool
 from tools.user_vault import run_vault_tool
+from tools.flights import run_flight_tool
 from tools.web_tools import run_web_tool
 
 SANDBOX_FALLBACK = "00000000-0000-0000-0000-000000000000"
@@ -307,6 +308,52 @@ def fetch_url(url: str, state: Annotated[dict, InjectedState]) -> str:
     return run_web_tool("fetch_url", _uid(state), {"url": url})
 
 
+# --- travel -----------------------------------------------------------------
+
+
+@tool
+def search_flights(
+    origins: str,
+    destination: str,
+    departure_date: str,
+    state: Annotated[dict, InjectedState],
+    earliest_departure_time: str | None = None,
+    adults: int = 1,
+) -> str:
+    """Find REAL bookable flights for a date — airlines, departure and arrival
+    times, stops, duration and fares.
+
+    Use this for ANY question about catching a flight. search_web cannot answer
+    these: it returns a prose summary and will say schedules "are not available",
+    which is not an answer to "what time can I fly".
+
+    origins: one or more IATA airport codes, space or comma separated ("SAV CHS
+    HHH"). Pass EVERY airport within a reasonable drive, not just the closest one —
+    the nearest field is often tiny and the airport an hour away is the one with
+    service. Ranking is done on the itineraries that come back.
+    destination: one IATA code ("MEM").
+    departure_date: YYYY-MM-DD.
+    earliest_departure_time: optional local clock time ("13:30" or "1:30 PM") —
+    nothing departing before it is returned. Use it to respect a commitment the
+    user has to finish first, allowing for drive time and check-in.
+
+    Times returned are LOCAL to each airport. If it returns no flights or an
+    error, say so plainly; never fall back to describing which airlines "generally"
+    serve a route.
+    """
+    return run_flight_tool(
+        "search_flights",
+        _uid(state),
+        {
+            "origins": origins,
+            "destination": destination,
+            "departure_date": departure_date,
+            "earliest_departure_time": earliest_departure_time,
+            "adults": adults,
+        },
+    )
+
+
 # --- the catalog ------------------------------------------------------------
 
 @tool
@@ -384,6 +431,7 @@ ALL_TOOLS = [
     search_briefings,
     search_web,
     fetch_url,
+    search_flights,
 ]
 
 TOOLS_BY_NAME = {t.name: t for t in ALL_TOOLS}
