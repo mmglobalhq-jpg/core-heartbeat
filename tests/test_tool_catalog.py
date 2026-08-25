@@ -65,10 +65,12 @@ def test_write_tools_are_exactly_the_mutating_ones():
         "create_calendar_event",
         "update_calendar_event",
         "delete_calendar_event",
-        # Change what the briefing covers. Delivery time, timezone and email
-        # address are deliberately NOT writable by chat.
-        "add_briefing_topic",
-        "remove_briefing_topic",
+        # add_briefing_topic / remove_briefing_topic were here until 2026-08-25 and are
+        # RETIRED, not merely unlisted. They wrote to briefing_prefs.topics on the pipeline
+        # being sunset; the replacement keeps interests as `stated` events on an append-only
+        # log where spec §2 reserves removal to the user alone, so there was nothing to
+        # repoint them at. Chat has no briefing write path at all now — which is a decision,
+        # and is why this literal shrank rather than gaining two new names.
     }
     assert WRITE_TOOLS <= CATALOG_TOOL_NAMES
 

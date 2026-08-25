@@ -363,30 +363,6 @@ def search_briefings(
 
 
 @tool
-def add_briefing_topic(topic: str, state: Annotated[dict, InjectedState]) -> str:
-    """Add a topic to the user's daily briefing so future briefings cover it.
-
-    Use whenever the user asks to add, follow, track or start covering something
-    in their brief — "add baseball cards", "follow the Fed", "I want more about
-    Georgia football". One topic per call; call it repeatedly for several.
-    This CHANGES a setting. A single change runs straight away and is undone with
-    remove_briefing_topic; several at once are proposed for confirmation first.
-    """
-    return run_briefing_tool("add_briefing_topic", _uid(state), {"topic": topic})
-
-
-@tool
-def remove_briefing_topic(topic: str, state: Annotated[dict, InjectedState]) -> str:
-    """Remove a topic from the user's daily briefing.
-
-    Use for "stop covering X", "drop X from my brief", "I don't care about X any
-    more". This CHANGES a setting. A single change runs straight away and is undone
-    by adding the topic back; several at once are proposed for confirmation first.
-    """
-    return run_briefing_tool("remove_briefing_topic", _uid(state), {"topic": topic})
-
-
-@tool
 def reread_attachment(
     doc_id: str,
     question: str,
@@ -429,8 +405,6 @@ ALL_TOOLS = [
     list_briefing_sources,
     get_latest_briefing,
     search_briefings,
-    add_briefing_topic,
-    remove_briefing_topic,
     search_web,
     fetch_url,
 ]

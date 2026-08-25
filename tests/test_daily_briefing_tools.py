@@ -16,6 +16,8 @@ import json
 import httpx
 import pytest
 
+from pathlib import Path
+
 from tools import daily_briefing as db
 
 UID = "712d8946-ced7-4c85-b968-6cdd1e3887b8"
@@ -206,87 +208,31 @@ def test_service_role_file_is_preferred_over_the_blanked_variable(tmp_path, monk
     assert db._key() == "file-key"
 
 
-def test_readers_are_free_and_writers_are_gated():
-    """Membership in WRITE_TOOLS is what makes "yes" work. A writer missing from
-    it runs without ever asking; a reader wrongly in it demands approval to
-    answer a question."""
-    from tools.catalog import WRITE_TOOLS
+def test_the_writers_are_RETIRED_and_the_module_cannot_write():
+    """add/remove_briefing_topic are gone by owner decision (2026-08-25).
 
-    readers = db.BRIEFING_TOOL_REGISTRY - db.BRIEFING_WRITE_TOOLS
-    assert not (readers & WRITE_TOOLS), "a read-only briefing tool is gated"
-    assert db.BRIEFING_WRITE_TOOLS <= WRITE_TOOLS, "a briefing writer is not gated"
-    assert db.BRIEFING_WRITE_TOOLS == {"add_briefing_topic", "remove_briefing_topic"}
+    They wrote to ``briefing_prefs.topics``, a settings column on the pipeline being sunset.
+    They were retired rather than repointed because the new system has nothing to repoint AT:
+    an interest there is a ``stated`` event on an append-only log, and spec §2 reserves
+    removal to the user alone. Giving chat a write path is a decision about write authority,
+    not a port of these two.
 
-
-def test_add_topic_is_idempotent_and_case_insensitive():
-    calls = []
-
-    def handler(request):
-        calls.append(request.method)
-        if request.method == "GET":
-            return httpx.Response(200, json=[{"topics": ["Baseball", "AI"]}])
-        return httpx.Response(204)
-
-    _mock(handler)
-    out = db.run_briefing_tool("add_briefing_topic", UID, {"topic": "baseball"})
-    assert "already" in out.lower()
-    assert "PATCH" not in calls, "a duplicate topic still issued a write"
-
-
-def test_add_topic_appends_and_preserves_order():
-    seen = {}
-
-    def handler(request):
-        if request.method == "GET":
-            return httpx.Response(200, json=[{"topics": ["AI", "Memphis"]}])
-        seen["body"] = json.loads(request.content)
-        return httpx.Response(204)
-
-    _mock(handler)
-    out = db.run_briefing_tool("add_briefing_topic", UID, {"topic": "Baseball cards"})
-    assert seen["body"]["topics"] == ["AI", "Memphis", "Baseball cards"]
-    assert "Baseball cards" in out
-
-
-def test_remove_topic_matches_case_insensitively():
-    seen = {}
-
-    def handler(request):
-        if request.method == "GET":
-            return httpx.Response(200, json=[{"topics": ["AI", "Baseball cards"]}])
-        seen["body"] = json.loads(request.content)
-        return httpx.Response(204)
-
-    _mock(handler)
-    db.run_briefing_tool("remove_briefing_topic", UID, {"topic": "BASEBALL CARDS"})
-    assert seen["body"]["topics"] == ["AI"]
-
-
-def test_removing_something_absent_changes_nothing():
-    calls = []
-
-    def handler(request):
-        calls.append(request.method)
-        return httpx.Response(200, json=[{"topics": ["AI"]}])
-
-    _mock(handler)
-    out = db.run_briefing_tool("remove_briefing_topic", UID, {"topic": "Cricket"})
-    assert "not on your briefing" in out
-    assert "PATCH" not in calls
-
-
-def test_writers_reject_a_bad_user_id_before_writing():
-    calls = []
-    _mock(lambda r: calls.append(r.method) or httpx.Response(200, json=[]))
+    Asserted three ways, because a retired tool that is still reachable is worse than one that
+    was never removed: gone from dispatch, gone from the catalog, and the module has no HTTP
+    write verb left at all.
+    """
     for name in ("add_briefing_topic", "remove_briefing_topic"):
-        assert db.run_briefing_tool(name, "", {"topic": "X"}).startswith("error:")
-    assert not calls
+        assert name not in db.BRIEFING_TOOL_REGISTRY
+        assert db.run_briefing_tool(name, UID).startswith("error:")
 
+    # Kept as an EMPTY set rather than deleted: the confirmation machinery that consumes it is
+    # unchanged and ready for a future write family, and removing the name would make its
+    # absence look like a bug at the call site.
+    assert db.BRIEFING_WRITE_TOOLS == frozenset()
 
-def test_topic_ceiling_is_enforced():
-    _mock(lambda r: httpx.Response(200, json=[{"topics": [f"t{i}" for i in range(db.MAX_TOPICS)]}]))
-    out = db.run_briefing_tool("add_briefing_topic", UID, {"topic": "one more"})
-    assert "maximum" in out.lower()
+    source = Path(db.__file__).read_text(encoding="utf-8")
+    for verb in (".patch(", ".post(", ".put(", ".delete("):
+        assert verb not in source, f"the briefing tools are read-only; found {verb}"
 
 
 def test_catalog_and_dispatch_agree():

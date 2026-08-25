@@ -150,24 +150,6 @@ def _uid(user_id: str) -> str:
     return value
 
 
-def _topics(uid: str) -> list[str]:
-    rows = _get("/briefing_prefs", {"user_id": f"eq.{uid}", "select": "topics"})
-    if not rows:
-        raise _BriefingError("you have no daily briefing preferences yet")
-    return list(rows[0].get("topics") or [])
-
-
-def _write_topics(uid: str, topics: list[str]) -> None:
-    with _client() as client:
-        response = client.patch(
-            "/briefing_prefs", params={"user_id": f"eq.{uid}"},
-            json={"topics": topics},
-            headers={"Content-Type": "application/json", "Prefer": "return=minimal"},
-        )
-    if response.status_code >= 400:
-        raise _BriefingError(f"could not save topics (HTTP {response.status_code})")
-
-
 def _get(path: str, params: dict) -> list[dict]:
     with _client() as client:
         response = client.get(path, params=params)
@@ -343,61 +325,34 @@ def search_briefings(user_id: str, args: dict) -> str:
     return "\n".join(out)
 
 
-# --- writers (confirmation-gated) -------------------------------------------
-
-MAX_TOPICS = 40
-"""A ceiling, not a preference. Every topic costs candidate selection work and
-enlarges the judge prompt; at 11 topics the model already began omitting keys
-from its reply. Refusing at a limit is better than degrading silently."""
-
-
-def add_briefing_topic(user_id: str, args: dict) -> str:
-    """Add one topic. Idempotent, case-insensitive, order preserved."""
-    uid = _uid(user_id)
-    topic = ((args or {}).get("topic") or "").strip()
-    if not topic:
-        return "error: topic is required"
-    if len(topic) > 60:
-        return "error: that topic is too long (60 characters max)"
-    current = _topics(uid)
-    if any(t.strip().lower() == topic.lower() for t in current):
-        return f"{topic!r} is already on your briefing. Nothing changed."
-    if len(current) >= MAX_TOPICS:
-        return (f"You already follow {len(current)} topics, which is the maximum. "
-                "Remove one first.")
-    _write_topics(uid, current + [topic])
-    return (f"Added {topic!r} to your daily briefing. You now follow "
-            f"{len(current) + 1} topics; it will be used from the next briefing.")
-
-
-def remove_briefing_topic(user_id: str, args: dict) -> str:
-    """Remove one topic, matched case-insensitively."""
-    uid = _uid(user_id)
-    topic = ((args or {}).get("topic") or "").strip()
-    if not topic:
-        return "error: topic is required"
-    current = _topics(uid)
-    kept = [t for t in current if t.strip().lower() != topic.lower()]
-    if len(kept) == len(current):
-        return (f"{topic!r} is not on your briefing, so nothing changed. "
-                f"You follow: {', '.join(current) or '(none)'}.")
-    _write_topics(uid, kept)
-    return (f"Removed {topic!r} from your daily briefing. You now follow "
-            f"{len(kept)} topics.")
-
-
-# --- dispatch (name -> callable(user_id, args) -> str) ----------------------
+# --- writers: RETIRED 2026-08-25 -------------------------------------------
+#
+# ``add_briefing_topic`` and ``remove_briefing_topic`` wrote to
+# ``briefing_prefs.topics``, which belongs to the pipeline being sunset
+# (briefing-agent/docs/SUNSET.md). Retired by owner decision rather than
+# repointed, because the new system has no equivalent to repoint AT:
+#
+#   * topics there are not a settings column. An interest is a ``stated`` event
+#     on an append-only user-model log, and spec §2 reserves removal to the user
+#     alone — inference may add, only the user may retire.
+#   * the integration surface is read-only BY CONSTRUCTION. Giving chat a write
+#     path is a decision about write authority, not a port of these two.
+#
+# So this is a deliberate capability removal, not an oversight, and the reader
+# now changes interests where the model actually lives rather than through a
+# column the retiring pipeline reads. ``BRIEFING_WRITE_TOOLS`` stays as an empty
+# frozenset: the confirmation machinery that consumes it is unchanged and ready
+# for a future write family, and deleting the name would make its absence look
+# like a bug at the call site.
 
 _DISPATCH = {
     "get_briefing_preferences": get_briefing_preferences,
     "list_briefing_sources": list_briefing_sources,
     "get_latest_briefing": get_latest_briefing,
     "search_briefings": search_briefings,
-    "add_briefing_topic": add_briefing_topic,
-    "remove_briefing_topic": remove_briefing_topic,
 }
 
-BRIEFING_WRITE_TOOLS = frozenset({"add_briefing_topic", "remove_briefing_topic"})
+BRIEFING_WRITE_TOOLS: frozenset[str] = frozenset()
 """Declared here, next to the implementations, and imported by tools/catalog.py.
 A write tool that is not in WRITE_TOOLS runs without confirmation."""
 
