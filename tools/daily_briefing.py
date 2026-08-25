@@ -313,8 +313,8 @@ def get_latest_briefing(user_id: str, args: dict) -> str:
 
 
 def search_briefings(user_id: str, args: dict) -> str:
-    """Find past briefing items whose headline matches a query."""
-    uid = _uid(user_id)
+    """Find past brief items whose text matches a query."""
+    _uid(user_id)  # the isolation boundary still has to hold before any call goes out
     query = ((args or {}).get("query") or "").strip()
     if not query:
         return "error: query is required"
@@ -323,33 +323,23 @@ def search_briefings(user_id: str, args: dict) -> str:
         limit = max(1, min(int(limit), 25))
     except (TypeError, ValueError):
         limit = 10
-    # Scoped through the user's own briefings. PostgREST cannot filter a child on
-    # a parent column, so the parent ids are resolved first — the alternative is
-    # an unscoped scan of every user's sections, which is exactly the isolation
-    # this module exists to keep.
-    parents = _get("/briefings", {
-        "user_id": f"eq.{uid}", "select": "id,briefing_date",
-        "order": "briefing_date.desc", "limit": "120",
-    })
-    if not parents:
-        return "You have no briefings yet."
-    dates = {p["id"]: p["briefing_date"] for p in parents}
-    ids = ",".join(dates)
-    escaped = query.replace("*", "").replace(",", " ")
-    rows = _get("/briefing_sections", {
-        "briefing_id": f"in.({ids})",
-        "headline": f"ilike.*{escaped}*",
-        "select": "briefing_id,kind,rank,headline,source_name,url",
-        "limit": str(limit),
-    })
-    if not rows:
-        return f"No briefing items matched {query!r}."
-    out = [f"{len(rows)} briefing item(s) matching {query!r}:"]
-    for r in rows:
-        out.append(f"  {dates.get(r.get('briefing_id'), '?')} — {r.get('headline')} "
-                   f"[{r.get('source_name')}]")
-        if r.get("url"):
-            out.append(f"      {r['url']}")
+
+    # REPOINTED 2026-08-25 at briefing-agent (ROADMAP Phase 12). The old reader resolved the
+    # user's briefing ids and then scanned their sections; the new surface does that scoping
+    # itself, against its own owner, so nothing here passes a user id.
+    payload = _brief_api("/api/brief/search", {"q": query, "limit": str(limit)})
+    if not payload or not payload.get("ok"):
+        return "The daily brief archive is unavailable."
+    matches = payload.get("matches") or []
+    if not matches:
+        return f"No brief items matched {query!r}."
+
+    out = [f"{len(matches)} brief item(s) matching {query!r}:"]
+    for m in matches:
+        section = f" [{m.get('section')}]" if m.get("section") else ""
+        out.append(f"  {m.get('briefDate')} — {m.get('text')}{section}")
+        if m.get("url"):
+            out.append(f"      {m['url']}")
     return "\n".join(out)
 
 

@@ -109,23 +109,56 @@ def test_a_blank_or_malformed_user_id_fails_closed():
     assert not calls, "a request was issued despite an invalid user id"
 
 
-def test_search_is_scoped_through_the_users_own_briefings():
-    """PostgREST cannot filter a child on a parent column; resolving parents
-    first is what keeps this from scanning every user's sections."""
+def test_search_is_scoped_by_the_SERVICE_not_by_this_caller():
+    """The scoping moved, and this pins where it moved to.
+
+    The old reader resolved the user's briefing ids and then bounded the child query to
+    them, because PostgREST cannot filter a child on a parent column and the alternative was
+    scanning every user's sections. Repointing at briefing-agent (2026-08-25) moved that
+    work server-side, where it is asserted by that repo's own tests.
+
+    What must hold HERE is that this tool cannot ask for anyone else's brief: it sends the
+    query, a bounded limit and a bearer token, and never a user id. The caller's id is still
+    validated first, so a blank session cannot reach the network at all.
+    """
     seen = []
 
     def handler(request):
-        seen.append(request.url)
-        if request.url.path.endswith("/briefings"):
-            return httpx.Response(200, json=[{"id": "b1", "briefing_date": "2026-08-09"}])
-        return httpx.Response(200, json=[{"briefing_id": "b1", "kind": "top", "rank": 1,
-                                          "headline": "Fed holds rates", "source_name": "FT",
-                                          "url": "https://x.example/1"}])
+        seen.append(request)
+        return httpx.Response(200, json={"ok": True, "query": "Fed", "count": 1, "matches": [
+            {"briefDate": "2026-08-09", "section": "Business",
+             "text": "Fed holds rates", "url": "https://x.example/1"}]})
+
     _mock(handler)
     out = db.run_briefing_tool("search_briefings", UID, {"query": "Fed"})
     assert "Fed holds rates" in out
-    assert seen[0].params["user_id"] == f"eq.{UID}"          # parents scoped
-    assert seen[1].params["briefing_id"] == "in.(b1)"          # children limited to them
+    assert "2026-08-09" in out
+
+    request = seen[0]
+    assert request.headers.get("authorization", "").startswith("Bearer ")
+    assert request.url.params["q"] == "Fed"
+    assert "user_id" not in dict(request.url.params)
+    assert UID not in str(request.url)
+
+
+def test_search_limit_is_bounded_before_it_leaves():
+    """A caller-supplied limit is clamped here as well as at the surface.
+
+    Belt and braces on purpose: the model picks this number, and an unbounded one would ask
+    the brief service for everything and then paste it into a chat reply.
+    """
+    seen = []
+
+    def handler(request):
+        seen.append(request)
+        return httpx.Response(200, json={"ok": True, "count": 0, "matches": []})
+
+    _mock(handler)
+    db.run_briefing_tool("search_briefings", UID, {"query": "Fed", "limit": 9999})
+    assert int(seen[0].url.params["limit"]) <= 25
+    _mock(handler)
+    db.run_briefing_tool("search_briefings", UID, {"query": "Fed", "limit": "nonsense"})
+    assert int(seen[1].url.params["limit"]) == 10
 
 
 def test_missing_credentials_degrade_to_an_error_string(monkeypatch):
