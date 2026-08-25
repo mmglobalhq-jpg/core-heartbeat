@@ -516,17 +516,24 @@ _FAMILY_NOTES: tuple[tuple[str, str, str, str], ...] = (
      "no tool that does it and answering in prose that you will is the failure this "
      "instruction exists to prevent."),
     ("web", "The live internet", "The live internet",
-     "search_web returns a PROSE SUMMARY of what a search engine surfaced. It is not "
-     "a database: it does not return live flight schedules, seat availability, fares, "
-     "stock quotes, inventory or anything else that changes by the minute. When the "
-     "result says the specific data was not available — or gives only general trends, "
-     "or tells the user to check a booking site — SAY THAT PLAINLY as the answer. Do "
+     "TWO STEPS, and most specific questions need both. search_web returns a PROSE "
+     "SUMMARY — right when a summary IS the answer. find_sources returns a list of "
+     "pages, and fetch_url reads one: that pairing is how you get a detail a summary "
+     "rounds off — a schedule, a table, opening hours, a roster, a figure.\n"
+     "     When a search_web result is vague, says the specific information was NOT "
+     "AVAILABLE, or tells the user to go and check a website, that is the signal to "
+     "call find_sources and READ a page — not to pass the hedge along and not to "
+     "answer from memory. Do the reading the summary declined to do.\n"
+     "     If, after reading, the answer genuinely is not there, SAY SO PLAINLY. Do "
      "NOT quietly substitute the nearest thing you do have: asked for flight options "
      "and given none, the honest reply is that the schedules could not be retrieved "
      "and here is what would need checking, NOT a paragraph about drive times that "
      "looks like an answer to a question nobody asked. Never present a general trend "
      "(\"Delta generally operates this route\") as though it were a specific "
-     "departure. Cite the source URLs the tool returns."),
+     "departure.\n"
+     "     None of this reaches data behind a booking engine — live fares, seat "
+     "availability, inventory. For flights use search_flights. Cite the source URLs "
+     "the tools return."),
     ("travel", "Flights", "Live flight search (real bookable itineraries)",
      "Use search_flights — NOT search_web — for any question about catching a "
      "flight. Pass EVERY airport within a reasonable drive as origins, not just the "

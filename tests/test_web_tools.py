@@ -176,8 +176,10 @@ def test_long_pages_are_truncated(monkeypatch):
 # --- tool wrappers ----------------------------------------------------------
 
 
-def test_registry_exposes_both_tools():
-    assert WEB_TOOL_REGISTRY == {"search_web", "fetch_url"}
+def test_registry_exposes_the_search_read_loop():
+    # find_sources (list pages) + fetch_url (read one) is the two-step that gets a
+    # specific detail off a page; search_web answers in prose when that is enough.
+    assert WEB_TOOL_REGISTRY == {"search_web", "find_sources", "fetch_url"}
 
 
 def test_fetch_url_returns_an_error_string_rather_than_raising(monkeypatch):
@@ -200,3 +202,76 @@ def test_search_without_a_key_is_reported_not_crashed(monkeypatch):
 
 def test_unknown_tool_name():
     assert run_web_tool("nope", "u1", {}).startswith("error: unknown tool")
+
+
+# --- find_sources: the reading list ----------------------------------------
+#
+# The defect behind this tool: grounding answered a flight question with "check a
+# booking site" and the composer relayed the hedge. A summary is not always the
+# answer, and the fix is to go and read a page.
+
+
+def _sources(monkeypatch, results):
+    import tools.web_tools as wt
+    monkeypatch.setattr(wt, "search_web_raw", lambda q, max_results=10: results[:max_results])
+
+
+def test_find_sources_lists_pages_with_their_sites(monkeypatch):
+    _sources(monkeypatch, [
+        {"url": "https://a.example/x", "title": "a.example", "snippet": "", "source": "a.example"},
+        {"url": "https://b.example/y", "title": "b.example", "snippet": "", "source": "b.example"},
+    ])
+    out = run_web_tool("find_sources", "u1", {"query": "memphis weather"})
+    assert "1. a.example — https://a.example/x" in out
+    assert "2. b.example — https://b.example/y" in out
+
+
+def test_find_sources_tells_the_model_to_read_and_that_links_expire(monkeypatch):
+    _sources(monkeypatch, [{"url": "https://a.example/x", "title": "t", "snippet": "", "source": "a.example"}])
+    out = run_web_tool("find_sources", "u1", {"query": "q"})
+    assert "fetch_url" in out
+    # grounding redirect links 429 once stale, so they must be read this turn
+    assert "expire" in out
+
+
+def test_find_sources_with_no_results_forbids_answering_from_memory(monkeypatch):
+    _sources(monkeypatch, [])
+    out = run_web_tool("find_sources", "u1", {"query": "q"})
+    assert "No sources found" in out
+    assert "rather than answering from memory" in out
+
+
+def test_find_sources_bounds_the_result_count(monkeypatch):
+    import tools.web_tools as wt
+    seen = {}
+
+    def fake(q, max_results=10):
+        seen["n"] = max_results
+        return []
+    monkeypatch.setattr(wt, "search_web_raw", fake)
+
+    run_web_tool("find_sources", "u1", {"query": "q", "max_results": 500})
+    assert seen["n"] == wt.MAX_SOURCE_COUNT
+    run_web_tool("find_sources", "u1", {"query": "q", "max_results": 0})
+    assert seen["n"] == 1
+    run_web_tool("find_sources", "u1", {"query": "q", "max_results": "not a number"})
+    assert seen["n"] == wt.DEFAULT_SOURCE_COUNT
+
+
+def test_find_sources_refuses_an_empty_query():
+    assert run_web_tool("find_sources", "u1", {"query": "  "}).startswith("error:")
+
+
+def test_find_sources_does_not_present_its_order_as_a_ranking(monkeypatch):
+    """Observed live 2026-08-25: asked for zoo ticket prices, grounding returned
+    facebook.com first and memphiszoo.org fourth, and fetching #1 yielded 81
+    characters of nothing. The order is chunk order, not relevance, so the tool
+    must not imply otherwise."""
+    _sources(monkeypatch, [
+        {"url": "https://x/1", "title": "", "snippet": "", "source": "facebook.com"},
+        {"url": "https://x/2", "title": "", "snippet": "", "source": "memphiszoo.org"},
+    ])
+    out = run_web_tool("find_sources", "u1", {"query": "Memphis Zoo ticket prices"})
+    assert "NOT A RANKING" in out
+    assert "authoritative" in out
+    assert "read the next source" in out

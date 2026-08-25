@@ -73,9 +73,21 @@ def test_web_family_note_is_no_longer_empty():
 
 def test_composer_is_told_not_to_substitute_adjacent_information():
     note = _tool_catalogue_block()
-    assert "SAY THAT PLAINLY" in note
+    assert "SAY SO PLAINLY" in note
     assert "drive times" in note  # the specific substitution that was served
-    assert "live flight schedules" in note
+
+
+def test_composer_is_told_to_read_a_page_rather_than_pass_on_a_hedge():
+    """A vague search result is an instruction to go and read, not to give up.
+
+    Grounding answered the flight question with "check a booking site" and the
+    composer relayed it. With find_sources + fetch_url available, relaying a hedge
+    is a choice, so the guidance names it.
+    """
+    note = _tool_catalogue_block()
+    assert "NOT AVAILABLE" in note
+    assert "find_sources" in note and "fetch_url" in note
+    assert "Do the reading the summary declined to do." in note
 
 
 # --- formatting -------------------------------------------------------------

@@ -30,6 +30,13 @@ GOOGLE_KEY_ENVS = ("GOOGLE_API_KEY", "GEMINI_API_KEY")
 MAX_SEARCH_CHARS = 6000
 
 
+# How many sources find_sources returns. Six is enough to cover the plausible
+# sites for a question without turning the tool result into a link dump the model
+# has to wade through before it can read anything.
+DEFAULT_SOURCE_COUNT = 6
+MAX_SOURCE_COUNT = 10
+
+
 def _google_key() -> str | None:
     for env in GOOGLE_KEY_ENVS:
         value = (os.environ.get(env) or "").strip()
@@ -96,17 +103,23 @@ def search_web(user_id: str, args: dict) -> str:
 
 
 def search_web_raw(query: str, *, max_results: int = 10) -> list[dict[str, str]]:
-    """Grounded search returning STRUCTURED results.
+    """Grounded search returning STRUCTURED results — a reading list, not an answer.
 
-    ``search_web`` above answers a question in prose for the assistant to speak.
-    The briefing pipeline needs the underlying sources as data — it ranks and
-    deduplicates them, then fetches the survivors. Re-parsing the prose form to
-    recover the URLs would be lossy and would break the moment the wording
-    changed, so the grounding metadata is read directly here instead.
+    ``search_web`` above answers a question in prose. This returns the underlying
+    sources as data so a caller can pick pages and read them with ``fetch_url``.
+    Re-parsing the prose form to recover URLs would be lossy and would break the
+    moment the wording changed, so the grounding metadata is read directly.
 
-    Returns ``[{"url", "title", "snippet", "source"}, ...]``; empty on any
-    failure, because a briefing missing one source is better than a briefing that
-    did not run.
+    The URLs are Google ``grounding-api-redirect`` links rather than the sites
+    themselves. ``fetch_url`` follows them (re-validating every hop), so they are
+    usable as-is — verified 2026-08-25. They do expire: a stale one returns 429,
+    so fetch within the same turn rather than storing them.
+
+    Returns ``[{"url", "title", "snippet", "source"}, ...]``; empty on any failure,
+    because a caller with no sources is better than one that raised. ``snippet`` is
+    always empty — grounding metadata carries no excerpt — and ``title`` is often
+    just the domain, so the choice of what to read is made on the domain. The real
+    page title is the first line of what ``fetch_url`` returns.
     """
     key = _google_key()
     if not key or not query.strip():
@@ -118,7 +131,11 @@ def search_web_raw(query: str, *, max_results: int = 10) -> list[dict[str, str]]
         client = genai.Client(api_key=key)
         response = client.models.generate_content(
             model=os.environ.get(SEARCH_MODEL_ENV) or DEFAULT_SEARCH_MODEL,
-            contents=f"What are the most significant news stories about: {query}",
+            # Was hardcoded to "What are the most significant news stories about:",
+            # which was the briefing's framing leaking into a general helper — it
+            # turned "Memphis weather this week" into a search for news ABOUT the
+            # weather. Callers that want news say so in their query.
+            contents=query,
             config=types.GenerateContentConfig(
                 tools=[types.Tool(google_search=types.GoogleSearch())],
             ),
@@ -153,6 +170,43 @@ def search_web_raw(query: str, *, max_results: int = 10) -> list[dict[str, str]]
     return results
 
 
+def find_sources(user_id: str, args: dict) -> str:
+    """List web pages worth reading for a query, for ``fetch_url`` to open."""
+    query = (args.get("query") or "").strip()
+    if not query:
+        return "error: empty search query"
+    # `or` would fold an explicit 0 into the default; be explicit instead, so a
+    # nonsense count clamps to a usable one rather than silently meaning something
+    # different from what was asked.
+    raw = args.get("max_results")
+    try:
+        requested = DEFAULT_SOURCE_COUNT if raw is None else int(raw)
+    except (TypeError, ValueError):
+        requested = DEFAULT_SOURCE_COUNT
+    count = max(1, min(requested, MAX_SOURCE_COUNT))
+
+    results = search_web_raw(query, max_results=count)
+    if not results:
+        return (
+            f"No sources found for {query!r}. Say that the search returned nothing "
+            "rather than answering from memory."
+        )
+    lines = [f"Pages worth reading for {query!r} — THIS ORDER IS NOT A RANKING:"]
+    for n, r in enumerate(results, 1):
+        label = r.get("source") or r.get("title") or "(unknown site)"
+        lines.append(f"{n}. {label} — {r['url']}")
+    lines.append(
+        "Call fetch_url on the one or two most likely to carry the detail. Choose "
+        "by WHICH SITE is likely to be authoritative, not by position. The "
+        "organisation's own site beats an aggregator, a directory or a social media "
+        "page — asked for zoo ticket prices, memphiszoo.org is the answer and "
+        "facebook.com is not, whichever came first here. If a page comes back with "
+        "little usable text, read the next source rather than giving up. These links "
+        "expire, so read them on this turn."
+    )
+    return "\n".join(lines)
+
+
 def fetch_url(user_id: str, args: dict) -> str:
     """Read one public web page and return its text."""
     url = (args.get("url") or "").strip()
@@ -171,6 +225,7 @@ def fetch_url(user_id: str, args: dict) -> str:
 
 _DISPATCH = {
     "search_web": search_web,
+    "find_sources": find_sources,
     "fetch_url": fetch_url,
 }
 

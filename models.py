@@ -179,7 +179,7 @@ class RoutingDecision(BaseModel):
         "list_calendar_events", "create_calendar_event",
         "update_calendar_event", "delete_calendar_event",
         # web (public internet)
-        "search_web", "fetch_url",
+        "search_web", "find_sources", "fetch_url",
         # travel: real bookable itineraries (search_web cannot answer these)
         "search_flights",
         # REIT research reports (read-only, global)

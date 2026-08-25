@@ -295,12 +295,42 @@ def search_web(query: str, state: Annotated[dict, InjectedState]) -> str:
 
 
 @tool
+def find_sources(
+    query: str,
+    state: Annotated[dict, InjectedState],
+    max_results: int | None = None,
+) -> str:
+    """Get a list of web pages to READ, instead of a summary of them.
+
+    Use this when the answer is a SPECIFIC detail that a summary tends to round
+    off — a schedule, a table, opening hours, a fare, a roster, a figure, an
+    address. Then call fetch_url on the one or two most promising results to read
+    the actual page.
+
+    search_web is the right tool when a summary IS the answer ("who won", "what is
+    X"). This one is right when you need to look at the source. If a search_web
+    result came back vague, said the specific information "was not available", or
+    told the user to go and check a website — that is the signal to use this and
+    read the page yourself rather than passing the hedge along.
+
+    Returns results with their site names. The numbering is NOT a ranking — pick by
+    which site is authoritative for the question (the organisation's own site over
+    an aggregator or a social media page). If a fetched page has little usable
+    text, read the next source. The links expire, so fetch on the same turn.
+    """
+    return run_web_tool(
+        "find_sources", _uid(state), {"query": query, "max_results": max_results}
+    )
+
+
+@tool
 def fetch_url(url: str, state: Annotated[dict, InjectedState]) -> str:
     """Read one specific web page and return its text.
 
-    Use when the user gives a URL, or when a search result needs reading in full.
-    For open questions use search_web instead — this fetches exactly one page and
-    does not find pages.
+    Use when the user gives a URL, or to read a result from find_sources — that
+    pairing is how you get a specific detail off a page rather than a summary of
+    it. For open questions use search_web instead; this fetches exactly one page
+    and does not find pages.
 
     Only public http/https pages work. Private, local and internal addresses are
     refused by design.
@@ -430,6 +460,7 @@ ALL_TOOLS = [
     get_latest_briefing,
     search_briefings,
     search_web,
+    find_sources,
     fetch_url,
     search_flights,
 ]
