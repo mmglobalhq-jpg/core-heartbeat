@@ -174,8 +174,7 @@ class RoutingDecision(BaseModel):
         # REIT research reports (read-only, global)
         "list_reit_issuers", "list_reit_reports",
         "get_reit_report", "get_latest_reit_report",
-        # daily briefing (per-user, read-only)
-        "get_briefing_preferences", "list_briefing_sources",
+        # daily brief (briefing-agent, read-only over HTTP)
         "get_latest_briefing", "search_briefings",
         # attachments (per-user): re-open an image sent earlier in the chat
         "reread_attachment",

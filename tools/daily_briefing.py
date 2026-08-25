@@ -59,9 +59,12 @@ import re
 
 import httpx
 
-SUPABASE_URL_ENV = "SUPABASE_URL"
-SERVICE_ROLE_ENV = "SUPABASE_SERVICE_ROLE_KEY"
-SERVICE_ROLE_FILE_ENV = "SUPABASE_SERVICE_ROLE_KEY_FILE"
+# THE SERVICE-ROLE CREDENTIAL IS GONE FROM THIS MODULE (2026-08-25).
+#
+# Every remaining tool reads briefing-agent over HTTP with a bearer token, so nothing here
+# needs a key that bypasses RLS on the Core project any more. That is the point worth keeping:
+# retiring the four old-table tools did not just remove code, it removed this module from the
+# set of things that hold a credential able to read every user's rows.
 
 _UUID = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
                    r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
@@ -104,39 +107,6 @@ def looks_like_briefing_reference(text: str) -> bool:
     return bool(_BRIEFING_REFERENCE_RE.search(text or ""))
 
 
-def _key() -> str:
-    """Service-role key, file-mounted first.
-
-    The platform moved service keys from environment values to mounted files on
-    2026-08-06; the plain variable is deliberately blanked in compose, so reading
-    it first would find an empty string and look like a missing credential.
-    """
-    path = os.environ.get(SERVICE_ROLE_FILE_ENV)
-    if path and os.path.exists(path):
-        with open(path, encoding="utf-8") as handle:
-            value = handle.read().strip()
-            if value:
-                return value
-    value = (os.environ.get(SERVICE_ROLE_ENV) or "").strip()
-    if not value:
-        raise _BriefingError("no Supabase service-role credential configured")
-    return value
-
-
-def _client() -> httpx.Client:
-    url = (os.environ.get(SUPABASE_URL_ENV) or "").strip().rstrip("/")
-    if not url:
-        raise _BriefingError(f"{SUPABASE_URL_ENV} is not set")
-    key = _key()
-    return httpx.Client(
-        base_url=f"{url}/rest/v1",
-        headers={"apikey": key, "Authorization": f"Bearer {key}",
-                 "Accept": "application/json"},
-        timeout=20.0,
-        transport=_transport,
-    )
-
-
 def _uid(user_id: str) -> str:
     """Validate the caller's id before it reaches a query.
 
@@ -148,16 +118,6 @@ def _uid(user_id: str) -> str:
     if not _UUID.match(value):
         raise _BriefingError("no valid user id in session")
     return value
-
-
-def _get(path: str, params: dict) -> list[dict]:
-    with _client() as client:
-        response = client.get(path, params=params)
-    if response.status_code >= 400:
-        raise _BriefingError(f"briefing store returned HTTP {response.status_code}")
-    payload = response.json()
-    return payload if isinstance(payload, list) else []
-
 
 
 # --- the NEW brief (briefing-agent), reached over its integration surface ------
@@ -197,49 +157,25 @@ def _brief_api(path: str, params: dict | None = None) -> dict:
 # --- tools -------------------------------------------------------------------
 
 
-def get_briefing_preferences(user_id: str, args: dict) -> str:
-    """Topics, delivery time, timezone and email setting."""
-    uid = _uid(user_id)
-    rows = _get("/briefing_prefs", {
-        "user_id": f"eq.{uid}",
-        "select": "topics,deliver_at,timezone,deliver_email,email_to,enabled",
-    })
-    if not rows:
-        return "No daily briefing preferences are set up for you yet."
-    p = rows[0]
-    topics = p.get("topics") or []
-    lines = [
-        f"Daily briefing: {'enabled' if p.get('enabled') else 'DISABLED'}",
-        f"Delivery time: {str(p.get('deliver_at') or '')[:5]} {p.get('timezone') or ''}".strip(),
-        ("Email: on to " + p["email_to"]) if p.get("deliver_email") and p.get("email_to")
-        else "Email: off",
-        "",
-        f"Topics ({len(topics)}):" if topics else "Topics: none set",
-    ]
-    lines += [f"  - {t}" for t in topics]
-    return "\n".join(lines)
-
-
-def list_briefing_sources(user_id: str, args: dict) -> str:
-    """The feeds this user added themselves."""
-    uid = _uid(user_id)
-    rows = _get("/briefing_user_sources", {
-        "user_id": f"eq.{uid}",
-        "select": "name,kind,url,topic,is_active,last_error",
-        "order": "created_at",
-    })
-    if not rows:
-        return ("You have not added any custom feeds. Your briefing uses the "
-                "platform's default feeds only.")
-    lines = [f"Your custom feeds ({len(rows)}):"]
-    for r in rows:
-        state = "" if r.get("is_active") else "  [inactive]"
-        err = f"  [last error: {r['last_error']}]" if r.get("last_error") else ""
-        lines.append(f"  - {r.get('name')} ({r.get('topic')}){state}{err}")
-        lines.append(f"      {r.get('url')}")
-    lines.append("\nThese are in addition to the platform's default feeds.")
-    return "\n".join(lines)
-
+# --- readers on the OLD tables: RETIRED 2026-08-25 --------------------------
+#
+# ``get_briefing_preferences`` and ``list_briefing_sources`` read
+# ``briefing_prefs`` and ``briefing_user_sources`` — settings tables belonging to
+# the pipeline being sunset (briefing-agent/docs/SUNSET.md). Retired rather than
+# repointed because the replacement has nothing equivalent to read: it is
+# config-driven, its schedule lives in the worker's environment, and its feed
+# list is a static declaration in the repo rather than per-user rows.
+#
+# WHAT THIS COSTS, STATED PLAINLY. Doc 29 §32 records the founding case for this
+# whole tool family: asked "what topics are on my daily brief?", the assistant
+# answered that it had no way to know. After this it cannot answer that again.
+# The difference is that there is now no per-user answer to give — a config file
+# is the truth — rather than an answer it was merely blind to.
+#
+# ``looks_like_briefing_reference`` stays UNCHANGED so the router still
+# recognises such a turn and declines it, instead of falling through to the
+# forced knowledge-base retrieval that once answered a briefing question from
+# whatever was nearest in vector space.
 
 def get_latest_briefing(user_id: str, args: dict) -> str:
     """Today's daily brief, or one specific date (YYYY-MM-DD)."""
@@ -346,8 +282,6 @@ def search_briefings(user_id: str, args: dict) -> str:
 # like a bug at the call site.
 
 _DISPATCH = {
-    "get_briefing_preferences": get_briefing_preferences,
-    "list_briefing_sources": list_briefing_sources,
     "get_latest_briefing": get_latest_briefing,
     "search_briefings": search_briefings,
 }

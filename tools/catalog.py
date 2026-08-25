@@ -310,27 +310,6 @@ def fetch_url(url: str, state: Annotated[dict, InjectedState]) -> str:
 # --- the catalog ------------------------------------------------------------
 
 @tool
-def get_briefing_preferences(state: Annotated[dict, InjectedState]) -> str:
-    """The user's daily briefing settings: which topics they follow, what time it
-    is delivered, their timezone, and whether it is emailed. Takes no arguments.
-
-    Use for "what topics am I following", "what's on my daily brief", "when does
-    my briefing arrive". Read-only — it cannot change any setting.
-    """
-    return run_briefing_tool("get_briefing_preferences", _uid(state), {})
-
-
-@tool
-def list_briefing_sources(state: Annotated[dict, InjectedState]) -> str:
-    """List the news feeds the user added to their own daily briefing, on top of
-    the platform's default feeds. Takes no arguments.
-
-    Use for "what feeds do I have", "where does my briefing get news from".
-    """
-    return run_briefing_tool("list_briefing_sources", _uid(state), {})
-
-
-@tool
 def get_latest_briefing(
     state: Annotated[dict, InjectedState],
     briefing_date: str | None = None,
@@ -401,8 +380,6 @@ ALL_TOOLS = [
     list_reit_reports,
     get_reit_report,
     get_latest_reit_report,
-    get_briefing_preferences,
-    list_briefing_sources,
     get_latest_briefing,
     search_briefings,
     search_web,

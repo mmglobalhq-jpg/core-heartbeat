@@ -26,9 +26,8 @@ OTHER = "00000000-0000-0000-0000-000000000001"
 
 @pytest.fixture(autouse=True)
 def _creds(monkeypatch):
-    monkeypatch.setenv(db.SUPABASE_URL_ENV, "https://example.supabase.co")
-    monkeypatch.setenv(db.SERVICE_ROLE_ENV, "test-key")
-    monkeypatch.delenv(db.SERVICE_ROLE_FILE_ENV, raising=False)
+    # No Core service-role credential is set, deliberately: as of 2026-08-25 this module
+    # holds none. Every tool reads briefing-agent over HTTP with a bearer token.
     # The repointed reader (2026-08-25) talks to briefing-agent over HTTP and FAILS CLOSED
     # without both of these. Set here so the tests below exercise the behaviour under test
     # rather than the unconfigured path — two of them were passing on "error:" either way.
@@ -40,39 +39,6 @@ def _creds(monkeypatch):
 
 def _mock(handler):
     db._transport = httpx.MockTransport(handler)
-
-
-def test_preferences_render_topics(monkeypatch):
-    def handler(request):
-        assert request.url.params["user_id"] == f"eq.{UID}"
-        return httpx.Response(200, json=[{
-            "topics": ["Financial Markets", "UGA football"], "deliver_at": "06:30:00",
-            "timezone": "America/Chicago", "deliver_email": True,
-            "email_to": "a@b.example", "enabled": True}])
-    _mock(handler)
-    out = db.run_briefing_tool("get_briefing_preferences", UID)
-    assert "Financial Markets" in out and "UGA football" in out
-    assert "06:30" in out and "America/Chicago" in out
-
-
-def test_every_postgrest_query_is_scoped_to_the_caller():
-    """The filter is the isolation. It must be present on every request.
-
-    Applies to the tools still reading ``briefing_*`` directly: the service-role key
-    bypasses RLS, so ``user_id=eq.<uid>`` is the ONLY thing standing between two users.
-    """
-    seen = []
-
-    def handler(request):
-        seen.append(dict(request.url.params))
-        return httpx.Response(200, json=[])
-
-    _mock(handler)
-    for name in ("get_briefing_preferences", "list_briefing_sources"):
-        db.run_briefing_tool(name, UID)
-    assert seen, "no requests made"
-    for params in seen:
-        assert params.get("user_id") == f"eq.{UID}"
 
 
 def test_the_repointed_reader_sends_a_token_and_NO_user_id():
@@ -102,12 +68,18 @@ def test_the_repointed_reader_sends_a_token_and_NO_user_id():
 
 
 def test_a_blank_or_malformed_user_id_fails_closed():
-    """A missing id must not become an unfiltered query."""
+    """A missing id must not become a request at all.
+
+    The surface is single-owner and never receives this id, so it is no longer a query
+    filter — but it is still the proof that a real session exists, and a blank one must stop
+    here rather than fetching someone's brief on behalf of nobody.
+    """
     calls = []
-    _mock(lambda r: calls.append(r) or httpx.Response(200, json=[]))
+    _mock(lambda r: calls.append(r) or httpx.Response(200, json={}))
     for bad in ("", "   ", "not-a-uuid", "*", "eq.anything"):
-        out = db.run_briefing_tool("get_briefing_preferences", bad)
-        assert out.startswith("error:"), f"{bad!r} was not rejected"
+        for tool in ("get_latest_briefing", "search_briefings"):
+            out = db.run_briefing_tool(tool, bad, {"query": "x"})
+            assert out.startswith("error:"), f"{bad!r} was not rejected by {tool}"
     assert not calls, "a request was issued despite an invalid user id"
 
 
@@ -163,12 +135,6 @@ def test_search_limit_is_bounded_before_it_leaves():
     assert int(seen[1].url.params["limit"]) == 10
 
 
-def test_missing_credentials_degrade_to_an_error_string(monkeypatch):
-    monkeypatch.delenv(db.SERVICE_ROLE_ENV, raising=False)
-    out = db.run_briefing_tool("get_briefing_preferences", UID)
-    assert out.startswith("error:")
-
-
 def test_http_failure_never_raises():
     # 500 from the brief service, not from PostgREST — same requirement either way.
     _mock(lambda r: httpx.Response(500, json={}))
@@ -196,16 +162,6 @@ def test_bad_date_is_rejected():
     _mock(lambda r: httpx.Response(200, json={}))
     out = db.run_briefing_tool("get_latest_briefing", UID, {"briefing_date": "yesterday"})
     assert out.startswith("error:")
-
-
-def test_service_role_file_is_preferred_over_the_blanked_variable(tmp_path, monkeypatch):
-    """Compose blanks the plain variable and mounts the value as a file; reading
-    the variable first finds an empty string and looks like a missing credential."""
-    f = tmp_path / "key"
-    f.write_text("file-key\n")
-    monkeypatch.setenv(db.SERVICE_ROLE_ENV, "")
-    monkeypatch.setenv(db.SERVICE_ROLE_FILE_ENV, str(f))
-    assert db._key() == "file-key"
 
 
 def test_the_writers_are_RETIRED_and_the_module_cannot_write():
@@ -269,3 +225,16 @@ class TestBriefingTurnsSkipTheForcedKnowledgeBaseRetrieval:
     def test_the_supervisor_actually_consults_it(self):
         import orchestrator
         assert orchestrator.looks_like_briefing_reference is db.looks_like_briefing_reference
+
+
+def test_the_module_holds_no_service_role_credential():
+    """Retiring the old-table tools removed a credential, not just code.
+
+    Until 2026-08-25 this module carried a Core service-role key that bypasses RLS and can
+    read every user's rows. Nothing here needs it any more, and the absence is asserted so a
+    future tool cannot quietly reintroduce a PostgREST path alongside the HTTP one.
+    """
+    source = Path(db.__file__).read_text(encoding="utf-8")
+    for marker in ("SERVICE_ROLE", "apikey", "/rest/v1"):
+        assert marker not in source, f"a PostgREST path came back: {marker}"
+    assert not hasattr(db, "SERVICE_ROLE_ENV")
