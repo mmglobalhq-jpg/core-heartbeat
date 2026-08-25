@@ -35,9 +35,16 @@ trust. ``detect_injection`` exists for *telemetry* — so a run can report that
 something looked hostile — and is deliberately not wired to blocking.
 """
 
+# MOVED HERE 2026-08-25 from ``briefing/untrusted.py``. It never belonged to the briefing:
+# ``orchestrator`` fences documents with it and ``tools/attachments`` fences images, both by
+# LAZY import — which is why it survived a grep for the package's dependents and was caught
+# only by 20 failing tests. Retiring the briefing must not remove a prompt-injection defence
+# that chat depends on, so it lives in services/ with the platform's other shared machinery.
+
 from __future__ import annotations
 
 import re
+from urllib.parse import urlsplit, urlunsplit
 import secrets
 import unicodedata
 
@@ -183,6 +190,34 @@ def extract_urls(text: str) -> list[str]:
     return [m.group(0).rstrip(".,;:!?") for m in _URL_RE.finditer(text or "")]
 
 
+
+# Lifted from the retired ``briefing.models`` rather than left as a dangling import. The URL
+# check below is the control that does not rely on the model behaving, so it must not depend
+# on a package being retired underneath it.
+_TRACKING_KEYS = {"fbclid", "gclid", "igshid", "ref", "ref_src", "cmpid", "smid"}
+_TRACKING_PREFIXES = ("utm_", "mc_", "pk_")
+
+
+def normalize_url(url: str) -> str:
+    """Canonical form used for the dedup key.
+
+    Lowercases the host, drops the fragment, strips tracking parameters and
+    removes a trailing slash. Deliberately does NOT drop meaningful query
+    parameters — plenty of sites still identify articles with ``?id=``, and
+    collapsing those would merge unrelated stories into one.
+    """
+    parts = urlsplit(url.strip())
+    query = "&".join(
+        p
+        for p in parts.query.split("&")
+        if p
+        and (key := p.split("=", 1)[0].lower()) not in _TRACKING_KEYS
+        and not key.startswith(_TRACKING_PREFIXES)
+    )
+    path = parts.path.rstrip("/") or "/"
+    return urlunsplit((parts.scheme.lower(), parts.netloc.lower(), path, query, ""))
+
+
 def assert_allowed_urls(text: str, allowed: set[str]) -> None:
     """Every URL in model output must be one the pipeline decided to read.
 
@@ -193,8 +228,6 @@ def assert_allowed_urls(text: str, allowed: set[str]) -> None:
     Compared on the normalised form so a tracking parameter or a trailing slash
     is not mistaken for a different destination.
     """
-    from briefing.models import normalize_url
-
     permitted = {normalize_url(u) for u in allowed}
     for url in extract_urls(text):
         if normalize_url(url) not in permitted:

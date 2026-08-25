@@ -86,7 +86,7 @@ def _vision_answer(image: dict, question: str) -> str:
 
 def reread_attachment(user_id: str, args: dict) -> str:
     """Look at an attached image again and answer one question about it."""
-    from briefing.untrusted import DOCUMENT_PREAMBLE, wrap
+    from services.untrusted import DOCUMENT_PREAMBLE, wrap
     from services import documents as docstore
     from services.images import (
         IMAGE_MEDIA_TYPES,

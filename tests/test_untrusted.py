@@ -7,13 +7,17 @@ attacker asked for.
 The fixtures below are deliberately written the way real injection attempts are
 written — not as obvious "hack the AI" strings, but as text that would look
 unremarkable inside an article body.
+
+MOVED 2026-08-25 with the module, when the briefing package was retired. These 17 tests
+cover a prompt-injection defence that CHAT depends on, not the briefing — deleting them with
+the pipeline would have stripped coverage from a live security control.
 """
 
 from __future__ import annotations
 
 import pytest
 
-from briefing.untrusted import (
+from services.untrusted import (
     UntrustedContentError,
     assert_allowed_urls,
     detect_injection,

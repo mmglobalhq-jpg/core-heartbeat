@@ -505,12 +505,14 @@ _FAMILY_NOTES: tuple[tuple[str, str, str, str], ...] = (
      "(ARR); \"ORC\", \"Orchid\", \"Orchid Island\" and \"Orchid Island Capital\" are "
      "one issuer (ORC). Report ids may be namespaced (arr:<uuid>, orc:<uuid>). Never "
      "claim a report exists unless a tool returned it."),
-    ("briefing", "Daily briefing", "The user's DAILY BRIEFING (their personal morning news digest)",
+    ("briefing", "Daily brief", "The user's DAILY BRIEF (their personal morning news digest)",
      "Use these — NOT query_knowledge_base or the vault, which do not contain the "
-     "briefing — for anything about the user's own briefing, its topics, its feeds "
-     "or what it said. When the user asks to CHANGE what it covers, call the writer; "
-     "do not answer in prose that you will. Delivery time, timezone and email "
-     "address are NOT changeable here: say so and point to briefing settings."),
+     "brief — to read TODAY'S brief or SEARCH past ones. "
+     "READ-ONLY as of 2026-08-25: what the brief covers, its delivery time, timezone "
+     "and email address are all configuration and none is changeable from chat. If the "
+     "user asks to change any of them, SAY SO plainly rather than promising to; there is "
+     "no tool that does it and answering in prose that you will is the failure this "
+     "instruction exists to prevent."),
     ("web", "The live internet", "The live internet", ""),
     ("attachments", "Attachments", "Images the user attached earlier in this chat",
      "You are shown an attached image ONLY on the turn it is sent. On any later "
@@ -2707,7 +2709,7 @@ async def _load_documents(user_id: str, document_ids: list[str]) -> str:
     """
     if not document_ids:
         return ""
-    from briefing.untrusted import DOCUMENT_PREAMBLE, wrap
+    from services.untrusted import DOCUMENT_PREAMBLE, wrap
     from services import documents as docstore
 
     parts: list[str] = []

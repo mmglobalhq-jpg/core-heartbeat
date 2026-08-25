@@ -17,7 +17,6 @@ from fastapi.responses import JSONResponse
 
 from models import ValidationRejected
 from orchestrator import warm_ollama_models
-from briefing.api import router as briefing_router
 from router import load_confidence_threshold, router
 
 # Surface app-level INFO logs (e.g. auth.resolve_user_id's resolved user_id).
@@ -75,7 +74,6 @@ def create_app() -> FastAPI:
     app = FastAPI(title="core-heartbeat gateway", version="0.1.0", lifespan=_lifespan)
     app.state.confidence_threshold = load_confidence_threshold()
     app.include_router(router)
-    app.include_router(briefing_router)
     app.add_exception_handler(RequestValidationError, _validation_exception_handler)
     return app
 
