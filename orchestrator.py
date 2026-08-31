@@ -44,7 +44,12 @@ from services.storage_sync import sync_user_vault, upload_user_file
 from tools.user_vault import USER_VAULT_TOOLS, read_note, run_vault_tool, write_note
 from tools.flights import FLIGHT_TOOL_REGISTRY, run_flight_tool
 from tools.web_tools import WEB_TOOL_REGISTRY, run_web_tool
-from tools.graphrag import GRAPHRAG_TOOL_REGISTRY, kb_configured, run_graphrag_tool
+from tools.graphrag import (
+    GRAPHRAG_TOOL_REGISTRY,
+    KB_RETRIEVE_ONCE_TOOLS,
+    kb_configured,
+    run_graphrag_tool,
+)
 from tools.attachments import ATTACHMENT_TOOL_REGISTRY, run_attachment_tool
 from tools.google_calendar import CALENDAR_TOOL_REGISTRY, run_calendar_tool
 from tools.catalog import ALL_TOOLS, WRITE_TOOLS
@@ -1611,13 +1616,19 @@ def supervisor(state: GraphState) -> dict:
             "messages": [Message(source="supervisor", content="route -> finish (fast-path: answered)", step=step)],
         }
 
-    # Deterministic fast-path (latency): the KB is a retrieve-once-then-compose tool,
-    # so once its result is in this run's messages the next hop is ALWAYS local_llm.
-    # Skipping the model routing call here removes a ~1.2s Gemini round-trip that sits
-    # BEFORE generation, cutting time-to-first-token on every KB-grounded turn. The
-    # retrieve-once guard below enforces the same transition when the model is asked;
-    # this just avoids paying for a decision that's already determined.
-    _kb_prefixes = tuple(f"[tool:{n}]" for n in GRAPHRAG_TOOL_REGISTRY)
+    # Deterministic fast-path (latency): a corpus-wide KB search is a
+    # retrieve-once-then-compose tool, so once its result is in this run's messages the
+    # next hop is ALWAYS local_llm. Skipping the model routing call here removes a
+    # ~1.2s Gemini round-trip that sits BEFORE generation, cutting time-to-first-token
+    # on every KB-grounded turn. The retrieve-once guard below enforces the same
+    # transition when the model is asked; this just avoids paying for a decision that's
+    # already determined.
+    #
+    # Scoped to KB_RETRIEVE_ONCE_TOOLS, NOT the whole KB registry: listing the
+    # knowledge base's documents is a step TOWARDS a second call (summarize the one the
+    # user then names), so short-circuiting to local_llm after it would strand the turn
+    # with a list of titles instead of the summary that was asked for.
+    _kb_prefixes = tuple(f"[tool:{n}]" for n in KB_RETRIEVE_ONCE_TOOLS)
     if "local_llm" not in state.get("visited", []) and any(
         m.source == "tool_execution" and m.content.startswith(_kb_prefixes)
         for m in state.get("messages", [])
@@ -1839,7 +1850,7 @@ def _finish_routing(
 
     # Has the KB already been consulted THIS turn? (a query_knowledge_base result in
     # this run's messages). Shared by both KB guards below.
-    _kb_prefixes = tuple(f"[tool:{n}]" for n in GRAPHRAG_TOOL_REGISTRY)
+    _kb_prefixes = tuple(f"[tool:{n}]" for n in KB_RETRIEVE_ONCE_TOOLS)
     kb_consulted = any(
         m.source == "tool_execution" and m.content.startswith(_kb_prefixes)
         for m in state.get("messages", [])
@@ -1852,7 +1863,7 @@ def _finish_routing(
     # "any other options?"). Redirect any repeat KB call to local_llm so it composes
     # from what was already retrieved (plus general knowledge). Runs before the
     # local_llm guard below so an already-answered turn still finishes cleanly.
-    if nxt == "tool_execution" and decision.tool_name in GRAPHRAG_TOOL_REGISTRY and kb_consulted:
+    if nxt == "tool_execution" and decision.tool_name in KB_RETRIEVE_ONCE_TOOLS and kb_consulted:
         nxt = "local_llm"
 
     # Deterministic retrieve-first guard (do not rely on the model to consult the KB).
@@ -1956,7 +1967,7 @@ def _finish_routing(
         # discarding the whole batch, so "check my notes AND add these games" keeps
         # its calendar writes.
         if kb_consulted:
-            calls = [c for c in calls if c["name"] not in GRAPHRAG_TOOL_REGISTRY] or None
+            calls = [c for c in calls if c["name"] not in KB_RETRIEVE_ONCE_TOOLS] or None
 
     # Repeat-call guard. The model re-emits a call when the result doesn't answer the
     # question, but "no matching events" IS the answer — it just doesn't look like one.

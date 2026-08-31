@@ -107,6 +107,47 @@ def query_knowledge_base(query: str, state: Annotated[dict, InjectedState]) -> s
     return run_graphrag_tool("query_knowledge_base", _uid(state), {"query": query})[0]
 
 
+@tool
+def list_knowledge_base_documents(state: Annotated[dict, InjectedState]) -> str:
+    """List the titles of the documents saved in the user's knowledge base.
+
+    Use this when the user asks what is in their knowledge base, or when they refer
+    to a document by a partial or uncertain name and you need the exact title before
+    calling summarize_document.
+    """
+    return run_graphrag_tool("list_knowledge_base_documents", _uid(state), {})[0]
+
+
+@tool
+def summarize_document(
+    document: str, state: Annotated[dict, InjectedState], focus: str | None = None
+) -> str:
+    """Read ONE named document from the knowledge base and return it for summarizing.
+
+    Use this — NOT query_knowledge_base — whenever the user points at a specific
+    document: "summarize X", "what are the highlights of X", "what does X say about
+    Y". query_knowledge_base searches the whole knowledge base and returns a few short
+    fragments, so on a request about one document it returns pieces of the WRONG
+    documents; that is what this tool exists to prevent.
+
+    document: how the user referred to it — a title, part of a title, or a filename.
+    Include any date they mentioned: publications like a weekly report have many
+    issues whose titles differ only by date, and the date is what tells them apart.
+
+    focus: optional. Set it when the user wants a specific topic within the document
+    ("what does it say about specified pools?") rather than an overall summary. Leave
+    it unset for a general summary — the tool then samples the whole document instead
+    of only the part matching a search.
+
+    If it reports that no document matches, tell the user that and show them the
+    titles it lists. Never substitute a different document, and never answer from
+    general knowledge as though you had read theirs.
+    """
+    return run_graphrag_tool(
+        "summarize_document", _uid(state), {"document": document, "focus": focus}
+    )[0]
+
+
 # --- google calendar --------------------------------------------------------
 #
 # Datetimes are NAIVE LOCAL — "2026-08-21T19:00:00", never a Z or a UTC offset. The
@@ -449,6 +490,8 @@ ALL_TOOLS = [
     search_user_vault,
     write_user_note,
     query_knowledge_base,
+    list_knowledge_base_documents,
+    summarize_document,
     list_calendar_events,
     create_calendar_event,
     update_calendar_event,
