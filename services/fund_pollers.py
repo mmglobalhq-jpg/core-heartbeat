@@ -52,6 +52,20 @@ ALLSPRING_STALE_AFTER_DAYS = 70
 """Allspring publishes monthly, in arrears, captured during a mid-month window.
 Two months plus slack — anything less alarms every normal cycle."""
 
+REGAN_STALE_AFTER_DAYS = 6
+"""Daily, like JP, but one of the two funds runs a business day behind the other.
+
+MBSF has consistently served the prior business day's file while MBSX serves the
+current one (2026-09-01: MBSF 08-31, MBSX 09-01; 2026-09-02: MBSF 09-01, MBSX 09-02).
+So the worst normal case is a Monday check finding MBSF stamped the previous Thursday —
+four days — and a Monday holiday pushes that to five.
+
+⚠️ **Provisional.** This is set from two days of observation, which is not enough to
+have seen a weekend or a holiday. Six buys a day of margin over the reasoning above,
+deliberately erring loose: a false alarm here trains people to ignore the endpoint,
+whereas a missed day is caught by the continuity check rather than by this. Tighten it
+once the capture record actually covers a long weekend."""
+
 _FAILURE_STATUSES = (
     "partial",
     "download_failed",
@@ -270,6 +284,11 @@ def _poller_report(
 
 
 JP_TICKERS = ["JAGG", "JBND", "JCPB", "JCPI", "JFLX", "JMTG", "JPIE", "JPLD", "JSCP"]
+REGAN_TICKERS = ["MBSF", "MBSX"]
+"""Both carry ``is_active = false`` in ``funds`` so the JP poller never selects them —
+see system-source-of-truth docs/26 §1. This list is therefore the only thing that makes
+them visible to monitoring, which is why it is spelled out rather than derived."""
+
 ALLSPRING_TICKERS = [
     "AS_CORE_BOND",
     "AS_CORE_PLUS",
@@ -281,10 +300,10 @@ ALLSPRING_TICKERS = [
 
 
 def fund_poller_health(*, today: dt.date | None = None) -> dict[str, Any]:
-    """Report JP and Allspring poller health separately.
+    """Report each poller's health separately.
 
-    Each poller is reported independently and a failure in one never masks or
-    degrades the other. If a poller cannot be queried at all, it is reported as
+    Every poller is reported independently and a failure in one never masks or
+    degrades the others. If a poller cannot be queried at all, it is reported as
     ``"unknown"`` rather than ``"healthy"`` — an unreachable check is not a
     passing check.
     """
@@ -294,6 +313,7 @@ def fund_poller_health(*, today: dt.date | None = None) -> dict[str, Any]:
     for name, tickers, stale_days in (
         ("jp", JP_TICKERS, JP_STALE_AFTER_DAYS),
         ("allspring", ALLSPRING_TICKERS, ALLSPRING_STALE_AFTER_DAYS),
+        ("regan", REGAN_TICKERS, REGAN_STALE_AFTER_DAYS),
     ):
         try:
             report[name] = _poller_report(
@@ -303,14 +323,18 @@ def fund_poller_health(*, today: dt.date | None = None) -> dict[str, Any]:
             logger.warning("fund poller health check failed for %s: %s", name, exc)
             report[name] = {"poller": name, "healthy": None, "status": "unknown", "error": str(exc)}
 
-    statuses = [report[n].get("healthy") for n in ("jp", "allspring")]
+    statuses = [report[n].get("healthy") for n in ("jp", "allspring", "regan")]
     report["healthy"] = all(s is True for s in statuses)
     report["degraded"] = any(s is False for s in statuses)
     report["unknown"] = any(s is None for s in statuses)
-    # Nothing is wired to send an alert when this goes unhealthy, so this
-    # endpoint is the only signal and must be polled externally. A Resend API key
-    # does exist on the host (used by the signup-approval Edge Function) but is
-    # not in this service's environment, and no systemd unit has OnFailure=.
-    # See system-source-of-truth docs/26-fund-pollers.md §8.
-    report["outbound_alerting"] = "none"
+    # Corrected 2026-09-02. This previously reported "none" and carried a comment
+    # asserting that no systemd unit set OnFailure= — true when written on 2026-08-04,
+    # false since 2026-08-05. All poller units now carry OnFailure=alert@ drop-ins
+    # (verified with `systemctl show <unit> -p OnFailure`), so the endpoint was telling
+    # every consumer that alerting did not exist while it did.
+    #
+    # It stays a coarse, honest summary rather than a claim this endpoint cannot back:
+    # the units alert on *their own* failure, but nothing polls this rollup, so an
+    # unhealthy state visible only here still reaches no one. See docs/14 §7.
+    report["outbound_alerting"] = "unit_onfailure_only"
     return report
