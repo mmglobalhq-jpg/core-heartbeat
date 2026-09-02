@@ -212,7 +212,7 @@ def test_recovery_shows_as_healthy_again(patch_api):
 
 
 # --------------------------------------------------------------------------- #
-# Reporting the two pollers independently
+# Reporting every poller independently
 # --------------------------------------------------------------------------- #
 def test_pollers_are_reported_separately(monkeypatch):
     def fake_report(*, poller, tickers, stale_after_days, today):
@@ -222,6 +222,7 @@ def test_pollers_are_reported_separately(monkeypatch):
     report = fund_pollers.fund_poller_health(today=TODAY)
     assert report["jp"]["healthy"] is True
     assert report["allspring"]["healthy"] is False
+    assert report["regan"]["healthy"] is False
     assert report["healthy"] is False, "one unhealthy poller degrades the rollup"
     assert report["degraded"] is True
     assert not report["unknown"]
@@ -236,6 +237,7 @@ def test_one_poller_failing_to_report_does_not_break_the_other(monkeypatch):
     monkeypatch.setattr(fund_pollers, "_poller_report", fake_report)
     report = fund_pollers.fund_poller_health(today=TODAY)
     assert report["jp"]["healthy"] is True
+    assert report["regan"]["healthy"] is True, "an unrelated poller must be unaffected"
     assert report["allspring"]["status"] == "unknown"
     assert report["allspring"]["healthy"] is None
     assert report["unknown"] is True
@@ -248,78 +250,101 @@ def test_missing_configuration_is_surfaced_not_swallowed(monkeypatch):
     report = fund_pollers.fund_poller_health(today=TODAY)
     assert report["jp"]["status"] == "unknown"
     assert report["allspring"]["status"] == "unknown"
+    assert report["regan"]["status"] == "unknown"
     assert report["healthy"] is False
 
 
-def test_report_records_that_no_outbound_channel_exists(monkeypatch):
+def test_report_records_the_outbound_alerting_state(monkeypatch):
+    """Corrected 2026-09-02.
+
+    This previously asserted "none", which stopped being true on 2026-08-05 when the
+    poller units gained OnFailure=alert@ drop-ins. The test passed for a month while
+    the endpoint told every consumer that alerting did not exist.
+    """
     monkeypatch.setattr(
         fund_pollers,
         "_poller_report",
         lambda **kw: {"poller": kw["poller"], "healthy": True},
     )
-    assert fund_pollers.fund_poller_health(today=TODAY)["outbound_alerting"] == "none"
+    report = fund_pollers.fund_poller_health(today=TODAY)
+    assert report["outbound_alerting"] == "unit_onfailure_only"
 
 
 # --------------------------------------------------------------------------- #
-# Request count — the reason this endpoint was rewritten
+# Regan
 # --------------------------------------------------------------------------- #
-def test_request_count_does_not_grow_five_per_fund(patch_api):
-    """The endpoint issued five sequential requests PER FUND — ~75 round-trips for
-    15 funds, measured at 21-30s, long enough to trip a monitoring timeout on a
-    health check.
+def test_regan_tickers_match_what_the_poller_writes():
+    """These funds carry is_active=false so the JP poller never selects them, which
+    means this list is the only thing making them visible to monitoring."""
+    assert fund_pollers.REGAN_TICKERS == ["MBSF", "MBSX"]
 
-    Snapshots, unresolved failures and needs-review counts are now one batched
-    request each regardless of fund count; only the two top-N-per-fund lookups
-    remain per fund, and those run concurrently. So the growth rate is 2 per fund
-    plus a constant, not 5 per fund.
-    """
-    funds = [{"id": f"f{n}", "ticker": f"TICK{n}", "is_active": True} for n in range(15)]
-    fake = patch_api(FakeApi(
-        funds=funds,
-        snapshots={f"f{n}": "2026-08-03" for n in range(15)},
-        successes={f"f{n}": "2026-08-03T06:00:00+00:00" for n in range(15)},
-        recent={f"f{n}": ["success"] for n in range(15)},
-    ))
-    report = fund_pollers._poller_report(
-        poller="jp", tickers=[f"TICK{n}" for n in range(15)],
-        stale_after_days=4, today=TODAY,
+
+def _regan_api(**kwargs):
+    return FakeApi(
+        funds=[
+            {"id": "f1", "ticker": "MBSF", "is_active": False},
+            {"id": "f2", "ticker": "MBSX", "is_active": False},
+        ],
+        **kwargs,
     )
-    assert report["funds_total"] == 15
-
-    # 1 funds + 3 batched + (2 x 15 per-fund) = 34, vs 1 + 75 = 76 before.
-    assert len(fake.calls) == 34
-    assert fake.calls.count("fund_snapshots") == 1, "snapshots must be one batched call"
 
 
-def test_batched_counts_are_attributed_to_the_right_fund(patch_api):
-    """The batched queries return every fund's rows in one response, so grouping by
-    fund_id is now this module's job. Mis-grouping would report one fund's failures
-    against another — worse than being slow."""
-    patch_api(FakeApi(
-        funds=[{"id": "f1", "ticker": "AAA", "is_active": True},
-               {"id": "f2", "ticker": "BBB", "is_active": True}],
-        snapshots={"f1": "2026-08-03", "f2": "2026-08-03"},
-        successes={"f1": "2026-08-03T06:00:00+00:00", "f2": "2026-08-03T06:00:00+00:00"},
-        recent={"f1": ["success"], "f2": ["success"]},
-        unresolved={"f2": 3},
-    ))
-    report = fund_pollers._poller_report(
-        poller="jp", tickers=["AAA", "BBB"], stale_after_days=4, today=TODAY,
+def _regan_report(today):
+    return fund_pollers._poller_report(
+        poller="regan",
+        tickers=fund_pollers.REGAN_TICKERS,
+        stale_after_days=fund_pollers.REGAN_STALE_AFTER_DAYS,
+        today=today,
     )
-    by_ticker = {f["ticker"]: f for f in report["funds"]}
-    assert by_ticker["AAA"]["unresolved_failures"] == 0
-    assert by_ticker["BBB"]["unresolved_failures"] == 3
-    assert by_ticker["AAA"]["healthy"] is True
-    assert by_ticker["BBB"]["healthy"] is False
 
 
-def test_no_matching_funds_reports_unhealthy_not_a_crash(patch_api):
-    """An empty id list would produce a malformed in.() filter, so this returns
-    early. Unhealthy, matching the previous `bool(entries) and all(...)`."""
-    patch_api(FakeApi(funds=[]))
-    report = fund_pollers._poller_report(
-        poller="jp", tickers=["NOPE"], stale_after_days=4, today=TODAY,
+def test_regan_tolerates_the_one_business_day_lag_between_its_funds(patch_api):
+    """MBSF consistently serves the prior business day while MBSX serves the current
+    one. A tolerance tuned for a same-day feed would call MBSF stale every weekend."""
+    patch_api(
+        _regan_api(
+            snapshots={"f1": "2026-08-31", "f2": "2026-09-04"},  # MBSF 5 days behind
+            successes={
+                "f1": "2026-09-04T06:00:00+00:00",
+                "f2": "2026-09-04T06:00:00+00:00",
+            },
+            unresolved={"f1": 0, "f2": 0},
+            recent={"f1": ["success"], "f2": ["success"]},
+        )
     )
-    assert report["funds_total"] == 0
-    assert report["healthy"] is False
-    assert report["funds"] == []
+    report = _regan_report(dt.date(2026, 9, 5))
+    assert report["healthy"], "a long-weekend lag on MBSF is normal, not stale"
+    assert report["funds_stale"] == 0
+    assert report["funds_total"] == 2
+
+
+def test_regan_still_reports_a_genuinely_stalled_fund(patch_api):
+    """The tolerance is loose, not absent."""
+    patch_api(
+        _regan_api(
+            snapshots={"f1": "2026-08-20", "f2": "2026-09-04"},
+            successes={"f1": None, "f2": "2026-09-04T06:00:00+00:00"},
+            unresolved={"f1": 0, "f2": 0},
+            recent={"f1": ["success"], "f2": ["success"]},
+        )
+    )
+    report = _regan_report(dt.date(2026, 9, 5))
+    assert not report["healthy"]
+    assert report["funds_stale"] == 1
+    assert [f["ticker"] for f in report["funds"] if f["stale_data"]] == ["MBSF"]
+
+
+def test_regan_is_inactive_by_design_and_still_monitored(patch_api):
+    """Both funds carry is_active=false so the JP poller never selects them. That is
+    exactly why they need an explicit ticker list here — nothing derives them."""
+    patch_api(
+        _regan_api(
+            snapshots={"f1": "2026-09-04", "f2": "2026-09-04"},
+            successes={"f1": "2026-09-04T06:00:00+00:00", "f2": "2026-09-04T06:00:00+00:00"},
+            unresolved={"f1": 0, "f2": 0},
+            recent={"f1": ["success"], "f2": ["success"]},
+        )
+    )
+    report = _regan_report(dt.date(2026, 9, 5))
+    assert report["funds_total"] == 2
+    assert report["healthy"]
