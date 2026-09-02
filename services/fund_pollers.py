@@ -327,14 +327,23 @@ def fund_poller_health(*, today: dt.date | None = None) -> dict[str, Any]:
     report["healthy"] = all(s is True for s in statuses)
     report["degraded"] = any(s is False for s in statuses)
     report["unknown"] = any(s is None for s in statuses)
-    # Corrected 2026-09-02. This previously reported "none" and carried a comment
-    # asserting that no systemd unit set OnFailure= — true when written on 2026-08-04,
-    # false since 2026-08-05. All poller units now carry OnFailure=alert@ drop-ins
-    # (verified with `systemctl show <unit> -p OnFailure`), so the endpoint was telling
-    # every consumer that alerting did not exist while it did.
+    # This field has now been wrong twice, in opposite directions, so it is worth
+    # stating exactly what it means: **what happens when this rollup says unhealthy.**
     #
-    # It stays a coarse, honest summary rather than a claim this endpoint cannot back:
-    # the units alert on *their own* failure, but nothing polls this rollup, so an
-    # unhealthy state visible only here still reaches no one. See docs/14 §7.
-    report["outbound_alerting"] = "unit_onfailure_only"
+    #   "none"               (until 2026-09-02) — asserted that no unit set OnFailure=.
+    #                        True on 2026-08-04, false from 2026-08-05. Stale a month.
+    #   "unit_onfailure_only" (2026-09-02, also wrong) — corrected the above but added
+    #                        that "nothing polls this rollup". platform-watchdog check 5
+    #                        has polled it every 30 minutes since 2026-08-10.
+    #
+    # Both paths exist and both have been observed delivering:
+    #   * each poller unit carries OnFailure=alert@, firing on its own failure;
+    #   * watchdog check 5 GETs this endpoint every 30 min, CRITs on unhealthy, which
+    #     fails platform-watchdog.service, which fires its own OnFailure=alert@.
+    #
+    # The lesson is not the value but the method: this field describes machinery living
+    # outside this repository, and it was twice asserted from memory rather than
+    # checked. Verify against `systemctl show <unit> -p OnFailure` and against
+    # platform-watchdog.sh before editing it again.
+    report["outbound_alerting"] = "unit_onfailure_and_watchdog_poll"
     return report

@@ -255,11 +255,16 @@ def test_missing_configuration_is_surfaced_not_swallowed(monkeypatch):
 
 
 def test_report_records_the_outbound_alerting_state(monkeypatch):
-    """Corrected 2026-09-02.
+    """This assertion has been wrong twice, and passed happily both times.
 
-    This previously asserted "none", which stopped being true on 2026-08-05 when the
-    poller units gained OnFailure=alert@ drop-ins. The test passed for a month while
-    the endpoint told every consumer that alerting did not exist.
+    "none" stopped being true on 2026-08-05 when the poller units gained
+    OnFailure=alert@ drop-ins. "unit_onfailure_only" was wrong the same day it was
+    written: it claimed nothing polls this rollup, when platform-watchdog check 5 had
+    been GETting it every 30 minutes since 2026-08-10.
+
+    A test that only pins whatever the code currently says cannot catch either error.
+    The value describes machinery in another repository, so verifying it means looking
+    at `systemctl show <unit> -p OnFailure` and at platform-watchdog.sh.
     """
     monkeypatch.setattr(
         fund_pollers,
@@ -267,7 +272,7 @@ def test_report_records_the_outbound_alerting_state(monkeypatch):
         lambda **kw: {"poller": kw["poller"], "healthy": True},
     )
     report = fund_pollers.fund_poller_health(today=TODAY)
-    assert report["outbound_alerting"] == "unit_onfailure_only"
+    assert report["outbound_alerting"] == "unit_onfailure_and_watchdog_poll"
 
 
 # --------------------------------------------------------------------------- #
