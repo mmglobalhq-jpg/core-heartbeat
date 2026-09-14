@@ -1,7 +1,7 @@
 """Fund-poller health for the platform heartbeat.
 
-Neither fund poller is a long-running service — both are one-shot systemd
-units. Nothing "goes down"; a poller fails by quietly not producing data, which
+None of the three fund pollers is a long-running service — all are one-shot
+systemd units. Nothing "goes down"; a poller fails by quietly not producing data, which
 no liveness probe can see. This module therefore checks the *evidence a poller
 leaves behind* rather than any process:
 
@@ -55,16 +55,18 @@ Two months plus slack — anything less alarms every normal cycle."""
 REGAN_STALE_AFTER_DAYS = 6
 """Daily, like JP, but one of the two funds runs a business day behind the other.
 
-MBSF has consistently served the prior business day's file while MBSX serves the
-current one (2026-09-01: MBSF 08-31, MBSX 09-01; 2026-09-02: MBSF 09-01, MBSX 09-02).
-So the worst normal case is a Monday check finding MBSF stamped the previous Thursday —
-four days — and a Monday holiday pushes that to five.
+MBSF consistently serves the prior business day's file while MBSX serves the current
+one (and forward-dates across weekends), so the worst normal case is a Monday check
+finding MBSF stamped the previous Thursday — four days — and a Monday holiday pushes
+that to five. Six buys a day of margin.
 
-⚠️ **Provisional.** This is set from two days of observation, which is not enough to
-have seen a weekend or a holiday. Six buys a day of margin over the reasoning above,
-deliberately erring loose: a false alarm here trains people to ignore the endpoint,
-whereas a missed day is caught by the continuity check rather than by this. Tighten it
-once the capture record actually covers a long weekend."""
+✅ **Validated 2026-09-08.** Labor Day weekend was the first real test: peak age
+reached 4 days against the 6-day tolerance, headroom 2. The peak matters as much as
+the pass — a weekend that never pushed it would have proved nothing.
+
+Note this is a hardcoded constant, not an environment variable: tuning it needs a
+code change and a redeploy. That is deliberate for a value this load-bearing, but it
+is worth knowing before someone goes looking for a knob."""
 
 _FAILURE_STATUSES = (
     "partial",
