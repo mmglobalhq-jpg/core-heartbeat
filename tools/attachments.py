@@ -77,7 +77,16 @@ def _vision_answer(image: dict, question: str) -> str:
             ],
         }
     ]
-    resp = client.models.generate_content(model=model, contents=contents)
+    from services import llm_ledger
+
+    # Re-reading an image is a full multimodal request and was never recorded.
+    with llm_ledger.attempt("gemini", model, "heartbeat.vision") as record:
+        resp = client.models.generate_content(model=model, contents=contents)
+        record.ok(
+            getattr(resp, "usage_metadata", None),
+            model_served=getattr(resp, "model_version", None),
+            request_id=getattr(resp, "response_id", None),
+        )
     text = (getattr(resp, "text", "") or "").strip()
     if not text:
         raise AttachmentError("the vision model returned nothing for that image")

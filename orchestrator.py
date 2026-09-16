@@ -75,6 +75,7 @@ from models import (
     ToolArgs,
     WorkerFailure,
 )
+from services import llm_ledger
 
 logger = logging.getLogger(__name__)
 
@@ -875,8 +876,14 @@ def _decide_native(
 
     prompt = _build_native_prompt(state)
     content = _as_content_parts(prompt, _turn_images(state), "langchain")
+    provider, api_model = _resolve_model(model_pref)
     try:
-        response = bound.invoke([{"role": "user", "content": content}])
+        # shape="langchain": usage_metadata is NOT the provider's own spelling. Its
+        # input_tokens already includes cache reads and writes, and output_tokens
+        # already includes reasoning (doc 07 3a).
+        with llm_ledger.attempt(provider, api_model, "heartbeat.router.native") as record:
+            response = bound.invoke([{"role": "user", "content": content}])
+            record.ok(getattr(response, "usage_metadata", None), shape="langchain")
     except Exception as exc:  # never crash the graph
         _trace("router.native.FAILED", err=f"{type(exc).__name__}: {exc}")
         return None, [], RoutingFailure(
@@ -947,18 +954,24 @@ def _decide_openai(
     """OpenAI path via chat.completions with a strict json_schema response_format."""
     prompt = _build_prompt(state)
     try:
-        response = client.chat.completions.create(
-            model=api_model,
-            messages=[{"role": "user", "content": prompt}],
-            response_format={
-                "type": "json_schema",
-                "json_schema": {
-                    "name": "routing_decision",
-                    "strict": True,
-                    "schema": ROUTING_JSON_SCHEMA,
+        with llm_ledger.attempt("openai", api_model, "heartbeat.router.openai") as record:
+            response = client.chat.completions.create(
+                model=api_model,
+                messages=[{"role": "user", "content": prompt}],
+                response_format={
+                    "type": "json_schema",
+                    "json_schema": {
+                        "name": "routing_decision",
+                        "strict": True,
+                        "schema": ROUTING_JSON_SCHEMA,
+                    },
                 },
-            },
-        )
+            )
+            record.ok(
+                getattr(response, "usage", None),
+                model_served=getattr(response, "model", None),
+                request_id=getattr(response, "id", None),
+            )
     except Exception as exc:  # never crash the graph
         return None, RoutingFailure(category=_categorize_api_error(exc), detail=_detail(exc)), TokenUsage()
 
@@ -985,13 +998,19 @@ def _decide_anthropic(
     # deciding what to do with it. No images -> plain string, exactly as before.
     content = _as_content_parts(prompt, _turn_images(state), "anthropic")
     try:
-        response = client.messages.create(
-            model=api_model,
-            max_tokens=64,
-            messages=[{"role": "user", "content": content}],
-            tools=[tool],
-            tool_choice={"type": "tool", "name": "route"},
-        )
+        with llm_ledger.attempt("anthropic", api_model, "heartbeat.router.anthropic") as record:
+            response = client.messages.create(
+                model=api_model,
+                max_tokens=64,
+                messages=[{"role": "user", "content": content}],
+                tools=[tool],
+                tool_choice={"type": "tool", "name": "route"},
+            )
+            record.ok(
+                getattr(response, "usage", None),
+                model_served=getattr(response, "model", None),
+                request_id=getattr(response, "id", None),
+            )
     except Exception as exc:  # never crash the graph
         return None, RoutingFailure(category=_categorize_api_error(exc), detail=_detail(exc)), TokenUsage()
 
@@ -1429,6 +1448,11 @@ async def generate_local(
         return None, WorkerFailure(
             category="invalid_output", detail="no 'response' field in stream"
         ), TokenUsage()
+    # Recorded here rather than around the stream: usage_body is only complete once the
+    # final "done" chunk has arrived, and None (never {}) when Ollama reported nothing —
+    # a provider row with no token counts is rejected by the ledger's check constraint.
+    with llm_ledger.attempt("ollama", _ollama_model(), "heartbeat.local_answer") as record:
+        record.ok(usage_body or None)
     return "".join(parts), None, _extract_ollama_usage(usage_body)
 
 
@@ -1492,10 +1516,15 @@ async def generate_title(
         "options": {"num_predict": 24, "temperature": 0.2},
     }
     try:
-        response = await client.post(_ollama_url(), json=payload)
-        if response.status_code // 100 != 2:
-            return None
-        body = response.json()
+        with llm_ledger.attempt("ollama", _ollama_model(), "heartbeat.title") as record:
+            response = await client.post(_ollama_url(), json=payload)
+            if response.status_code // 100 != 2:
+                return None
+            body = response.json()
+            # Local inference costs nothing, but volume is still worth seeing: an
+            # empty ledger for ollama should mean "not called", never "not recorded".
+            # None rather than {} when Ollama reported no counts — see local_answer.
+            record.ok(body if body.get("eval_count") is not None else None)
     except Exception:  # timeout / transport / decode — never crash the endpoint
         return None
     if body.get("error"):
@@ -2139,18 +2168,25 @@ async def generate_cloud(
     # Attach images so the composed ANSWER can describe what is in the screenshot,
     # not just the text docling pulled out of it. No images -> plain string.
     contents = _as_content_parts(prompt, _turn_images(state), "gemini")
+    last_meta = None
     try:
-        stream = await client.aio.models.generate_content_stream(
-            model=api_model, contents=contents, config=config
-        )
-        async for chunk in stream:
-            piece = getattr(chunk, "text", None)
-            if piece:
-                parts.append(piece)
-                if on_token is not None:
-                    await on_token(piece)
-            if getattr(chunk, "usage_metadata", None) is not None:
-                usage = _extract_usage(chunk)  # last chunk carries the running totals
+        # The whole stream is ONE billed request, so it is one ledger row. A stream that
+        # dies mid-answer records as a failure with usage "missing": the partial answer
+        # is kept for the reader, but what it cost is genuinely unknown (doc 07 3a).
+        with llm_ledger.attempt("gemini", api_model, "heartbeat.compose") as record:
+            stream = await client.aio.models.generate_content_stream(
+                model=api_model, contents=contents, config=config
+            )
+            async for chunk in stream:
+                piece = getattr(chunk, "text", None)
+                if piece:
+                    parts.append(piece)
+                    if on_token is not None:
+                        await on_token(piece)
+                if getattr(chunk, "usage_metadata", None) is not None:
+                    last_meta = chunk.usage_metadata
+                    usage = _extract_usage(chunk)  # last chunk carries the running totals
+            record.ok(last_meta)
     except Exception as exc:  # never crash the graph
         if parts:  # already streamed a partial answer — keep it rather than regress
             return "".join(parts), None, usage
@@ -2498,19 +2534,27 @@ def extract_user_preference(
     provider, api_model = _resolve_model(model_preference)
     prompt = _build_memory_prompt(user_message, assistant_reply)
     try:
+        # Memory extraction runs in the BACKGROUND after every turn, so it was the
+        # easiest spend to miss entirely: no user waits on it and nothing logged it.
         if provider == "openai":
-            response = client.chat.completions.create(
-                model=api_model,
-                messages=[{"role": "user", "content": prompt}],
-                response_format={
-                    "type": "json_schema",
-                    "json_schema": {
-                        "name": "memory_extraction",
-                        "strict": True,
-                        "schema": MEMORY_EXTRACTION_JSON_SCHEMA,
+            with llm_ledger.attempt(provider, api_model, "heartbeat.memory_extraction") as record:
+                response = client.chat.completions.create(
+                    model=api_model,
+                    messages=[{"role": "user", "content": prompt}],
+                    response_format={
+                        "type": "json_schema",
+                        "json_schema": {
+                            "name": "memory_extraction",
+                            "strict": True,
+                            "schema": MEMORY_EXTRACTION_JSON_SCHEMA,
+                        },
                     },
-                },
-            )
+                )
+                record.ok(
+                    getattr(response, "usage", None),
+                    model_served=getattr(response, "model", None),
+                    request_id=getattr(response, "id", None),
+                )
             return MemoryExtraction.model_validate(
                 json.loads(response.choices[0].message.content)
             )
@@ -2520,25 +2564,37 @@ def extract_user_preference(
                 "description": "Record at most one durable user preference.",
                 "input_schema": MEMORY_EXTRACTION_JSON_SCHEMA,
             }
-            response = client.messages.create(
-                model=api_model,
-                max_tokens=256,
-                messages=[{"role": "user", "content": prompt}],
-                tools=[tool],
-                tool_choice={"type": "tool", "name": "remember"},
-            )
+            with llm_ledger.attempt(provider, api_model, "heartbeat.memory_extraction") as record:
+                response = client.messages.create(
+                    model=api_model,
+                    max_tokens=256,
+                    messages=[{"role": "user", "content": prompt}],
+                    tools=[tool],
+                    tool_choice={"type": "tool", "name": "remember"},
+                )
+                record.ok(
+                    getattr(response, "usage", None),
+                    model_served=getattr(response, "model", None),
+                    request_id=getattr(response, "id", None),
+                )
             block = next(b for b in response.content if getattr(b, "type", None) == "tool_use")
             return MemoryExtraction.model_validate(block.input)
         # Gemini: native structured output via the MemoryExtraction schema.
-        response = client.models.generate_content(
-            model=api_model,
-            contents=prompt,
-            config=types.GenerateContentConfig(
-                response_mime_type="application/json",
-                response_schema=MemoryExtraction,
-                http_options=types.HttpOptions(timeout=REQUEST_TIMEOUT_MS),
-            ),
-        )
+        with llm_ledger.attempt(provider, api_model, "heartbeat.memory_extraction") as record:
+            response = client.models.generate_content(
+                model=api_model,
+                contents=prompt,
+                config=types.GenerateContentConfig(
+                    response_mime_type="application/json",
+                    response_schema=MemoryExtraction,
+                    http_options=types.HttpOptions(timeout=REQUEST_TIMEOUT_MS),
+                ),
+            )
+            record.ok(
+                getattr(response, "usage_metadata", None),
+                model_served=getattr(response, "model_version", None),
+                request_id=getattr(response, "response_id", None),
+            )
         parsed = getattr(response, "parsed", None)
         if isinstance(parsed, MemoryExtraction):
             return parsed

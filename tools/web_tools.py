@@ -58,17 +58,30 @@ def search_web(user_id: str, args: dict) -> str:
         from google import genai
         from google.genai import types
 
+        from services import llm_ledger
+
         client = genai.Client(api_key=key)
-        response = client.models.generate_content(
-            model=os.environ.get(SEARCH_MODEL_ENV) or DEFAULT_SEARCH_MODEL,
-            contents=query,
-            config=types.GenerateContentConfig(
-                # Grounding is a config-level tool, not a function declaration — it
-                # cannot be mixed with our own tool schemas, which is why search is
-                # its own isolated call rather than part of the routing request.
-                tools=[types.Tool(google_search=types.GoogleSearch())],
-            ),
-        )
+        model = os.environ.get(SEARCH_MODEL_ENV) or DEFAULT_SEARCH_MODEL
+        # Grounded search is billed TWICE: the tokens, and the grounded prompt itself
+        # (free below a daily allowance, then per 1,000). The ledger records both, which
+        # nothing did before — this call was entirely invisible (doc 07 3a).
+        with llm_ledger.attempt("gemini", model, "heartbeat.web_search") as record:
+            response = client.models.generate_content(
+                model=model,
+                contents=query,
+                config=types.GenerateContentConfig(
+                    # Grounding is a config-level tool, not a function declaration — it
+                    # cannot be mixed with our own tool schemas, which is why search is
+                    # its own isolated call rather than part of the routing request.
+                    tools=[types.Tool(google_search=types.GoogleSearch())],
+                ),
+            )
+            record.ok(
+                getattr(response, "usage_metadata", None),
+                model_served=getattr(response, "model_version", None),
+                request_id=getattr(response, "response_id", None),
+                grounded_prompts=1,
+            )
     except Exception as exc:
         logger.warning("web search failed: %s", exc)
         return f"error: web search failed ({type(exc).__name__})"
