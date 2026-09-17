@@ -386,3 +386,21 @@ def test_citations_on_statements_about_the_knowledge_base_are_not_sources():
     assert [s["n"] for s in kc.cited_sources("The report does not mention X, but notes Y [1].", ctx)] == [1]
     # a mix: one claim sentence is enough to keep them
     assert [s["n"] for s in kc.cited_sources("Issuance rose [1]. It does not cover Q4 [2].", ctx)] == [1, 2]
+
+
+def test_a_search_over_several_documents_gives_each_its_share(monkeypatch, kbmock):
+    seen = []
+
+    async def _search(owner, query, *, top_k=8, document_titles=None, include_parent_context=True):
+        seen.append((tuple(document_titles or []), top_k))
+        doc = (document_titles or ["?"])[0]
+        return {"chunks": [{"id": f"{doc}-{i}", "document_id": doc, "title": doc, "content": f"{doc} passage {i}", "score": 3.0}
+                           for i in range(top_k)]}
+
+    monkeypatch.setattr(kb, "search", _search)
+    ctx = kc.TurnContext(summaries={"Aug 28": "multifamily CMBS bottoming out"})
+    out = asyncio.run(kc.run_tool(ctx, USER, "search_knowledge", {"query": "CMBS", "documents": ["Aug 28", "Sep 11"]}))
+    assert sorted(seen) == [(("Aug 28",), 4), (("Sep 11",), 4)]
+    # interleaved: neither document crowds out the other
+    assert [p.document_id for p in ctx.passages][:4] == ["Aug 28", "Sep 11", "Aug 28", "Sep 11"]
+    assert "SUMMARY of Aug 28 (not citable" in out and "multifamily CMBS bottoming out" in out

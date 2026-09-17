@@ -185,9 +185,11 @@ def system_prompt(docs: list[dict] | None, tzname: str | None, req: KnowledgeCha
         "issues whose titles differ only by date; the date identifies the issue. \"That "
         "report\" and \"it\" refer to the documents cited earlier (listed above, when there "
         "are any). If a reference is genuinely ambiguous, ask which one they mean.\n"
-        "5. Comparing documents: make one call PER document (all in the same step), each "
-        "scoped to that document, so one document's passages cannot crowd out the other's. "
-        "Cover each document the question names.\n"
+        "5. Comparing documents: call read_document with `focus` set to the topic, once PER "
+        "document and all in the same step, so one document's passages cannot crowd out the "
+        "other's — read_document also returns each document's summary, which states its main "
+        "points on the topic. Cover each document the question names, and weigh what each "
+        "says about the topic itself rather than whichever tables happened to match.\n"
         "6. Before saying a document does not cover something, try once more — "
         "read_document with a `focus`, or search_knowledge with other wording scoped to that "
         "document. When several passages or documents bear on the question, use them all.\n"
@@ -287,6 +289,9 @@ class TurnContext:
     passages: list[Passage] = field(default_factory=list)
     by_key: dict[str, Passage] = field(default_factory=dict)
     chars: int = 0
+    # The library as listed at the start of the turn (title -> summary), so a scoped
+    # search can show the model what each named document says overall.
+    summaries: dict[str, str] = field(default_factory=dict)
 
     def add(self, key: str, document_id: str | None, title: str, chunk_index: int | None, text: str,
             excerpt: str | None = None, weak: bool = False) -> Passage | None:
@@ -325,7 +330,22 @@ async def _tool_search(ctx: TurnContext, user_id: str, args: dict) -> str:
         return "error: query is required"
     documents = [str(d) for d in (args.get("documents") or []) if str(d).strip()]
     try:
-        payload = await kbstore.search(user_id, query, top_k=SEARCH_TOP_K, document_titles=documents or None)
+        if len(documents) > 1:
+            # One search PER named document, interleaved. A single search over several
+            # documents let one crowd out the rest: asked to compare the Aug 28 and Sep 11
+            # issues on CMBS, 7 of 8 passages came from Sep 11 — and the model kept issuing
+            # the combined search even when told not to (2026-09-17), so the tool does it.
+            per = max(3, SEARCH_TOP_K // len(documents))
+            results = await asyncio.gather(*(
+                kbstore.search(user_id, query, top_k=per, document_titles=[d]) for d in documents
+            ))
+            lists = [r.get("chunks") or [] for r in results]
+            merged: list[dict] = []
+            for i in range(max(len(x) for x in lists)):
+                merged += [x[i] for x in lists if i < len(x)]
+            payload = {"chunks": merged}
+        else:
+            payload = await kbstore.search(user_id, query, top_k=SEARCH_TOP_K, document_titles=documents or None)
     except kbstore.KbNotFound as exc:
         return _not_found_text(exc.payload, ", ".join(f'"{d}"' for d in documents) or "that reference")
     def weak(c: dict) -> bool:
@@ -345,6 +365,16 @@ async def _tool_search(ctx: TurnContext, user_id: str, args: dict) -> str:
     if not chunks:
         return "No passages in the knowledge base are relevant to this query."
     lines: list[str] = []
+    if documents:
+        # What each named document says overall, so a thin passage set (a ratings table
+        # for "CMBS") does not stand in for the document's actual view on the topic.
+        for title in dict.fromkeys(c.get("title") for c in chunks if c.get("title")):
+            summary = ctx.summaries.get(title)
+            if summary:
+                lines.append(
+                    f"SUMMARY of {title} (not citable — search it with more specific terms "
+                    f"to find the passages behind it): {_clip(summary, 400)}"
+                )
     full = False
     for c in chunks:
         body = c.get("parent_content") or c.get("content") or ""
@@ -548,7 +578,9 @@ async def run(req: KnowledgeChatRequest, user_id: str) -> AsyncIterator[dict]:
 
     system = system_prompt(docs, req.timezone, req)
     contents = history_contents(req)
-    ctx = TurnContext()
+    ctx = TurnContext(summaries={
+        (d.get("title") or "").strip(): d.get("summary") or "" for d in (docs or []) if d.get("title")
+    })
     group = llm_ledger.new_group()
     answer_parts: list[str] = []
     tools_called = False
