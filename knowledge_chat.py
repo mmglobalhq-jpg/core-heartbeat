@@ -73,11 +73,15 @@ READ_PASSAGE_CHARS = _env_int("KB_CHAT_READ_PASSAGE_CHARS", 2000)
 # Total characters of retrieved text one turn may put in front of the model.
 CONTEXT_CHARS = _env_int("KB_CHAT_CONTEXT_CHARS", 40_000)
 MIN_SCORE = _env_float("KB_CHAT_MIN_SCORE", 0.0)
+# Passages kept from a search scoped to named documents when none clears MIN_SCORE.
+SCOPED_WEAK_MAX = 6
 THINKING_BUDGET = _env_int("KB_CHAT_THINKING_BUDGET", 0)
 HISTORY_TURNS = _env_int("KB_CHAT_HISTORY_TURNS", 20)
 # A tool-less answer longer than this, on a turn with conversation history, is treated as
-# answered-from-memory and sent back to search first (see _ungrounded).
-MEMORY_ANSWER_CHARS = 400
+# answered-from-memory and sent back to search first (see _ungrounded). Short enough to
+# catch a one-sentence "it doesn't mention that" (400 let exactly that through in the
+# eval, 2026-09-17), long enough to let "You're welcome" and "Glad that helped" pass.
+MEMORY_ANSWER_CHARS = 80
 LIBRARY_TITLES = 200
 EXCERPT_CHARS = 400
 
@@ -124,12 +128,38 @@ def _library_block(docs: list[dict] | None) -> str:
     return "\n".join(lines) + "\n"
 
 
-def system_prompt(docs: list[dict] | None, tzname: str | None) -> str:
+def _discussed_block(req: KnowledgeChatRequest | None) -> str:
+    """Documents earlier answers in this conversation cited, most recent last.
+
+    Kept in the system prompt, NOT appended to the assistant turns: annotated turns
+    taught the model the format, and it began ending its own answers with
+    "(Documents cited in this answer: …)" (seen in the browser conversations,
+    2026-09-17)."""
+    if req is None:
+        return ""
+    titles: list[str] = []
+    for t in req.history[-HISTORY_TURNS:]:
+        for src in t.sources if t.role == "assistant" else []:
+            if src.title in titles:
+                titles.remove(src.title)
+            titles.append(src.title)
+    if not titles:
+        return ""
+    return (
+        "Documents earlier answers in this conversation cited (most recent last) — "
+        "\"that report\", \"it\", \"the other one\" refer to these:\n"
+        + "\n".join(f"- {t}" for t in titles[-10:])
+        + "\n\n"
+    )
+
+
+def system_prompt(docs: list[dict] | None, tzname: str | None, req: KnowledgeChatRequest | None = None) -> str:
     return (
         "You are Knowledge chat: you answer questions using ONLY the user's own knowledge "
         "base — the research reports and documents they saved. You have no other source.\n\n"
         f"{_now_line(tzname)}\n"
         f"{_library_block(docs)}\n"
+        f"{_discussed_block(req)}"
         "How to answer:\n"
         "1. Use the tools to read the knowledge base before answering any substantive "
         "question. search_knowledge finds passages for a question; read_document reads one "
@@ -143,13 +173,25 @@ def system_prompt(docs: list[dict] | None, tzname: str | None) -> str:
         "means them).\n"
         "3. Never use general knowledge, and never fill a gap with something plausible. If "
         "the passages do not answer the question, say plainly that the knowledge base does "
-        "not cover it — and, when useful, which documents come closest.\n"
-        "4. Documents: a recurring publication has many issues whose titles differ only by "
-        "date; the date is what identifies the issue. \"The latest\" means the most recent "
-        "date in the list above. When the user says \"that report\" or \"the other one\", "
-        "resolve it from the documents cited earlier in the conversation. If a reference is "
-        "genuinely ambiguous, ask which one they mean.\n"
-        "5. Greetings, thanks and questions about what you can do need no tools — reply "
+        "not cover it — and, when useful, which documents come closest. A statement that "
+        "something is NOT covered carries no citation: cite only passages that support what "
+        "you say.\n"
+        "4. Choosing documents: when the user names a document or a kind of publication "
+        "(\"the Agency MBS weekly\", \"the data center ABS note\"), find the title in the "
+        "list above that matches it and pass THAT title to the tools — a search across the "
+        "whole knowledge base returns whatever is nearest, which is often a different "
+        "publication. \"The latest\" or \"most recent\" means the newest matching title (by "
+        "the date in the title, else the date added). A recurring publication has many "
+        "issues whose titles differ only by date; the date identifies the issue. \"That "
+        "report\" and \"it\" refer to the documents cited earlier (listed above, when there "
+        "are any). If a reference is genuinely ambiguous, ask which one they mean.\n"
+        "5. Comparing documents: make one call PER document (all in the same step), each "
+        "scoped to that document, so one document's passages cannot crowd out the other's. "
+        "Cover each document the question names.\n"
+        "6. Before saying a document does not cover something, try once more — "
+        "read_document with a `focus`, or search_knowledge with other wording scoped to that "
+        "document. When several passages or documents bear on the question, use them all.\n"
+        "7. Greetings, thanks and questions about what you can do need no tools — reply "
         "briefly.\n\n"
         "Format: Markdown. Lead with the answer. Bullets for several distinct points, prose "
         "otherwise. Keep citations right after the sentence they support. Do not add a "
@@ -285,10 +327,20 @@ async def _tool_search(ctx: TurnContext, user_id: str, args: dict) -> str:
         payload = await kbstore.search(user_id, query, top_k=SEARCH_TOP_K, document_titles=documents or None)
     except kbstore.KbNotFound as exc:
         return _not_found_text(exc.payload, ", ".join(f'"{d}"' for d in documents) or "that reference")
-    chunks = [
-        c for c in payload.get("chunks") or []
-        if not isinstance(c.get("score"), (int, float)) or float(c["score"]) >= MIN_SCORE
-    ]
+    def weak(c: dict) -> bool:
+        return isinstance(c.get("score"), (int, float)) and float(c["score"]) < MIN_SCORE
+
+    all_chunks = payload.get("chunks") or []
+    if documents:
+        # Scoped to documents the user named: no relevance floor, same policy as
+        # read_document. The floor exists so a corpus-wide search cannot cite unrelated
+        # documents; inside a named document its best passages ARE the material, even
+        # when the cross-encoder scores the wording low. Measured 2026-09-17: "regulatory
+        # changes" scored every passage of the CLO report below 0, including the Basel
+        # Endgame / NAIC one, and the answer became "it doesn't mention any".
+        chunks = all_chunks[:SCOPED_WEAK_MAX] if all(weak(c) for c in all_chunks) else all_chunks
+    else:
+        chunks = [c for c in all_chunks if not weak(c)]
     if not chunks:
         return "No passages in the knowledge base are relevant to this query."
     lines: list[str] = []
@@ -304,7 +356,8 @@ async def _tool_search(ctx: TurnContext, user_id: str, args: dict) -> str:
             full = True
             break
         date = str(c.get("document_created_at") or "")[:10]
-        lines.append(f"[{added.n}] {added.title}" + (f" (added {date})" if date else "") + f"\n{added.text}")
+        tag = " — weak match, check it actually answers the question" if weak(c) else ""
+        lines.append(f"[{added.n}] {added.title}" + (f" (added {date})" if date else "") + f"{tag}\n{added.text}")
     if full:
         lines.append("(Context budget for this turn is full — answer from the passages you have.)")
     return "\n\n".join(lines) if lines else "Context budget for this turn is full — answer from the passages you have."
@@ -380,16 +433,13 @@ async def run_tool(ctx: TurnContext, user_id: str, name: str, args: dict) -> str
 
 
 def history_contents(req: KnowledgeChatRequest) -> list[types.Content]:
-    """Prior turns + the new question as Gemini contents: starts with a user turn, roles
-    alternate (consecutive same-role turns are merged), and assistant turns carry the
-    titles of the documents they cited."""
+    """Prior turns + the new question as Gemini contents: starts with a user turn and
+    roles alternate (consecutive same-role turns are merged). The documents earlier
+    answers cited go in the system prompt (_discussed_block), not in these turns."""
     turns: list[tuple[str, str]] = []
     for t in req.history[-HISTORY_TURNS:]:
         role = "user" if t.role == "user" else "model"
         text = t.content.strip()
-        if role == "model" and t.sources:
-            titles = list(dict.fromkeys(s.title for s in t.sources))
-            text += "\n\n(Documents cited in this answer: " + "; ".join(titles) + ")"
         if not text:
             continue
         if turns and turns[-1][0] == role:
@@ -475,7 +525,7 @@ async def run(req: KnowledgeChatRequest, user_id: str) -> AsyncIterator[dict]:
         logger.warning("knowledge chat: document list unavailable: %s", type(exc).__name__)
         docs = None
 
-    system = system_prompt(docs, req.timezone)
+    system = system_prompt(docs, req.timezone, req)
     contents = history_contents(req)
     ctx = TurnContext()
     group = llm_ledger.new_group()

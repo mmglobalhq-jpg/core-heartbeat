@@ -39,6 +39,15 @@ ANSWERABLE = [
     ("What did the August 28 securitized products report say about multifamily CMBS?", ["August 28"]),
     ("Are borrowers whose FICO 10T score declines more likely to go delinquent?", ["Trended Credit Scores"]),
     ("Which securities did banks add most in 2Q26?", ["Bank Flows"]),
+    # added 2026-09-17 after the browser conversations: a publication named by type must
+    # be resolved to its library title, not to whatever a corpus-wide search finds nearest
+    ("Summarize the most recent Agency MBS weekly", ["Agency MBS Weekly: The Basis Is Mid", "Agency MBS Research: The Basis is Mid"]),
+]
+
+# (question, substrings that must EACH appear among the cited titles) — comparisons must
+# draw on every document named, not let one crowd out the other
+COMPARISONS = [
+    ("Compare what the August 28 and September 11 securitized products reports said about CMBS", ["August 28", "September 11"]),
 ]
 
 OUT_OF_SCOPE = [
@@ -54,6 +63,9 @@ FOLLOW_UPS = [
     ("What did the September 11 securitized products research say about CLOs?", "And what did it say about subprime auto in that same report?", "September 11"),
     ("What is the recommendation in Buy CLO AAAs vs. CMO Floaters?", "What regulatory changes does it mention?", "CLO AAAs"),
 ]
+
+
+LEAKS = {"n": 0}
 
 
 async def turn(text: str, history: list[dict] | None = None) -> dict:
@@ -72,6 +84,8 @@ async def turn(text: str, history: list[dict] | None = None) -> dict:
             tools.append(ev["tool_call"])
         elif "status" in ev:
             status = ev["status"]
+    if "Documents cited in this answer" in answer:
+        LEAKS["n"] += 1
     return {"answer": answer, "sources": sources, "tools": tools, "status": status,
             "ttft": ttft, "total": time.monotonic() - t0}
 
@@ -95,6 +109,14 @@ async def main() -> int:
         print(("PASS" if ok else "FAIL"), f"{r['ttft'] or 0:5.1f}s", q, "->", titles(r))
         if not ok:
             print("     ", r["answer"][:400].replace("\n", " "))
+
+    for q, needed in COMPARISONS:
+        r = await turn(q)
+        ttfts.append(r["ttft"] or r["total"])
+        ok = all(any(n in t for t in titles(r)) for n in needed)
+        ok_all &= ok
+        results.setdefault("comparisons", []).append({"q": q, "ok": ok, "cited": titles(r)})
+        print(("PASS" if ok else "FAIL"), f"{r['ttft'] or 0:5.1f}s", "[compare]", q, "->", titles(r))
 
     for q in OUT_OF_SCOPE:
         r = await turn(q)
@@ -120,11 +142,13 @@ async def main() -> int:
             print("      first:", titles(a), "| follow answer:", b["answer"][:300].replace("\n", " "))
 
     med = statistics.median(ttfts)
-    ok_all &= med < 8
+    ok_all &= med < 8 and LEAKS["n"] == 0
     summary = {
         "answerable": f"{sum(x['ok'] for x in results['answerable'])}/{len(ANSWERABLE)}",
         "out_of_scope_declined": f"{sum(x['ok'] for x in results['out_of_scope'])}/{len(OUT_OF_SCOPE)}",
         "follow_ups_same_doc": f"{sum(x['ok'] for x in results['follow_ups'])}/{len(FOLLOW_UPS)}",
+        "comparisons_cover_each_doc": f"{sum(x['ok'] for x in results.get('comparisons', []))}/{len(COMPARISONS)}",
+        "answers_leaking_history_notes": LEAKS["n"],
         "median_ttft_s": round(med, 2),
         "max_ttft_s": round(max(ttfts), 2),
         "pass": ok_all,

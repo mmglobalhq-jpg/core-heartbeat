@@ -197,8 +197,13 @@ def test_follow_up_carries_the_documents_earlier_answers_cited(monkeypatch, kbmo
     )
     contents = client.aio.models.requests[0]["contents"]
     assert [c.role for c in contents] == ["user", "model", "user"]
-    assert "(Documents cited in this answer: Securitized Products Research - August 28, 2026)" in contents[1].parts[0].text
     assert contents[2].parts[0].text == "What else did that report say?"
+    # the cited documents are in the system prompt, NOT in the model's own turn — an
+    # annotated turn taught the model to end its answers with the annotation
+    assert contents[1].parts[0].text == "It covered MBS [1]."
+    system = client.aio.models.requests[0]["config"].system_instruction
+    assert "Documents earlier answers in this conversation cited" in system
+    assert "- Securitized Products Research - August 28, 2026" in system
 
 
 def test_rounds_are_bounded_and_the_last_one_cannot_call_tools(monkeypatch, kbmock):
@@ -337,3 +342,31 @@ def test_short_tool_less_reply_is_kept(monkeypatch, kbmock):
                               history=[{"role": "user", "content": "q"}, {"role": "assistant", "content": "a [1]."}])
     assert "".join(e["token"] for e in events if "token" in e) == "You're welcome."
     assert len(client.aio.models.requests) == 1
+
+
+def test_one_sentence_follow_up_from_memory_is_also_sent_to_retrieve(monkeypatch, kbmock):
+    """Eval, 2026-09-17: 'What regulatory changes does it mention?' was answered in one
+    uncited sentence ('it does not mention any') with no tool call — and was wrong."""
+    events, client = run_turn(
+        monkeypatch,
+        [
+            [text_chunk('I apologize, but the document "Buy CLO AAAs vs. CMO Floaters, No Cap" does not mention any specific regulatory changes.')],
+            [call_chunk(("search_knowledge", {"query": "regulatory changes"}))],
+            [text_chunk("It cites Basel Endgame [1].")],
+        ],
+        text="What regulatory changes does it mention?",
+        history=[{"role": "user", "content": "q"}, {"role": "assistant", "content": "a [1]."}],
+    )
+    assert "".join(e["token"] for e in events if "token" in e) == "It cites Basel Endgame [1]."
+
+
+def test_scoped_search_keeps_its_best_passages_even_below_the_floor(monkeypatch, kbmock):
+    async def _low(owner, query, *, top_k=8, document_titles=None, include_parent_context=True):
+        return {"chunks": [{"id": f"c{i}", "document_id": "d", "title": "CLO note", "content": f"passage {i}", "score": -11.0 + i}
+                           for i in range(8)]}
+    monkeypatch.setattr(kb, "search", _low)
+    ctx = kc.TurnContext()
+    scoped = asyncio.run(kc.run_tool(ctx, USER, "search_knowledge", {"query": "regulatory changes", "documents": ["CLO note"]}))
+    assert scoped.count("weak match") == kc.SCOPED_WEAK_MAX
+    unscoped = asyncio.run(kc.run_tool(kc.TurnContext(), USER, "search_knowledge", {"query": "regulatory changes"}))
+    assert unscoped == "No passages in the knowledge base are relevant to this query."
