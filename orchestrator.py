@@ -485,7 +485,9 @@ _FAMILY_NOTES: tuple[tuple[str, str, str, str], ...] = (
      "offset, no Z); the calendar applies the user's timezone and DST. Resolve dates "
      "against the current date/time below, and ask if one is genuinely ambiguous."),
     ("reit", "REIT research", "REIT research reports (read-only, global)",
-     "Use these for anything about a REIT's research reports. \"ARR\", \"ARMOUR\" and \"ARMOUR Residential REIT\" are one issuer "
+     "Use these for the ARR and ORC research reports this platform generates — and "
+     "ONLY those. Research the user saved from other publishers (J.P. Morgan, Morgan "
+     "Stanley, a 'securitized products' weekly) is not here; that is Knowledge chat. \"ARR\", \"ARMOUR\" and \"ARMOUR Residential REIT\" are one issuer "
      "(ARR); \"ORC\", \"Orchid\", \"Orchid Island\" and \"Orchid Island Capital\" are "
      "one issuer (ORC). Report ids may be namespaced (arr:<uuid>, orc:<uuid>). Never "
      "claim a report exists unless a tool returned it."),
@@ -640,6 +642,10 @@ def _build_prompt(state: GraphState) -> str:
         "- Route to tool_execution to run a tool. You then MUST set tool_name and "
         "tool_args (only the fields that tool needs). Three tool families:\n"
         f"{_tool_catalogue_block()}"
+        "- The user's saved documents (their knowledge base — third-party research "
+        "reports and files they added) are NOT available here; they are answered in "
+        "Knowledge chat. For a request about one, route to local_llm without a tool — "
+        "never to the REIT tools or the vault as a substitute.\n"
         "- A tool result is raw DATA, not an answer. After a tool result appears in "
         "the history you MUST either issue another tool call or route to local_llm "
         "to compose the answer from it — NEVER choose finish directly after a "
@@ -784,6 +790,11 @@ def _build_native_prompt(state: GraphState) -> str:
         "it.\n"
         "- If no tool applies — general knowledge, chit-chat, or a question about an "
         "attachment — call nothing.\n"
+        "- The user's SAVED DOCUMENTS — research reports or files they added to their "
+        "knowledge base (J.P. Morgan, Morgan Stanley and similar publications) — are "
+        "NOT available in this chat; they are answered in Knowledge chat. For a request "
+        "about one of them, call NOTHING. Do not substitute the REIT tools (those hold "
+        "only the ARR/ORC reports this platform generates) or the notes vault.\n"
         "- If the user asks you to DO something and no tool can do it, call NOTHING. "
         "Do not substitute a tool that merely looks related — searching the "
         "web for a request to change a setting answers nothing and wastes the turn. The next step will say plainly that it cannot be done "
@@ -1119,9 +1130,12 @@ _EXPLICIT_NON_CAPABILITIES = (
     "    address, or whether it is enabled, and you cannot trigger a briefing run.\n"
     "    Topics you CAN add and remove. If asked for the others, say so plainly and\n"
     "    point the user at their briefing settings.\n"
-    "  - You CANNOT read the user's saved documents (their knowledge base). Those are\n"
-    "    answered in Knowledge chat: tell the user to switch to Knowledge at the top\n"
-    "    of the sidebar. Never answer as though you had read a document they saved.\n"
+    "  - You CANNOT read the user's saved documents (their knowledge base — research\n"
+    "    reports and files they added). Those are answered in Knowledge chat. When a\n"
+    "    request is about one — including a notes search that found nothing for\n"
+    "    \"my saved research\" — say so and tell the user to switch to Knowledge at the\n"
+    "    top of the sidebar. Never answer as though you had read a document they saved,\n"
+    "    and never answer from an unrelated tool result instead.\n"
 )
 
 

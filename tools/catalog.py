@@ -217,6 +217,10 @@ def list_reit_reports(
 ) -> str:
     """List the research reports that exist for a REIT (metadata only, newest first).
 
+    These are the ARR and ORC reports this platform generates — nothing else. Research
+    the user saved from other publishers (J.P. Morgan, Morgan Stanley, a securitized
+    products weekly) is NOT here; it is answered in Knowledge chat.
+
     Use for "what reports are available" or when the period asked about is
     ambiguous. Pass the issuer name or symbol as reit_symbol (e.g. "ARR", "ARMOUR",
     "ORC", "Orchid"). Each line begins with the report's [id].

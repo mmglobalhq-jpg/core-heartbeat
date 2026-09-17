@@ -485,3 +485,22 @@ def test_every_listed_capability_maps_to_a_real_tool():
     # The knowledge base moved to Knowledge chat (2026-09-17): no KB tool here.
     assert not {"query_knowledge_base", "summarize_document"} & CATALOG_TOOL_NAMES
     assert {"read_user_note", "write_user_note"} <= CATALOG_TOOL_NAMES
+
+
+def test_saved_documents_are_pointed_at_knowledge_chat_not_substituted():
+    """After the KB moved to Knowledge chat (2026-09-17) the replay showed "summarize
+    the August 28 securitized products report" wander into the REIT tools, hit the
+    step bound and answer with an ARR portfolio summary. Every prompt that decides or
+    composes must say where saved documents live and forbid the substitute."""
+    import orchestrator
+    from models import IntentPayload
+
+    state = {"intent": IntentPayload(intent="chat", raw_input="summarize my saved report",
+                                     confidence=0.9, source="test")}
+    native = orchestrator._build_native_prompt(state)
+    assert "NOT available in this chat" in native and "Knowledge chat" in native
+    structured = orchestrator._build_prompt({**state, "messages": []})
+    assert "Knowledge chat" in structured
+    block = orchestrator.capabilities_block()
+    assert "switch to Knowledge" in block and "never answer from an unrelated tool result" in block
+    assert "ONLY those" in orchestrator._tool_catalogue_block()
