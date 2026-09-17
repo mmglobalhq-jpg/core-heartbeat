@@ -458,13 +458,17 @@ def history_contents(req: KnowledgeChatRequest) -> list[types.Content]:
 
 _CITE = re.compile(r"\[(\d+(?:\s*,\s*\d+)*)\]")
 
-# An answer that OPENS by declining. Used only to decide whether weak-match citations
-# are shown as sources (see cited_sources) — never to change the answer itself.
-_DECLINE = re.compile(
-    r"^[^.!?]{0,160}\b(cannot answer|can't answer|unable to answer|does not (contain|cover|mention|include)"
-    r"|doesn't (contain|cover|mention|include)|do not (contain|cover)|not covered|no (relevant )?information)\b",
+# Sentences that are about the knowledge base itself, or decline — never a claim a
+# passage could support. Used only to decide whether citations are shown as sources
+# (see cited_sources); the answer text is never changed.
+_META = re.compile(
+    r"\b(knowledge base|my documents|your documents|cannot answer|can't answer|unable to (answer|find)"
+    r"|does not (contain|cover|mention|include|discuss)|doesn't (contain|cover|mention|include|discuss)"
+    r"|do not (contain|cover)|not covered|no (relevant )?information)\b",
     re.I,
 )
+_CONTRAST = re.compile(r"\b(but|however|although|though|whereas)\b", re.I)
+_SENTENCES = re.compile(r"(?<=[.!?])\s+")
 
 
 def cited_sources(answer: str, ctx: TurnContext) -> list[dict]:
@@ -473,11 +477,13 @@ def cited_sources(answer: str, ctx: TurnContext) -> list[dict]:
     for m in _CITE.finditer(answer):
         wanted.update(int(x) for x in m.group(1).split(","))
     cited = [p for p in ctx.passages if p.n in wanted]
-    # A decline that cites only weak matches: the model searched a document it chose
-    # itself, found nothing relevant, and still attached a marker. Showing that passage
-    # under "the knowledge base doesn't cover this" reads as evidence for the refusal.
-    # Seen 1 in 6 out-of-scope eval answers after scoped searches lost their floor.
-    if cited and all(p.weak for p in cited) and _DECLINE.search(answer.strip()):
+    # Citations attached only to statements ABOUT the knowledge base ("my knowledge base
+    # contains research reports, not sports results [1]") or to a refusal are not
+    # evidence, and showing that passage reads as support for "not covered". Seen in 1-2
+    # of 9 out-of-scope eval answers: the model searched, found a numbers table that
+    # happened to contain "2024", declined correctly, and cited it anyway.
+    cited_sentences = [x for x in _SENTENCES.split(answer.strip()) if _CITE.search(x)]
+    if cited_sentences and all(_META.search(x) and not _CONTRAST.search(x) for x in cited_sentences):
         return []
     return [
         {
