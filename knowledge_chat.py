@@ -75,6 +75,9 @@ CONTEXT_CHARS = _env_int("KB_CHAT_CONTEXT_CHARS", 40_000)
 MIN_SCORE = _env_float("KB_CHAT_MIN_SCORE", 0.0)
 THINKING_BUDGET = _env_int("KB_CHAT_THINKING_BUDGET", 0)
 HISTORY_TURNS = _env_int("KB_CHAT_HISTORY_TURNS", 20)
+# A tool-less answer longer than this, on a turn with conversation history, is treated as
+# answered-from-memory and sent back to search first (see _ungrounded).
+MEMORY_ANSWER_CHARS = 400
 LIBRARY_TITLES = 200
 EXCERPT_CHARS = 400
 
@@ -416,13 +419,35 @@ def cited_sources(answer: str, ctx: TurnContext) -> list[dict]:
     return out
 
 
-def _config(system: str, tools_enabled: bool) -> types.GenerateContentConfig:
+_GROUND_NUDGE = (
+    "Before answering, search or read the knowledge base in this turn. Earlier answers in "
+    "the conversation are not evidence, and their citation numbers do not refer to anything "
+    "you have retrieved now."
+)
+
+
+def _ungrounded(answer: str, req: KnowledgeChatRequest) -> bool:
+    """Did the model answer a substantive turn without retrieving anything?
+
+    Observed in the live eval (2026-09-17): asked a follow-up, the model restated the
+    previous answer and reused its "[1]" — a citation pointing at no passage retrieved in
+    this turn. A tool-less answer is fine for "thanks" or "that isn't covered"; it is not
+    fine when it cites passages, or when it is a long answer to a follow-up.
+    """
+    if _CITE.search(answer):
+        return True
+    return bool(req.history) and len(answer) > MEMORY_ANSWER_CHARS
+
+
+def _config(system: str, tools_enabled: bool, force_tools: bool = False) -> types.GenerateContentConfig:
     return types.GenerateContentConfig(
         system_instruction=system,
         tools=_tools(),
         automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True),
         tool_config=types.ToolConfig(
-            function_calling_config=types.FunctionCallingConfig(mode="AUTO" if tools_enabled else "NONE")
+            function_calling_config=types.FunctionCallingConfig(
+                mode=("ANY" if force_tools else "AUTO") if tools_enabled else "NONE"
+            )
         ),
         thinking_config=types.ThinkingConfig(thinking_budget=THINKING_BUDGET),
         temperature=0.2,
@@ -448,11 +473,18 @@ async def run(req: KnowledgeChatRequest, user_id: str) -> AsyncIterator[dict]:
     ctx = TurnContext()
     group = llm_ledger.new_group()
     answer_parts: list[str] = []
+    tools_called = False
+    force_tools = False
 
     for round_no in range(1, MAX_ROUNDS + 2):
         tools_enabled = round_no <= MAX_ROUNDS
         parts: list[types.Part] = []
         calls: list[types.FunctionCall] = []
+        # Until a tool has run this turn, hold the text back: a tool-less answer may turn
+        # out to be answered-from-memory (_ungrounded) and must then never reach the user.
+        # Once retrieval has happened, text streams as it arrives.
+        buffering = not tools_called and tools_enabled
+        held: list[str] = []
         streamed_this_round = False
         try:
             with llm_ledger.attempt(
@@ -461,7 +493,7 @@ async def run(req: KnowledgeChatRequest, user_id: str) -> AsyncIterator[dict]:
             ) as record:
                 last_meta = None
                 stream = await client.aio.models.generate_content_stream(
-                    model=MODEL, contents=contents, config=_config(system, tools_enabled)
+                    model=MODEL, contents=contents, config=_config(system, tools_enabled, force_tools)
                 )
                 async for chunk in stream:
                     if getattr(chunk, "usage_metadata", None) is not None:
@@ -472,9 +504,12 @@ async def run(req: KnowledgeChatRequest, user_id: str) -> AsyncIterator[dict]:
                             if part.function_call is not None:
                                 calls.append(part.function_call)
                             elif part.text and not part.thought:
-                                answer_parts.append(part.text)
-                                streamed_this_round = True
-                                yield {"token": part.text}
+                                if buffering:
+                                    held.append(part.text)
+                                else:
+                                    answer_parts.append(part.text)
+                                    streamed_this_round = True
+                                    yield {"token": part.text}
                 record.ok(last_meta)
         except Exception as exc:
             logger.warning("knowledge chat model call failed: %s", type(exc).__name__)
@@ -484,9 +519,23 @@ async def run(req: KnowledgeChatRequest, user_id: str) -> AsyncIterator[dict]:
             yield {"status": "error"}
             return
 
-        if not calls or not tools_enabled:
+        held_text = "".join(held)
+        if not calls:
+            if buffering and not force_tools and _ungrounded(held_text, req):
+                # Answered from memory: discard it and make the next round retrieve.
+                contents.append(types.Content(role="model", parts=[types.Part.from_text(text=held_text)]))
+                contents.append(types.Content(role="user", parts=[types.Part.from_text(text=_GROUND_NUDGE)]))
+                force_tools = True
+                continue
+            if held_text:
+                answer_parts.append(held_text)
+                yield {"token": held_text}
+            break
+        if not tools_enabled:
             break
 
+        force_tools = False
+        tools_called = True
         calls = calls[:MAX_CALLS_PER_ROUND]
         contents.append(types.Content(role="model", parts=parts))
         for call in calls:

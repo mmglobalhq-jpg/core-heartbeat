@@ -305,3 +305,33 @@ def test_kb_client_retries_5xx_and_surfaces_404_body(monkeypatch):
     with pytest.raises(kb.KbNotFound) as exc:
         asyncio.run(kb.read_document(USER, "nope"))
     assert exc.value.payload["alternatives"] == [{"title": "A"}]
+
+
+def test_answer_from_memory_is_discarded_and_retrieval_forced(monkeypatch, kbmock):
+    events, client = run_turn(
+        monkeypatch,
+        [
+            [text_chunk("It mentions Basel Endgame and NAIC [1].")],          # from memory: hidden
+            [call_chunk(("search_knowledge", {"query": "regulatory changes", "documents": ["CLO AAAs"]}))],
+            [text_chunk("Basel Endgame and NAIC changes [1].")],
+        ],
+        text="What regulatory changes does it mention?",
+        history=[
+            {"role": "user", "content": "What is the recommendation?"},
+            {"role": "assistant", "content": "Buy CLO AAAs [1].", "sources": [{"title": "Buy CLO AAAs vs. CMO Floaters, No Cap"}]},
+        ],
+    )
+    tokens = "".join(e["token"] for e in events if "token" in e)
+    assert tokens == "Basel Endgame and NAIC changes [1]."   # the ungrounded draft never streamed
+    reqs = client.aio.models.requests
+    assert reqs[1]["config"].tool_config.function_calling_config.mode == "ANY"
+    assert "not evidence" in reqs[1]["contents"][-1].parts[0].text
+    assert reqs[2]["config"].tool_config.function_calling_config.mode == "AUTO"
+    assert [s["n"] for s in next(e["sources"] for e in events if "sources" in e)] == [1]
+
+
+def test_short_tool_less_reply_is_kept(monkeypatch, kbmock):
+    events, client = run_turn(monkeypatch, [[text_chunk("You're welcome.")]], text="thanks",
+                              history=[{"role": "user", "content": "q"}, {"role": "assistant", "content": "a [1]."}])
+    assert "".join(e["token"] for e in events if "token" in e) == "You're welcome."
+    assert len(client.aio.models.requests) == 1
