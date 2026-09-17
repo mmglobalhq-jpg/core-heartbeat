@@ -202,20 +202,6 @@ def test_tool_calls_supersedes_tool_request(monkeypatch):
     assert "from-list" in out["messages"][0].content
 
 
-def test_kb_sources_survive_a_mixed_batch(monkeypatch):
-    """The citation channel must still be populated when a KB call is one of several."""
-    monkeypatch.setattr(orchestrator, "run_graphrag_tool",
-                        lambda n, u, a: ("ctx", ["Doc A"]))
-    monkeypatch.setattr(orchestrator, "run_calendar_tool", lambda n, u, a: "ok")
-    out = orchestrator.tool_execution(
-        _state(tool_calls=[
-            {"name": "create_calendar_event", "args": {"summary": "x"}},
-            {"name": "query_knowledge_base", "args": {"query": "q"}},
-        ])
-    )
-    assert out["kb_sources"] == ["Doc A"]
-
-
 def test_one_ui_event_per_call_in_order(monkeypatch):
     """The SSE tool indicator must fire per call. Events are dispatched on the graph
     thread precisely because pool threads don't inherit the callback contextvar."""
@@ -469,7 +455,7 @@ def test_write_tools_are_marked_in_the_prompt():
 
 
 def test_native_prompt_tells_the_router_what_to_do_when_nothing_fits():
-    """"can you add baseball cards?" routed to query_knowledge_base because no
+    """"can you add baseball cards?" routed to a knowledge-base search because no
     write tool existed and nothing told the router that calling nothing was the
     better move. A near-miss tool answers a question nobody asked."""
     import orchestrator

@@ -44,25 +44,11 @@ from services.storage_sync import sync_user_vault, upload_user_file
 from tools.user_vault import USER_VAULT_TOOLS, read_note, run_vault_tool, write_note
 from tools.flights import FLIGHT_TOOL_REGISTRY, run_flight_tool
 from tools.web_tools import WEB_TOOL_REGISTRY, run_web_tool
-from tools.graphrag import (
-    GRAPHRAG_TOOL_REGISTRY,
-    KB_RETRIEVE_ONCE_TOOLS,
-    kb_configured,
-    run_graphrag_tool,
-)
 from tools.attachments import ATTACHMENT_TOOL_REGISTRY, run_attachment_tool
 from tools.google_calendar import CALENDAR_TOOL_REGISTRY, run_calendar_tool
 from tools.catalog import ALL_TOOLS, WRITE_TOOLS
-from tools.daily_briefing import (
-    BRIEFING_TOOL_REGISTRY,
-    looks_like_briefing_reference,
-    run_briefing_tool,
-)
-from tools.reit_research import (
-    REIT_TOOL_REGISTRY,
-    looks_like_reit_reference,
-    run_reit_tool,
-)
+from tools.daily_briefing import BRIEFING_TOOL_REGISTRY, run_briefing_tool
+from tools.reit_research import REIT_TOOL_REGISTRY, run_reit_tool
 from models import (
     HistoryTurn,
     IntentPayload,
@@ -256,7 +242,6 @@ TOOL_REGISTRY = {t.name: t for t in USER_VAULT_TOOLS}
 # advertised vocabulary equals this set.
 DISPATCHABLE_TOOLS = frozenset(
     set(TOOL_REGISTRY)
-    | set(GRAPHRAG_TOOL_REGISTRY)
     | set(CALENDAR_TOOL_REGISTRY)
     | set(REIT_TOOL_REGISTRY)
     | set(BRIEFING_TOOL_REGISTRY)
@@ -322,9 +307,6 @@ class GraphState(TypedDict):
     # nor any knowledge that one exists — which is how it ends up inventing what
     # the picture said.
     attachments: list[dict]
-    # Source-document titles from the most recent knowledge_base retrieval, so the
-    # streamed answer can cite them at the end. Last-write-wins (set by tool_execution).
-    kb_sources: list[str]
     usage: Annotated[TokenUsage, add_usage]
     visited: Annotated[list[str], operator.add]
     step: Annotated[int, operator.add]
@@ -496,11 +478,6 @@ _FAMILY_NOTES: tuple[tuple[str, str, str, str], ...] = (
     ("vault", "Notes", "Personal Markdown vault (this user's private notes)",
      "Already scoped to THIS user — never put a user id or an absolute/`..` path "
      "in a filename."),
-    ("kb", "Knowledge base", "Personal knowledge base (saved documents plus shared/global docs — the "
-           "user's \"core knowledge\", which persists across chats)",
-     "Query it AT MOST ONCE per turn. Once any result appears for this turn — "
-     "including \"no relevant information found\" — compose from it rather than "
-     "re-querying with reworded terms."),
     ("calendar", "Google Calendar", "Google Calendar (this user's own calendar)",
      "Use when the user asks about their schedule or wants to add, change or cancel "
      "something. List first when changing or removing, because update and delete "
@@ -508,14 +485,12 @@ _FAMILY_NOTES: tuple[tuple[str, str, str, str], ...] = (
      "offset, no Z); the calendar applies the user's timezone and DST. Resolve dates "
      "against the current date/time below, and ask if one is genuinely ambiguous."),
     ("reit", "REIT research", "REIT research reports (read-only, global)",
-     "Use these and NOT query_knowledge_base for anything about a REIT's research "
-     "reports. \"ARR\", \"ARMOUR\" and \"ARMOUR Residential REIT\" are one issuer "
+     "Use these for anything about a REIT's research reports. \"ARR\", \"ARMOUR\" and \"ARMOUR Residential REIT\" are one issuer "
      "(ARR); \"ORC\", \"Orchid\", \"Orchid Island\" and \"Orchid Island Capital\" are "
      "one issuer (ORC). Report ids may be namespaced (arr:<uuid>, orc:<uuid>). Never "
      "claim a report exists unless a tool returned it."),
     ("briefing", "Daily brief", "The user's DAILY BRIEF (their personal morning news digest)",
-     "Use these — NOT query_knowledge_base or the vault, which do not contain the "
-     "brief — to read TODAY'S brief or SEARCH past ones. "
+     "Use these — NOT the vault, which does not contain the brief — to read TODAY'S brief or SEARCH past ones. "
      "READ-ONLY as of 2026-08-25: what the brief covers, its delivery time, timezone "
      "and email address are all configuration and none is changeable from chat. If the "
      "user asks to change any of them, SAY SO plainly rather than promising to; there is "
@@ -573,14 +548,12 @@ def _family_members(family: str) -> list[str]:
     """Tool names in one family, read from the registries rather than listed here."""
     from tools.daily_briefing import BRIEFING_TOOL_REGISTRY
     from tools.google_calendar import CALENDAR_TOOL_REGISTRY
-    from tools.graphrag import GRAPHRAG_TOOL_REGISTRY
     from tools.reit_research import REIT_TOOL_REGISTRY
     from tools.user_vault import USER_VAULT_TOOLS
     from tools.web_tools import WEB_TOOL_REGISTRY
 
     return {
         "vault": [t.name for t in USER_VAULT_TOOLS],
-        "kb": sorted(GRAPHRAG_TOOL_REGISTRY),
         "calendar": sorted(CALENDAR_TOOL_REGISTRY),
         "reit": sorted(REIT_TOOL_REGISTRY),
         "briefing": sorted(BRIEFING_TOOL_REGISTRY),
@@ -813,8 +786,7 @@ def _build_native_prompt(state: GraphState) -> str:
         "attachment — call nothing.\n"
         "- If the user asks you to DO something and no tool can do it, call NOTHING. "
         "Do not substitute a tool that merely looks related — searching the "
-        "knowledge base for a request to change a setting answers nothing and "
-        "wastes the turn. The next step will say plainly that it cannot be done "
+        "web for a request to change a setting answers nothing and wastes the turn. The next step will say plainly that it cannot be done "
         "and where the user can do it themselves. A near-miss tool is worse than "
         "no tool: it produces a confident answer to a question nobody asked.\n"
         "- Never promise an action you did not call a tool for. If you can act, "
@@ -1147,6 +1119,9 @@ _EXPLICIT_NON_CAPABILITIES = (
     "    address, or whether it is enabled, and you cannot trigger a briefing run.\n"
     "    Topics you CAN add and remove. If asked for the others, say so plainly and\n"
     "    point the user at their briefing settings.\n"
+    "  - You CANNOT read the user's saved documents (their knowledge base). Those are\n"
+    "    answered in Knowledge chat: tell the user to switch to Knowledge at the top\n"
+    "    of the sidebar. Never answer as though you had read a document they saved.\n"
 )
 
 
@@ -1171,7 +1146,7 @@ def capabilities_block() -> str:
         "never tell them to do it manually.\n"
         "READS versus CHANGES — these are handled differently and confusing them is a "
         "defect in both directions:\n"
-        "  * A READ (searching the web, querying the knowledge base, listing the "
+        "  * A READ (searching the web, reading REIT research, listing the "
         "calendar, reading a note or a briefing) needs NO permission. NEVER ask "
         "\"would you like me to search?\" or \"shall I look that up?\". If the answer "
         "depends on information you do not have, the search should already have "
@@ -1556,33 +1531,6 @@ def _degraded(step: int, failure: RoutingFailure, usage: TokenUsage | None = Non
     }
 
 
-# Pure greetings / pleasantries / acknowledgements that never need the knowledge
-# base. Stored in normalized form (lowercased, punctuation stripped).
-_TRIVIAL_TURNS = frozenset({
-    "hi", "hey", "hello", "yo", "hiya", "howdy", "sup", "hey there", "hi there",
-    "hello there", "good morning", "good afternoon", "good evening", "good night",
-    "morning", "evening", "greetings",
-    "thanks", "thank you", "thank you so much", "thanks so much", "ty", "thx",
-    "much appreciated", "appreciate it", "cheers",
-    "bye", "goodbye", "see you", "see ya", "cya", "later", "take care",
-    "ok", "okay", "k", "kk", "cool", "nice", "great", "awesome", "perfect",
-    "got it", "sounds good", "makes sense", "understood", "gotcha",
-    "yes", "no", "yep", "yeah", "yup", "nope", "nah", "sure", "please",
-    "how are you", "hows it going", "how s it going", "whats up", "what s up",
-    "how are things",
-})
-
-
-def _is_trivial_turn(raw: str) -> bool:
-    """True for a pure greeting / pleasantry / acknowledgement — a turn that never
-    needs the knowledge base. Exact-match on the WHOLE normalized input, so it never
-    fires on a real question that merely starts with a greeting (e.g. "hello, how do
-    I roast a chicken?"). Used to skip the forced KB retrieval on trivial turns. Pure.
-    """
-    norm = " ".join(re.sub(r"[^a-z0-9\s]", " ", (raw or "").lower()).split())
-    return norm in _TRIVIAL_TURNS
-
-
 def supervisor(state: GraphState) -> dict:
     """Model-driven routing hub. Falls back to a safe finish on any failure."""
     step = state["step"]
@@ -1645,34 +1593,6 @@ def supervisor(state: GraphState) -> dict:
             "messages": [Message(source="supervisor", content="route -> finish (fast-path: answered)", step=step)],
         }
 
-    # Deterministic fast-path (latency): a corpus-wide KB search is a
-    # retrieve-once-then-compose tool, so once its result is in this run's messages the
-    # next hop is ALWAYS local_llm. Skipping the model routing call here removes a
-    # ~1.2s Gemini round-trip that sits BEFORE generation, cutting time-to-first-token
-    # on every KB-grounded turn. The retrieve-once guard below enforces the same
-    # transition when the model is asked; this just avoids paying for a decision that's
-    # already determined.
-    #
-    # Scoped to KB_RETRIEVE_ONCE_TOOLS, NOT the whole KB registry: listing the
-    # knowledge base's documents is a step TOWARDS a second call (summarize the one the
-    # user then names), so short-circuiting to local_llm after it would strand the turn
-    # with a list of titles instead of the summary that was asked for.
-    _kb_prefixes = tuple(f"[tool:{n}]" for n in KB_RETRIEVE_ONCE_TOOLS)
-    if "local_llm" not in state.get("visited", []) and any(
-        m.source == "tool_execution" and m.content.startswith(_kb_prefixes)
-        for m in state.get("messages", [])
-    ):
-        return {
-            "next": "local_llm",
-            "step": 1,
-            "usage": TokenUsage(),
-            "tool_request": None,
-            "tool_calls": None,
-            "pending_plan": None,
-            "plan_note": None,
-            "messages": [Message(source="supervisor", content="route -> local_llm (fast-path: compose KB)", step=step)],
-        }
-
     # Feature 006: the caller's model_preference selects the provider/model.
     model_pref = getattr(state["intent"], "model_preference", None) or DEFAULT_MODEL_PREFERENCE
     provider, _ = _resolve_model(model_pref)
@@ -1689,7 +1609,7 @@ def supervisor(state: GraphState) -> dict:
     # Native tool calling (NATIVE_TOOL_CALLING=1). The model may emit SEVERAL calls
     # in one response, which is what makes "add my whole schedule" possible inside
     # the step bound. It is normalized into a RoutingDecision so every deterministic
-    # guard below — KB retrieve-once, retrieve-first, the anti-reloop rules — keeps
+    # guard below — the anti-reloop and repeat-call rules — keeps
     # working unchanged; the full list rides alongside on `native_calls`.
     #
     # A failure here falls through to the structured-output path rather than
@@ -1877,72 +1797,6 @@ def _finish_routing(
     """
     nxt = decision.next_node
 
-    # Has the KB already been consulted THIS turn? (a query_knowledge_base result in
-    # this run's messages). Shared by both KB guards below.
-    _kb_prefixes = tuple(f"[tool:{n}]" for n in KB_RETRIEVE_ONCE_TOOLS)
-    kb_consulted = any(
-        m.source == "tool_execution" and m.content.startswith(_kb_prefixes)
-        for m in state.get("messages", [])
-    )
-
-    # Deterministic KB retrieve-once guard (do not rely on the model to stop).
-    # The KB is a consult-once-per-turn tool: once a query_knowledge_base result is
-    # already in THIS run's messages, re-dispatching it adds nothing and can loop
-    # the supervisor to the MAX_STEPS halt (observed on follow-up questions like
-    # "any other options?"). Redirect any repeat KB call to local_llm so it composes
-    # from what was already retrieved (plus general knowledge). Runs before the
-    # local_llm guard below so an already-answered turn still finishes cleanly.
-    if nxt == "tool_execution" and decision.tool_name in KB_RETRIEVE_ONCE_TOOLS and kb_consulted:
-        nxt = "local_llm"
-
-    # Deterministic retrieve-first guard (do not rely on the model to consult the KB).
-    # The user's curated knowledge base MUST be checked before we answer a fresh turn
-    # from general knowledge — Gemini follows the "consult the KB" prose only some of
-    # the time (observed: it consulted a follow-up but skipped the direct question).
-    # So if it routes STRAIGHT to local_llm on the first step of a turn (no worker has
-    # run yet) and the KB hasn't been consulted, redirect that first step to a
-    # query_knowledge_base call built from the user's input. The retrieve-once guard
-    # then blocks a second query, and once the result is in messages this is false so
-    # local_llm composes normally. Gated on the KB being configured so it never fires
-    # in tests / KB-less deploys; tool turns (vault) route to tool_execution not
-    # local_llm, so they are untouched.
-    forced_kb_query: str | None = None
-    raw = (getattr(state["intent"], "raw_input", "") or "").strip()
-    if (
-        nxt == "local_llm"
-        and not state.get("visited")
-        and not kb_consulted
-        and kb_configured()
-        # Skip the embed+search+rerank on pure greetings/pleasantries — they never
-        # need the KB, and forcing it there just adds latency to a trivial reply.
-        and not _is_trivial_turn(raw)
-        # A clear REIT-report question belongs to the dedicated REIT tools, not the
-        # generic KB. Don't preempt it with a forced query_knowledge_base retrieval
-        # (the prompt steers the model to a REIT tool; this is the deterministic
-        # backstop for the case where it routed straight to local_llm).
-        and not looks_like_reit_reference(raw)
-        # Same reasoning for the user's daily briefing: it lives in its own
-        # tables and the KB does not contain it, so a forced retrieval returns
-        # whatever is nearest in vector space and the composer answers from it.
-        # Measured: "change my briefing delivery time to 5am" came back as "I can
-        # change your briefing delivery time if it's an event on your Google
-        # Calendar." The router had correctly called nothing; this backstop
-        # overrode that decision. A decline only means "say we cannot" if nothing
-        # downstream reinterprets it as "go searching".
-        and not looks_like_briefing_reference(raw)
-        # A question ABOUT AN ATTACHMENT is self-contained — the answer comes from the
-        # document/image the user just supplied, not from the curated KB. Forcing a
-        # retrieval here searched the KB for things like "can you see this schedule?",
-        # which returns whatever is nearest in vector space and then gets cited as the
-        # source of an answer that came entirely from the attachment. It also spent an
-        # embed+search+rerank on every attachment turn for nothing.
-        and not state.get("documents")
-        and not state.get("document_images")
-    ):
-        if raw:
-            forced_kb_query = raw
-            nxt = "tool_execution"
-
     # Deterministic anti-reloop guard (do not rely on the model to terminate).
     # Scoped to local_llm: if the model re-dispatches local_llm after it has
     # ALREADY produced a reply this run, override to a clean finish. This kills the
@@ -1976,27 +1830,15 @@ def _finish_routing(
     # tool_request channel. Written fresh (dict or None) on EVERY routing turn so
     # tool_execution never replays a stale request from an earlier turn.
     tool_request: dict | None = None
-    if forced_kb_query is not None:
-        # retrieve-first guard fired: synthesize the KB call the model skipped.
-        tool_request = {"name": "query_knowledge_base", "args": {"query": forced_kb_query}}
-    elif nxt == "tool_execution" and decision.tool_name:
+    if nxt == "tool_execution" and decision.tool_name:
         tool_request = {
             "name": decision.tool_name,
             "args": decision.tool_args.model_dump(exclude_none=True),
         }
 
-    # The multi-call list only survives when the guards left us on tool_execution and
-    # didn't synthesize their own call. A guard that redirected to local_llm, or the
-    # retrieve-first guard that replaced the model's choice with a KB query, must not
-    # be overridden by a stale batch — so drop it in those cases and let the single
-    # `tool_request` stand.
-    calls = native_calls if (native_calls and nxt == "tool_execution" and forced_kb_query is None) else None
-    if calls:
-        # The KB is consult-once-per-turn; strip a repeat from the batch rather than
-        # discarding the whole batch, so "check my notes AND add these games" keeps
-        # its calendar writes.
-        if kb_consulted:
-            calls = [c for c in calls if c["name"] not in KB_RETRIEVE_ONCE_TOOLS] or None
+    # The multi-call list only survives when the guards left us on tool_execution; a
+    # guard that redirected elsewhere must not be overridden by a stale batch.
+    calls = native_calls if (native_calls and nxt == "tool_execution") else None
 
     # Repeat-call guard. The model re-emits a call when the result doesn't answer the
     # question, but "no matching events" IS the answer — it just doesn't look like one.
@@ -2260,44 +2102,39 @@ def _call_signature(name: str, args: dict) -> str:
         return f"{name}:{args!r}"
 
 
-def _dispatch_tool(name: str, args: dict, user_id: str) -> tuple[str, list[str] | None]:
-    """Run one tool. Returns ``(result_text, kb_source_titles_or_None)``.
+def _dispatch_tool(name: str, args: dict, user_id: str) -> str:
+    """Run one tool and return its result text.
 
     ``user_id`` comes from graph state in every branch — never from a model-supplied
-    argument — so no emitted tool call can reach another user's vault, calendar or
-    knowledge base. Each ``run_*_tool`` converts its own failures into an
+    argument — so no emitted tool call can reach another user's vault or calendar. Each ``run_*_tool`` converts its own failures into an
     ``error: ...`` string rather than raising, which is what makes it safe to fan
     these out across a thread pool.
     """
-    if name in GRAPHRAG_TOOL_REGISTRY:
-        # Per-user (own + global docs); user_id is sent as X-User-Id to the service.
-        result, sources = run_graphrag_tool(name, user_id, args)
-        return result, sources
     if name in ATTACHMENT_TOOL_REGISTRY:
         # Per-user: user_id keys the storage path, so a forged doc_id cannot reach
         # another user's upload.
-        return run_attachment_tool(name, user_id, args), None
+        return run_attachment_tool(name, user_id, args)
     if name in CALENDAR_TOOL_REGISTRY:
         # Per-user: user_id selects whose OAuth tokens are loaded.
-        return run_calendar_tool(name, user_id, args), None
+        return run_calendar_tool(name, user_id, args)
     if name in REIT_TOOL_REGISTRY:
         # Read-only and global; user_id threaded only for a uniform signature.
-        return run_reit_tool(name, user_id, args), None
+        return run_reit_tool(name, user_id, args)
     if name in BRIEFING_TOOL_REGISTRY:
         # Per-user, and unlike the REIT tools that is the security boundary:
         # every query filters on this user_id. The service-role key bypasses RLS,
         # so the filter IS the isolation.
-        return run_briefing_tool(name, user_id, args), None
+        return run_briefing_tool(name, user_id, args)
     if name in TOOL_REGISTRY:
-        return run_vault_tool(name, user_id, args), None
+        return run_vault_tool(name, user_id, args)
     if name in WEB_TOOL_REGISTRY:
         # Not per-user: the public web is the same for everyone. user_id is threaded
         # only to keep one dispatch signature.
-        return run_web_tool(name, user_id, args), None
+        return run_web_tool(name, user_id, args)
     if name in FLIGHT_TOOL_REGISTRY:
         # Not per-user either: an airline schedule is the same for everyone. The
         # Amadeus credential is the server's, never the caller's.
-        return run_flight_tool(name, user_id, args), None
+        return run_flight_tool(name, user_id, args)
     return f"error: unknown tool {name!r}", None
 
 
@@ -2372,10 +2209,7 @@ def tool_execution(state: GraphState) -> dict:
     # tool indicator never appears. Emitting after the fact also keeps event order
     # matching call order regardless of which tool finished first.
     messages: list[Message] = []
-    kb_sources: list[str] | None = None  # set by the KB tool, for the answer's citation
-    for call, (result, sources) in zip(calls, results):
-        if sources is not None:
-            kb_sources = sources
+    for call, result in zip(calls, results):
         messages.append(
             Message(
                 source="tool_execution",
@@ -2401,10 +2235,6 @@ def tool_execution(state: GraphState) -> dict:
         "step": 1,
         "executed_calls": [_call_signature(c["name"], c["args"]) for c in calls],
     }
-    # Record the KB source titles (only when a KB tool ran) so astream_run can cite
-    # them at the end of the composed answer. Last-write-wins on the channel.
-    if kb_sources is not None:
-        out["kb_sources"] = kb_sources
     return out
 
 
@@ -2798,7 +2628,6 @@ def _initial_state(payload: IntentPayload, user_id: str) -> GraphState:
         "documents": "",  # populated by _load_documents in the async prelude
         "document_images": [],  # populated by _load_document_images in the async prelude
         "attachments": [],  # populated by _load_attachment_manifest in the async prelude
-        "kb_sources": [],
         "usage": TokenUsage(),
         "visited": [],
         "step": 0,
@@ -3129,7 +2958,6 @@ async def astream_run(
     final_status = "completed"
     streamed_local_tokens = False
     last_local_reply = ""  # captured for the detached memory extraction
-    kb_sources: list[str] = []  # titles from the last KB retrieval, cited after the answer
 
     # Pre-execution: localize the caller's Markdown vault before the supervisor
     # fires, so downstream nodes read from /tmp/vaults/<user_id>/ rather than
@@ -3176,22 +3004,12 @@ async def astream_run(
                         last_local_reply = message.content
                     if not streamed_local_tokens:
                         yield {"token": message.content}
-            # Capture KB source titles from a tool_execution turn (only KB tools set
-            # this) so we can cite them once the answer is composed.
-            if "kb_sources" in output:
-                kb_sources = output.get("kb_sources") or []
             # The supervisor stamps the terminal status on finish/degrade/halt.
             if output.get("status"):
                 final_status = output["status"]
     except (GraphRecursionError, Exception) as exc:  # noqa: B014 - never break the stream
         yield {"status": "error", "detail": f"{type(exc).__name__}: {exc}"[:200]}
         return
-    # Cite the KB source document(s) at the end of a completed, KB-grounded answer —
-    # deterministic (doesn't rely on the small local model to remember to cite).
-    if kb_sources and last_local_reply and final_status in ("completed", "halted_step_bound"):
-        src_line = "\n\nSource: " + ", ".join(kb_sources)
-        yield {"token": src_line}
-        last_local_reply += src_line
     # Detached, non-blocking profile update — the stream closes immediately after
     # the status event while extraction runs in parallel.
     schedule_memory_extraction(user_id, payload, last_local_reply)

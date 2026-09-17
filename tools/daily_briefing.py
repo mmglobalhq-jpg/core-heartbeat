@@ -77,34 +77,6 @@ class _BriefingError(RuntimeError):
     """Internal; converted to an ``error: ...`` string at the boundary."""
 
 
-_BRIEFING_REFERENCE_RE = re.compile(
-    r"\b(?:daily\s+brief(?:ing)?s?|my\s+brief(?:ing)?s?|the\s+brief(?:ing)?)\b",
-    re.I,
-)
-
-
-def looks_like_briefing_reference(text: str) -> bool:
-    """True if the text is clearly about the user's own daily briefing.
-
-    Used by the supervisor to keep briefing turns out of the FORCED generic
-    knowledge-base retrieval, exactly as `looks_like_reit_reference` does for
-    REIT questions. Deliberately narrow: it wants "my daily brief", not the word
-    "brief" in "keep it brief".
-
-    WHY THIS IS NEEDED AND NOT MERELY TIDY. When the router calls no tool on a
-    substantive turn, the supervisor forces `query_knowledge_base` with the raw
-    user text. The briefing lives in its own tables — the KB does not contain it
-    — so that retrieval returns whatever is nearest in vector space and the
-    composer then answers from it. Measured on the deployed build: "change my
-    briefing delivery time to 5am" produced "I can change your briefing delivery
-    time if it's an event on your Google Calendar." The router had correctly
-    declined; the backstop overrode the decision and the composer confabulated
-    from an unrelated result.
-
-    So a decline can only mean "say we cannot do this" if nothing downstream
-    reinterprets it as "go searching".
-    """
-    return bool(_BRIEFING_REFERENCE_RE.search(text or ""))
 
 
 def _uid(user_id: str) -> str:
@@ -171,11 +143,6 @@ def _brief_api(path: str, params: dict | None = None) -> dict:
 # answered that it had no way to know. After this it cannot answer that again.
 # The difference is that there is now no per-user answer to give — a config file
 # is the truth — rather than an answer it was merely blind to.
-#
-# ``looks_like_briefing_reference`` stays UNCHANGED so the router still
-# recognises such a turn and declines it, instead of falling through to the
-# forced knowledge-base retrieval that once answered a briefing question from
-# whatever was nearest in vector space.
 
 def get_latest_briefing(user_id: str, args: dict) -> str:
     """Today's daily brief, or one specific date (YYYY-MM-DD)."""

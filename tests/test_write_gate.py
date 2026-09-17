@@ -98,7 +98,7 @@ def test_any_delete_is_always_confirmed():
 
 def test_reads_are_never_gated():
     reads = [{"name": "list_calendar_events", "args": {}},
-             {"name": "query_knowledge_base", "args": {"query": "x"}},
+             {"name": "search_web", "args": {"query": "x"}},
              {"name": "get_latest_reit_report", "args": {"reit_symbol": "ARR"}}]
     out = _route(reads)
     assert out["next"] == "tool_execution"
@@ -471,7 +471,7 @@ def test_capabilities_block_still_lists_what_is_real():
     """The closed-world statement must not cost the in-scope offers — refusing a
     calendar add would be a worse regression than over-offering."""
     block = orchestrator.capabilities_block()
-    for capability in ("Google Calendar", "Knowledge base", "Notes", "live internet"):
+    for capability in ("Google Calendar", "REIT research", "Notes", "live internet"):
         assert capability in block
     assert "NEVER tell the user you are unable to do one of the things listed above" in block
 
@@ -482,5 +482,6 @@ def test_every_listed_capability_maps_to_a_real_tool():
     from tools.catalog import CATALOG_TOOL_NAMES
     assert {"search_web", "fetch_url"} <= CATALOG_TOOL_NAMES      # live internet
     assert {"create_calendar_event", "list_calendar_events"} <= CATALOG_TOOL_NAMES
-    assert "query_knowledge_base" in CATALOG_TOOL_NAMES
+    # The knowledge base moved to Knowledge chat (2026-09-17): no KB tool here.
+    assert not {"query_knowledge_base", "summarize_document"} & CATALOG_TOOL_NAMES
     assert {"read_user_note", "write_user_note"} <= CATALOG_TOOL_NAMES

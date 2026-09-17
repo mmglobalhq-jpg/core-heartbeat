@@ -122,8 +122,6 @@ class ToolArgs(BaseModel):
 
     * Vault tools: ``read_user_note(filename)``, ``search_user_vault(query)``,
       ``write_user_note(filename, content)``.
-    * Knowledge-base tools: ``query_knowledge_base(query)``,
-      ``summarize_document(document, focus)``, ``list_knowledge_base_documents()``.
     * Google Calendar tools — see the per-user fields below.
     * Flight search: ``search_flights(origins, destination, departure_date, ...)``.
     """
@@ -131,13 +129,6 @@ class ToolArgs(BaseModel):
     filename: str | None = None
     query: str | None = None
     content: str | None = None
-    # Knowledge base, document-scoped. `document` is how the USER referred to the
-    # document (title, part of a title, or filename) — the service resolves it against
-    # the caller's own + global docs. `focus` narrows a summary to one topic within
-    # that document. Deliberately NOT reusing `query`/`summary`: `query` means a
-    # corpus-wide search and `summary` is already the calendar event title.
-    document: str | None = None
-    focus: str | None = None
     # Google Calendar tools (per-user):
     event_id: str | None = None       # target event for update/delete
     summary: str | None = None        # event title
@@ -181,9 +172,6 @@ class RoutingDecision(BaseModel):
     tool_name: Literal[
         # vault tools (per-user)
         "read_user_note", "search_user_vault", "write_user_note",
-        # knowledge base (per-user own + global)
-        "query_knowledge_base",
-        "list_knowledge_base_documents", "summarize_document",
         # google calendar (per-user)
         "list_calendar_events", "create_calendar_event",
         "update_calendar_event", "delete_calendar_event",

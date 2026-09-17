@@ -26,7 +26,6 @@ from models import RoutingDecision, ToolArgs
 from tools.attachments import ATTACHMENT_TOOL_REGISTRY
 from tools.daily_briefing import BRIEFING_TOOL_REGISTRY
 from tools.google_calendar import CALENDAR_TOOL_REGISTRY
-from tools.graphrag import GRAPHRAG_TOOL_REGISTRY
 from tools.reit_research import REIT_TOOL_REGISTRY
 from tools.user_vault import USER_VAULT_TOOLS
 from tools.flights import FLIGHT_TOOL_REGISTRY
@@ -37,7 +36,6 @@ def dispatchable_tools() -> set[str]:
     """Every tool name ``tool_execution`` can actually run (orchestrator.py)."""
     return (
         {t.name for t in USER_VAULT_TOOLS}
-        | set(GRAPHRAG_TOOL_REGISTRY)
         | set(FLIGHT_TOOL_REGISTRY)
         | set(CALENDAR_TOOL_REGISTRY)
         | set(REIT_TOOL_REGISTRY)

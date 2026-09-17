@@ -7,7 +7,7 @@ and calls the Google Calendar API v3 as that user. ``user_id`` is threaded from 
 state (like the KB/vault tools), never a model-supplied arg, so a request can't be
 redirected to another user's calendar.
 
-Mirrors tools/graphrag.py: an injectable ``_transport`` test seam, a name->callable
+Mirrors the other tool modules: an injectable ``_transport`` test seam, a name->callable
 dispatch, and a ``run_calendar_tool`` entrypoint that degrades to a friendly string
 (never raises) so a bad tool call never crashes the graph.
 """

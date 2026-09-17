@@ -198,35 +198,6 @@ def test_catalog_and_dispatch_agree():
     assert db.BRIEFING_TOOL_REGISTRY <= orchestrator.DISPATCHABLE_TOOLS
 
 
-class TestBriefingTurnsSkipTheForcedKnowledgeBaseRetrieval:
-    """When the router calls no tool on a substantive turn, the supervisor forces
-    a query_knowledge_base with the raw user text. The briefing lives in its own
-    tables, so that retrieval returns whatever is nearest in vector space and the
-    composer answers from it.
-
-    Measured on the deployed build: "change my briefing delivery time to 5am"
-    produced "I can change your briefing delivery time if it's an event on your
-    Google Calendar." The router had correctly declined; the backstop overrode it.
-    """
-
-    def test_recognises_a_briefing_turn(self):
-        for text in ("what topics are on my daily brief?",
-                     "change my briefing delivery time to 5am",
-                     "add baseball cards to my daily briefing",
-                     "what was in the briefing today"):
-            assert db.looks_like_briefing_reference(text), text
-
-    def test_is_narrow_enough_not_to_swallow_ordinary_turns(self):
-        for text in ("keep it brief", "brief me on the roadmap",
-                     "summarise this in brief", "debrief the team",
-                     "what's on my calendar?"):
-            assert not db.looks_like_briefing_reference(text), text
-
-    def test_the_supervisor_actually_consults_it(self):
-        import orchestrator
-        assert orchestrator.looks_like_briefing_reference is db.looks_like_briefing_reference
-
-
 def test_the_module_holds_no_service_role_credential():
     """Retiring the old-table tools removed a credential, not just code.
 

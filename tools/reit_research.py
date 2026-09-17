@@ -92,7 +92,6 @@ _ALIASES = {
 _SYMBOL_RE = re.compile(r"^[A-Z][A-Z0-9.]{0,9}$")
 # Word-boundary alias tokens for the supervisor's forced-KB exemption. Kept narrow
 # (issuer names, not the generic word "reit") to avoid false positives.
-_REFERENCE_RE = re.compile(r"\b(arr|armour|orc|orchid)\b", re.IGNORECASE)
 
 # A report id is a namespaced (arr:/orc:) UUID or — transitionally — a bare ARR UUID.
 _UUID_RE = re.compile(
@@ -104,15 +103,6 @@ _MONTHS = (
     "January", "February", "March", "April", "May", "June",
     "July", "August", "September", "October", "November", "December",
 )
-
-
-def looks_like_reit_reference(text: str) -> bool:
-    """True if the text clearly references a known REIT issuer (ARR/ARMOUR/ORC/Orchid).
-
-    Used by the supervisor to keep clear REIT-report questions out of the forced
-    generic knowledge-base retrieval. Deliberately narrow.
-    """
-    return bool(_REFERENCE_RE.search(text or ""))
 
 
 def _issuer_name(code: str) -> str:
