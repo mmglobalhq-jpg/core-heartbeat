@@ -49,6 +49,7 @@ from tools.google_calendar import CALENDAR_TOOL_REGISTRY, run_calendar_tool
 from tools.catalog import ALL_TOOLS, WRITE_TOOLS
 from tools.daily_briefing import BRIEFING_TOOL_REGISTRY, run_briefing_tool
 from tools.reit_research import REIT_TOOL_REGISTRY, run_reit_tool
+from tools.saved_documents import pointer_reply, saved_document_reference
 from models import (
     HistoryTurn,
     IntentPayload,
@@ -307,6 +308,11 @@ class GraphState(TypedDict):
     # nor any knowledge that one exists — which is how it ends up inventing what
     # the picture said.
     attachments: list[dict]
+    # Set by the supervisor when a request is about a saved document (see
+    # tools/saved_documents.py): local_llm then emits this fixed pointer to Knowledge
+    # chat instead of composing, so it cannot improvise an answer about a document it
+    # cannot read.
+    canned_reply: str | None
     usage: Annotated[TokenUsage, add_usage]
     visited: Annotated[list[str], operator.add]
     step: Annotated[int, operator.add]
@@ -1130,12 +1136,12 @@ _EXPLICIT_NON_CAPABILITIES = (
     "    address, or whether it is enabled, and you cannot trigger a briefing run.\n"
     "    Topics you CAN add and remove. If asked for the others, say so plainly and\n"
     "    point the user at their briefing settings.\n"
-    "  - You CANNOT read the user's saved documents (their knowledge base — research\n"
-    "    reports and files they added). Those are answered in Knowledge chat. When a\n"
-    "    request is about one — including a notes search that found nothing for\n"
-    "    \"my saved research\" — say so and tell the user to switch to Knowledge at the\n"
-    "    top of the sidebar. Never answer as though you had read a document they saved,\n"
-    "    and never answer from an unrelated tool result instead.\n"
+    "  - You CANNOT read the user's saved documents: research reports and files they\n"
+    "    added to their knowledge base. The only reports you can read are the ARR and\n"
+    "    ORC reports. For any other report or publication, do not ask which REIT it is,\n"
+    "    do not offer a web search, and never answer from an unrelated tool result or\n"
+    "    from memory: tell the user their saved documents are answered in Knowledge\n"
+    "    chat (switch to Knowledge at the top of the sidebar).\n"
 )
 
 
@@ -1811,6 +1817,26 @@ def _finish_routing(
     """
     nxt = decision.next_node
 
+    # Deterministic saved-document guard (do not rely on the model to decline).
+    # The knowledge base lives in Knowledge chat now. When the router called no tool on
+    # the first step of a turn and the message is about one of the user's saved
+    # documents, answer with a fixed pointer instead of composing — measured: prose
+    # rules alone produced "which REIT?" and, once, an invented recommendation.
+    canned: str | None = None
+    if (
+        nxt == "local_llm"
+        and not state.get("visited")
+        and not native_calls
+        and not decision.tool_name
+        and not state.get("documents")
+        and not state.get("document_images")
+    ):
+        ref = saved_document_reference(
+            getattr(state["intent"], "raw_input", "") or "", state.get("user_id", SANDBOX_USER_ID)
+        )
+        if ref is not None:
+            canned = pointer_reply(ref)
+
     # Deterministic anti-reloop guard (do not rely on the model to terminate).
     # Scoped to local_llm: if the model re-dispatches local_llm after it has
     # ALREADY produced a reply this run, override to a clean finish. This kills the
@@ -1969,6 +1995,8 @@ def _finish_routing(
         "tool_calls": calls,
         "pending_plan": pending_plan,
         "plan_note": plan_note,
+        # Written on every routing turn so a pointer can never leak into a later turn.
+        "canned_reply": canned if (canned and nxt == "local_llm" and not pending_plan) else None,
         "messages": [Message(source="supervisor", content=label, step=step)],
     }
     if nxt == "finish":
@@ -2071,6 +2099,17 @@ async def local_llm(state: GraphState) -> dict:
             await adispatch_custom_event(LOCAL_TOKEN_EVENT, {"token": token})
         except Exception:
             pass
+
+    # Saved-document pointer set by the supervisor: emit it verbatim, no model call.
+    canned = state.get("canned_reply")
+    if canned:
+        await _emit(canned)
+        return {
+            "messages": [Message(source="local_llm", content=canned, step=step)],
+            "usage": TokenUsage(),
+            "visited": ["local_llm"],
+            "step": 1,
+        }
 
     if _is_local_compose():
         # Shared client — not closed here (see build_ollama_client); generate_local
@@ -2642,6 +2681,7 @@ def _initial_state(payload: IntentPayload, user_id: str) -> GraphState:
         "documents": "",  # populated by _load_documents in the async prelude
         "document_images": [],  # populated by _load_document_images in the async prelude
         "attachments": [],  # populated by _load_attachment_manifest in the async prelude
+        "canned_reply": None,
         "usage": TokenUsage(),
         "visited": [],
         "step": 0,

@@ -502,5 +502,5 @@ def test_saved_documents_are_pointed_at_knowledge_chat_not_substituted():
     structured = orchestrator._build_prompt({**state, "messages": []})
     assert "Knowledge chat" in structured
     block = orchestrator.capabilities_block()
-    assert "switch to Knowledge" in block and "never answer from an unrelated tool result" in block
+    assert "switch to Knowledge" in block and "never answer from an unrelated tool" in block
     assert "ONLY those" in orchestrator._tool_catalogue_block()
