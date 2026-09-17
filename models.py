@@ -348,7 +348,9 @@ class KbIngestRequest(BaseModel):
     """POST /kb/ingest — add an already-uploaded doc to the knowledge base.
 
     ``scope="global"`` is admin-gated server-side (profiles.is_admin); everyone else
-    ingests to their own private scope.
+    ingests to their own private scope. ``replaces_document_id`` turns the ingest into
+    a replacement: the KB service removes that document (same scope only) once the new
+    version has fully ingested.
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -357,6 +359,39 @@ class KbIngestRequest(BaseModel):
     filename: str = Field(min_length=1)
     content_type: str | None = None
     scope: Literal["private", "global"] = "private"
+    replaces_document_id: str | None = None
+
+
+class KnowledgeSource(BaseModel):
+    """A document an earlier Knowledge-chat answer drew on (echoed back by the UI)."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    document_id: str | None = None
+    title: str = Field(min_length=1, max_length=300)
+
+
+class KnowledgeTurn(BaseModel):
+    """One prior turn of a Knowledge chat. Assistant turns carry the documents they cited,
+    so a follow-up ("what else did that report say?") can be resolved to the same
+    document even though only the answer text was kept."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    role: Literal["user", "assistant"]
+    content: str = Field(max_length=20_000)
+    sources: list[KnowledgeSource] = Field(default_factory=list, max_length=40)
+
+
+class KnowledgeChatRequest(BaseModel):
+    """POST /kb/chat/stream — one Knowledge-chat turn."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    text: str = Field(min_length=1, max_length=8_000)
+    history: list[KnowledgeTurn] = Field(default_factory=list, max_length=60)
+    chat_id: str | None = None
+    timezone: str | None = None
 
 
 class DocumentParseResult(BaseModel):

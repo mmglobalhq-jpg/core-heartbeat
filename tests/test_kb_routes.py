@@ -20,7 +20,7 @@ def client(monkeypatch):
     app.dependency_overrides[resolve_user_id] = lambda: USER
     monkeypatch.setattr(docs, "fetch_original", lambda uid, did: b"hello world")
 
-    async def _ingest(owner, filename, content):
+    async def _ingest(owner, filename, content, replaces_document_id=None):
         return {"job_id": "job-1", "status": "pending", "_owner": owner}
 
     async def _list(owner):

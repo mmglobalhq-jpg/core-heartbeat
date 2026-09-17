@@ -25,6 +25,7 @@ from models import (
     IntentAccepted,
     IntentPayload,
     KbIngestRequest,
+    KnowledgeChatRequest,
     ThresholdRejected,
     TitleRequest,
     TitleResponse,
@@ -35,6 +36,7 @@ from services import documents as docstore
 from services import kb as kbstore
 from services import uploads as upstore
 from services.document_parser import parse_document
+import knowledge_chat
 
 logger = logging.getLogger(__name__)
 
@@ -228,11 +230,31 @@ async def kb_ingest(
         return JSONResponse(status_code=413, content={"detail": "file exceeds the 20 MB limit"})
 
     try:
-        result = await kbstore.ingest(owner, payload.filename, data)
+        result = await kbstore.ingest(owner, payload.filename, data, payload.replaces_document_id)
     except Exception as exc:  # KB unreachable / rejected — surface, don't crash
         logger.warning("kb ingest failed for doc_id=%s: %s", payload.doc_id, exc)
         return JSONResponse(status_code=502, content={"detail": "knowledge base ingest failed"})
     return JSONResponse(status_code=200, content=result)
+
+
+@router.post("/kb/chat/stream", response_model=None)
+async def kb_chat_stream(
+    payload: KnowledgeChatRequest,
+    user_id: str = Depends(resolve_user_id),
+) -> StreamingResponse | JSONResponse:
+    """One Knowledge-chat turn, streamed as SSE (see knowledge_chat.py for the events).
+
+    Answers only from the caller's own + global documents. Signed-in users only: the
+    sandbox identity has no knowledge base.
+    """
+    if user_id == SANDBOX_USER_ID:
+        return JSONResponse(status_code=401, content={"detail": "authentication required for the knowledge base"})
+
+    async def event_stream():
+        async for event in knowledge_chat.run(payload, user_id):
+            yield knowledge_chat.sse(event)
+
+    return StreamingResponse(event_stream(), media_type="text/event-stream")
 
 
 @router.get("/kb/jobs/{job_id}", response_model=None)
