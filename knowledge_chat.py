@@ -230,6 +230,11 @@ class Passage:
     title: str
     chunk_index: int | None
     text: str
+    # What the reader is shown under the answer. For a search hit this is the matched
+    # ~200-token passage, not the start of its parent block — the parent (what the model
+    # reads) often opens with page furniture, which made the excerpt look unrelated to
+    # the claim it supports (seen in the browser test, 2026-09-17).
+    excerpt: str = ""
 
 
 @dataclass
@@ -240,12 +245,13 @@ class TurnContext:
     by_key: dict[str, Passage] = field(default_factory=dict)
     chars: int = 0
 
-    def add(self, key: str, document_id: str | None, title: str, chunk_index: int | None, text: str) -> Passage | None:
+    def add(self, key: str, document_id: str | None, title: str, chunk_index: int | None, text: str,
+            excerpt: str | None = None) -> Passage | None:
         if key in self.by_key:
             return self.by_key[key]
         if self.chars + len(text) > CONTEXT_CHARS:
             return None
-        p = Passage(len(self.passages) + 1, key, document_id, title, chunk_index, text)
+        p = Passage(len(self.passages) + 1, key, document_id, title, chunk_index, text, excerpt or text)
         self.passages.append(p)
         self.by_key[key] = p
         self.chars += len(text)
@@ -292,6 +298,7 @@ async def _tool_search(ctx: TurnContext, user_id: str, args: dict) -> str:
         added = ctx.add(
             f"chunk:{c.get('id')}", c.get("document_id"), (c.get("title") or "Untitled").strip(),
             c.get("chunk_index"), _clip(body, PASSAGE_CHARS),
+            excerpt=c.get("content") or body,
         )
         if added is None:
             full = True
@@ -414,7 +421,7 @@ def cited_sources(answer: str, ctx: TurnContext) -> list[dict]:
                 "document_id": p.document_id,
                 "title": p.title,
                 "chunk_index": p.chunk_index,
-                "excerpt": _clip(p.text, EXCERPT_CHARS),
+                "excerpt": _clip(p.excerpt, EXCERPT_CHARS),
             })
     return out
 

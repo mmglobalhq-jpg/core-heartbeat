@@ -124,7 +124,9 @@ def test_search_then_cited_answer(monkeypatch, kbmock):
     assert tokens == "Subprime auto delinquencies rose to 6.9% [1]."
     sources = next(e["sources"] for e in events if "sources" in e)
     assert [s["n"] for s in sources] == [1]
-    assert sources[0]["document_id"] == "d-sep" and "6.9%" in sources[0]["excerpt"]
+    assert sources[0]["document_id"] == "d-sep"
+    # the reader sees the matched passage; the model saw its parent block
+    assert sources[0]["excerpt"] == "short child"
     assert events[-1] == {"status": "completed"}
 
     # the function response the model saw: parent context used, and the -10 passage filtered out
