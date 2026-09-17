@@ -272,6 +272,7 @@ class Passage:
     title: str
     chunk_index: int | None
     text: str
+    weak: bool = False
     # What the reader is shown under the answer. For a search hit this is the matched
     # ~200-token passage, not the start of its parent block — the parent (what the model
     # reads) often opens with page furniture, which made the excerpt look unrelated to
@@ -288,12 +289,12 @@ class TurnContext:
     chars: int = 0
 
     def add(self, key: str, document_id: str | None, title: str, chunk_index: int | None, text: str,
-            excerpt: str | None = None) -> Passage | None:
+            excerpt: str | None = None, weak: bool = False) -> Passage | None:
         if key in self.by_key:
             return self.by_key[key]
         if self.chars + len(text) > CONTEXT_CHARS:
             return None
-        p = Passage(len(self.passages) + 1, key, document_id, title, chunk_index, text, excerpt or text)
+        p = Passage(len(self.passages) + 1, key, document_id, title, chunk_index, text, weak, excerpt or text)
         self.passages.append(p)
         self.by_key[key] = p
         self.chars += len(text)
@@ -350,7 +351,7 @@ async def _tool_search(ctx: TurnContext, user_id: str, args: dict) -> str:
         added = ctx.add(
             f"chunk:{c.get('id')}", c.get("document_id"), (c.get("title") or "Untitled").strip(),
             c.get("chunk_index"), _clip(body, PASSAGE_CHARS),
-            excerpt=c.get("content") or body,
+            excerpt=c.get("content") or body, weak=weak(c),
         )
         if added is None:
             full = True
@@ -457,23 +458,37 @@ def history_contents(req: KnowledgeChatRequest) -> list[types.Content]:
 
 _CITE = re.compile(r"\[(\d+(?:\s*,\s*\d+)*)\]")
 
+# An answer that OPENS by declining. Used only to decide whether weak-match citations
+# are shown as sources (see cited_sources) — never to change the answer itself.
+_DECLINE = re.compile(
+    r"^[^.!?]{0,160}\b(cannot answer|can't answer|unable to answer|does not (contain|cover|mention|include)"
+    r"|doesn't (contain|cover|mention|include)|do not (contain|cover)|not covered|no (relevant )?information)\b",
+    re.I,
+)
+
 
 def cited_sources(answer: str, ctx: TurnContext) -> list[dict]:
     """The passages the answer actually cited, in citation-number order."""
     wanted: set[int] = set()
     for m in _CITE.finditer(answer):
         wanted.update(int(x) for x in m.group(1).split(","))
-    out = []
-    for p in ctx.passages:
-        if p.n in wanted:
-            out.append({
-                "n": p.n,
-                "document_id": p.document_id,
-                "title": p.title,
-                "chunk_index": p.chunk_index,
-                "excerpt": _clip(p.excerpt, EXCERPT_CHARS),
-            })
-    return out
+    cited = [p for p in ctx.passages if p.n in wanted]
+    # A decline that cites only weak matches: the model searched a document it chose
+    # itself, found nothing relevant, and still attached a marker. Showing that passage
+    # under "the knowledge base doesn't cover this" reads as evidence for the refusal.
+    # Seen 1 in 6 out-of-scope eval answers after scoped searches lost their floor.
+    if cited and all(p.weak for p in cited) and _DECLINE.search(answer.strip()):
+        return []
+    return [
+        {
+            "n": p.n,
+            "document_id": p.document_id,
+            "title": p.title,
+            "chunk_index": p.chunk_index,
+            "excerpt": _clip(p.excerpt, EXCERPT_CHARS),
+        }
+        for p in cited
+    ]
 
 
 _GROUND_NUDGE = (

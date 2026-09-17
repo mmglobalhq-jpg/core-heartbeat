@@ -370,3 +370,15 @@ def test_scoped_search_keeps_its_best_passages_even_below_the_floor(monkeypatch,
     assert scoped.count("weak match") == kc.SCOPED_WEAK_MAX
     unscoped = asyncio.run(kc.run_tool(kc.TurnContext(), USER, "search_knowledge", {"query": "regulatory changes"}))
     assert unscoped == "No passages in the knowledge base are relevant to this query."
+
+
+def test_a_decline_citing_only_weak_matches_shows_no_sources():
+    ctx = kc.TurnContext()
+    ctx.add("a", "d", "Doc", 1, "table of numbers", weak=True)
+    ctx.add("b", "d", "Doc", 2, "Basel Endgame raises CLO AAA demand", weak=True)
+    assert kc.cited_sources("I cannot answer that; the knowledge base does not contain it [1].", ctx) == []
+    # a real answer drawn from weak (scoped) matches keeps its sources
+    assert [s["n"] for s in kc.cited_sources("It cites Basel Endgame [2].", ctx)] == [2]
+    # a decline next to a strong passage is not suppressed
+    ctx.add("c", "d", "Doc", 3, "strong passage")
+    assert [s["n"] for s in kc.cited_sources("The report does not mention X, but notes Y [3].", ctx)] == [3]
